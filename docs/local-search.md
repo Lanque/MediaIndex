@@ -51,7 +51,12 @@ AI search is a separate, explicit workflow:
 
 1. Open **AI connection** and choose **Local (Ollama)**, **OpenAI (ChatGPT API)**,
    or **Google Gemini API**. Add the cloud API key when needed, verify the
-   models/base URL, press **Test connection**, and save the settings.
+   models/base URL, press **Test connection**, and save the settings. For
+   OpenAI, choose GPT-5.6 Luna for faster high-volume analysis or GPT-5.6 Terra
+   when recognition detail is more important than speed and cost.
+   **Library context** is optional: use it to list a project/franchise, setting,
+   or possible fictional characters for an unfamiliar collection. The model is
+   instructed to use this only when it agrees with the visible evidence.
 2. Select a footage folder and wait for deterministic indexing to finish.
 3. Press **Analyze with AI**. MediaIndex samples frames, stores descriptions
    and embeddings locally, and reports any per-file failures.
@@ -59,7 +64,9 @@ AI search is a separate, explicit workflow:
    `Fortnite kill`, `enemy elimination`, or `player victory`.
 
 AI results are ranked by embedding similarity and include the matching clip
-timestamp. Press **Preview** to open the clip at that timestamp. The default
+timestamp. Adjacent annotations from the same video within three seconds are
+coalesced after ranking, retaining the best-scoring timestamp for that event.
+Press **Preview** to open the clip at that timestamp. The default
 sampling interval is five seconds with a maximum of 120 frames per file; use
 the values in **AI connection** to adjust the cost/coverage trade-off. The full
 original video is never uploaded as one file, but sampled frames are sent to the
@@ -72,13 +79,16 @@ Ollama analysis remains sequential. The provider and model name are stored with
 each annotation, so embeddings from incompatible models are not mixed in one
 search.
 
-The vision prompt also requests readable on-screen text from HUDs, kill feeds,
-subtitles, and overlays. Search ranking combines semantic similarity with
-keyword matching and light inflection handling (`kill`/`killed`,
-`elimination`/`eliminated`). For short-lived events, set **Every (s)** to `2` or
-`1` before analysis. Changing provider or embedding model requires analyzing the
-folder again with that configuration; otherwise the app reports that no AI
-moments exist for the active model namespace.
+The vision prompt requests recognizable fictional characters and franchises,
+other visible entities, actions and interactions, the setting, the broader
+situation, and readable text from HUDs, subtitles, signs, and overlays. It does
+not identify a real person from their face alone. Search ranking combines
+semantic similarity with keyword matching and light inflection handling
+(`kill`/`killed`, `elimination`/`eliminated`). For short-lived events, set
+**Every (s)** to `2` or `1` before analysis. Changing provider, vision model, or
+embedding model requires analyzing the folder again with that configuration;
+otherwise the app reports that no AI moments exist for the active model
+namespace.
 
 AI analysis runs in background workers and reports the current phase, clip, and
 overall 0–100% completion through the progress bar, so the desktop window

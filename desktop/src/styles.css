@@ -276,6 +276,13 @@ button:disabled {
   font-weight: 400;
 }
 
+.field-help {
+  color: #7285ac;
+  font-size: 0.64rem;
+  font-weight: 400;
+  line-height: 1.35;
+}
+
 .settings-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

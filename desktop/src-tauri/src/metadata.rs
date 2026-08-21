@@ -116,7 +116,9 @@ impl FfprobeMetadataProbe {
 
 impl MetadataProbe for FfprobeMetadataProbe {
     fn extract(&self, path: &Path) -> MetadataExtraction {
-        let output = match Command::new(&self.executable)
+        let mut command = Command::new(&self.executable);
+        configure_hidden_process(&mut command);
+        let output = match command
             .args([
                 "-v",
                 "error",
@@ -163,6 +165,15 @@ impl MetadataProbe for FfprobeMetadataProbe {
             Ok(metadata) => MetadataExtraction::success(metadata),
             Err(message) => MetadataExtraction::failure(MetadataError::InvalidOutput { message }),
         }
+    }
+}
+
+fn configure_hidden_process(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
     }
 }
 

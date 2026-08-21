@@ -70,6 +70,7 @@ type AiConfig = {
   ffmpegPath: string;
   sampleIntervalSeconds: number;
   maxFrames: number;
+  contextHint: string;
 };
 
 type AiConnectionReport = {
@@ -148,7 +149,7 @@ app.innerHTML = `
         <details class="ai-settings" open>
           <summary>AI connection</summary>
           <p class="settings-help">
-            Choose local Ollama, OpenAI (ChatGPT API), or Gemini. Settings stay on this computer. For short kill-feed events, use Every (s) = 1–2.
+            Choose local Ollama, OpenAI (ChatGPT API), or Gemini. Settings stay on this computer. Use Every (s) = 1–2 for short actions and fast scene changes.
           </p>
           <form class="settings-form" id="ai-settings-form">
             <label>Provider
@@ -164,6 +165,14 @@ app.innerHTML = `
             <label>Vision model
               <input id="ai-vision-model" name="vision-model" placeholder="gemma4" />
             </label>
+            <label id="ai-openai-preset-label">OpenAI recognition preset
+              <select id="ai-openai-preset" name="openai-preset">
+                <option value="custom">Current / custom model</option>
+                <option value="gpt-5.6-luna">Fast broad recognition · GPT-5.6 Luna</option>
+                <option value="gpt-5.6-terra">Detailed recognition · GPT-5.6 Terra</option>
+              </select>
+              <span class="field-help">Changing the vision model requires Analyze with AI again. Detailed recognition can cost more.</span>
+            </label>
             <label>Embedding model
               <input id="ai-embedding-model" name="embedding-model" placeholder="embeddinggemma" />
             </label>
@@ -172,6 +181,10 @@ app.innerHTML = `
             </label>
             <label>FFmpeg path <span class="optional-label">(optional)</span>
               <input id="ai-ffmpeg-path" name="ffmpeg-path" placeholder="Uses PATH if empty" />
+            </label>
+            <label>Library context <span class="optional-label">(optional)</span>
+              <input id="ai-context-hint" name="context-hint" placeholder="Project, franchise, possible characters, location…" />
+              <span class="field-help">Helps with project-specific characters and circumstances; candidate names are still verified against the frames.</span>
             </label>
             <div class="settings-grid">
               <label>Every (s)
@@ -226,7 +239,7 @@ app.innerHTML = `
           <button class="secondary-button" id="search-submit" type="submit">Search</button>
         </form>
         <form class="ai-search-form" id="ai-search-form">
-          <input id="ai-search-input" name="ai-query" placeholder="AI search: Fortnite kill, enemy elimination, victory" />
+          <input id="ai-search-input" name="ai-query" placeholder="AI search: character, action, setting, event, visible text" />
           <button class="secondary-button" id="ai-search-submit" type="submit">AI Search</button>
         </form>
         <p class="search-status" id="ai-search-status" role="status"></p>
@@ -271,9 +284,12 @@ const aiProvider = document.querySelector<HTMLSelectElement>("#ai-provider");
 const aiApiKey = document.querySelector<HTMLInputElement>("#ai-api-key");
 const aiApiKeyLabel = document.querySelector<HTMLLabelElement>("#ai-api-key-label");
 const aiVisionModel = document.querySelector<HTMLInputElement>("#ai-vision-model");
+const aiOpenAiPresetLabel = document.querySelector<HTMLLabelElement>("#ai-openai-preset-label");
+const aiOpenAiPreset = document.querySelector<HTMLSelectElement>("#ai-openai-preset");
 const aiEmbeddingModel = document.querySelector<HTMLInputElement>("#ai-embedding-model");
 const aiBaseUrl = document.querySelector<HTMLInputElement>("#ai-base-url");
 const aiFfmpegPath = document.querySelector<HTMLInputElement>("#ai-ffmpeg-path");
+const aiContextHint = document.querySelector<HTMLInputElement>("#ai-context-hint");
 const aiSampleSeconds = document.querySelector<HTMLInputElement>("#ai-sample-seconds");
 const aiMaxFrames = document.querySelector<HTMLInputElement>("#ai-max-frames");
 const saveAiSettingsButton = document.querySelector<HTMLButtonElement>("#save-ai-settings");
@@ -312,12 +328,13 @@ function aiDefaults(provider: AiProvider): AiConfig {
     return {
       provider,
       apiKey: "",
-      visionModel: "gpt-4.1-mini",
+      visionModel: "gpt-5.6-luna",
       embeddingModel: "text-embedding-3-small",
       baseUrl: "https://api.openai.com/v1",
       ffmpegPath: "",
       sampleIntervalSeconds: 5,
       maxFrames: 120,
+      contextHint: "",
     };
   }
   if (provider === "gemini") {
@@ -330,6 +347,7 @@ function aiDefaults(provider: AiProvider): AiConfig {
       ffmpegPath: "",
       sampleIntervalSeconds: 5,
       maxFrames: 120,
+      contextHint: "",
     };
   }
   return {
@@ -341,6 +359,7 @@ function aiDefaults(provider: AiProvider): AiConfig {
     ffmpegPath: "",
     sampleIntervalSeconds: 5,
     maxFrames: 120,
+    contextHint: "",
   };
 }
 
@@ -356,6 +375,7 @@ function readAiConfig(): AiConfig {
     ffmpegPath: aiFfmpegPath?.value.trim() ?? "",
     sampleIntervalSeconds: Math.max(1, Number(aiSampleSeconds?.value ?? 5) || 5),
     maxFrames: Math.max(1, Number(aiMaxFrames?.value ?? 120) || 120),
+    contextHint: aiContextHint?.value.trim() ?? "",
   };
 }
 
@@ -372,17 +392,27 @@ function applyAiConfig(config: AiConfig): void {
   if (aiFfmpegPath) aiFfmpegPath.value = config.ffmpegPath;
   if (aiSampleSeconds) aiSampleSeconds.value = String(config.sampleIntervalSeconds);
   if (aiMaxFrames) aiMaxFrames.value = String(config.maxFrames);
+  if (aiContextHint) aiContextHint.value = config.contextHint;
   updateAiProviderFields();
+}
+
+function syncOpenAiPreset(): void {
+  if (!aiOpenAiPreset) return;
+  const model = aiVisionModel?.value.trim().toLowerCase() ?? "";
+  aiOpenAiPreset.value = model === "gpt-5.6-luna" || model === "gpt-5.6-terra"
+    ? model
+    : "custom";
 }
 
 function updateAiProviderFields(): void {
   const provider = (aiProvider?.value as AiProvider) || "local";
   if (aiApiKeyLabel) aiApiKeyLabel.hidden = provider === "local";
+  if (aiOpenAiPresetLabel) aiOpenAiPresetLabel.hidden = provider !== "openai";
   if (aiApiKey) {
     aiApiKey.placeholder = provider === "local" ? "Not needed for Local (Ollama)" : "Stored only in this app";
   }
   if (aiVisionModel) {
-    aiVisionModel.placeholder = provider === "local" ? "gemma4" : provider === "gemini" ? "gemini-3.6-flash" : "gpt-4.1-mini";
+    aiVisionModel.placeholder = provider === "local" ? "gemma4" : provider === "gemini" ? "gemini-3.6-flash" : "gpt-5.6-luna";
   }
   if (aiEmbeddingModel) {
     aiEmbeddingModel.placeholder = provider === "local" ? "embeddinggemma" : provider === "gemini" ? "gemini-embedding-001" : "text-embedding-3-small";
@@ -394,6 +424,7 @@ function updateAiProviderFields(): void {
         ? "https://generativelanguage.googleapis.com/v1beta"
         : "https://api.openai.com/v1";
   }
+  syncOpenAiPreset();
 }
 
 function loadAiConfig(): void {
@@ -771,6 +802,16 @@ aiProvider?.addEventListener("change", () => {
   if (aiBaseUrl) aiBaseUrl.value = defaults.baseUrl;
   updateAiProviderFields();
   saveAiConfig();
+});
+
+aiVisionModel?.addEventListener("input", syncOpenAiPreset);
+
+aiOpenAiPreset?.addEventListener("change", () => {
+  if (!aiVisionModel || !aiOpenAiPreset || aiOpenAiPreset.value === "custom") return;
+  aiVisionModel.value = aiOpenAiPreset.value;
+  if (aiConfigStatus) {
+    aiConfigStatus.textContent = `Selected ${aiOpenAiPreset.value}. Save settings and run Analyze with AI again.`;
+  }
 });
 
 aiSettingsForm?.addEventListener("submit", (event) => {
