@@ -25,7 +25,7 @@ Every pull request should run:
 The workflow is intentionally small while the repository is still a documentation-first scaffold. It should gain jobs rather than become a single opaque script.
 
 The current desktop job runs on Windows and verifies
-`npm ci`, the TypeScript/Vite build, Rust formatting, and the Rust test suite. This mirrors the supported desktop toolchain without requiring cloud services or media uploads.
+`npm ci`, the TypeScript/Vite build, Rust formatting, and the Rust test suite. This mirrors the supported desktop toolchain without requiring cloud services or media uploads. FFprobe parsing uses a small committed JSON fixture, while an unavailable FFprobe executable is tested as an actionable error state.
 
 ## Planned component checks
 
