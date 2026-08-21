@@ -25,6 +25,7 @@ const MAX_EXTRACTED_FRAME_WIDTH: u32 = 1_280;
 const MAX_THUMBNAIL_WIDTH: u32 = 640;
 const AI_CONNECT_TIMEOUT_SECONDS: u64 = 20;
 const AI_REQUEST_TIMEOUT_SECONDS: u64 = 180;
+pub const AI_ANALYSIS_CANCELLED_MESSAGE: &str = "AI analysis cancelled by user";
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub enum AiProvider {
@@ -85,6 +86,7 @@ pub struct AiIndexReport {
     pub analyzed_file_count: u64,
     pub skipped_file_count: u64,
     pub annotation_count: u64,
+    pub cancelled: bool,
     pub warnings: Vec<AiWarning>,
 }
 
@@ -276,12 +278,28 @@ pub fn analyze_file_with_progress<F>(
 where
     F: Fn(AiFileProgress),
 {
+    analyze_file_with_progress_and_cancel(path, _metadata, settings, progress, || false)
+}
+
+pub fn analyze_file_with_progress_and_cancel<F, C>(
+    path: &Path,
+    _metadata: Option<&MediaMetadata>,
+    settings: &AiSettings,
+    progress: F,
+    is_cancelled: C,
+) -> Result<Vec<AiAnnotation>, String>
+where
+    F: Fn(AiFileProgress),
+    C: Fn() -> bool,
+{
+    ensure_analysis_not_cancelled(&is_cancelled)?;
     let client = build_http_client()?;
     progress(AiFileProgress {
         percent: 1,
         phase: "Extracting frames",
     });
     let frames = extract_frames(path, settings)?;
+    ensure_analysis_not_cancelled(&is_cancelled)?;
     progress(AiFileProgress {
         percent: 10,
         phase: "Analyzing frames",
@@ -290,6 +308,7 @@ where
     let mut frame_errors = Vec::new();
     let mut processed_frames = 0usize;
     for frame_batch in frames.chunks(settings.vision_batch_size()) {
+        ensure_analysis_not_cancelled(&is_cancelled)?;
         match describe_frames(&client, frame_batch, settings) {
             Ok(batch) if batch.len() == frame_batch.len() => {
                 analyses.extend(
@@ -310,6 +329,7 @@ where
                 frame_batch.last().map(|frame| frame.0).unwrap_or_default()
             )),
         }
+        ensure_analysis_not_cancelled(&is_cancelled)?;
         processed_frames += frame_batch.len();
         let vision_percent = 10 + ((processed_frames * 80) / frames.len()) as u8;
         progress(AiFileProgress {
@@ -347,8 +367,10 @@ where
         percent: 92,
         phase: "Creating search index",
     });
+    ensure_analysis_not_cancelled(&is_cancelled)?;
     let embeddings =
         create_embeddings(&client, &embedding_texts, settings, EmbeddingKind::Document)?;
+    ensure_analysis_not_cancelled(&is_cancelled)?;
     if embeddings.len() != analyses.len() {
         return Err(format!(
             "AI returned {} embeddings for {} analyzed frames",
@@ -416,6 +438,17 @@ where
         phase: "Finished",
     });
     Ok(annotations)
+}
+
+fn ensure_analysis_not_cancelled<C>(is_cancelled: &C) -> Result<(), String>
+where
+    C: Fn() -> bool,
+{
+    if is_cancelled() {
+        Err(AI_ANALYSIS_CANCELLED_MESSAGE.to_owned())
+    } else {
+        Ok(())
+    }
 }
 
 pub fn embed_query(query: &str, settings: &AiSettings) -> Result<Vec<f32>, String> {
@@ -1441,6 +1474,26 @@ mod tests {
         assert_eq!(settings.vision_model, DEFAULT_LOCAL_VISION_MODEL);
         assert_eq!(settings.embedding_model, DEFAULT_LOCAL_EMBEDDING_MODEL);
         assert_eq!(settings.model_namespace(), "local:gemma4:embeddinggemma");
+    }
+
+    #[test]
+    fn cancellation_stops_before_frame_extraction_or_network_work() {
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::Local),
+            ..Default::default()
+        }))
+        .expect("local settings should be valid");
+
+        let error = analyze_file_with_progress_and_cancel(
+            Path::new("missing-video.mp4"),
+            None,
+            &settings,
+            |_| {},
+            || true,
+        )
+        .expect_err("cancellation should stop before the missing path is read");
+
+        assert_eq!(error, AI_ANALYSIS_CANCELLED_MESSAGE);
     }
 
     #[test]

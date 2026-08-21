@@ -102,6 +102,16 @@ h1 {
   background: #222d4a;
 }
 
+.secondary-button.is-stop {
+  color: #ffe6dc;
+  border-color: rgba(223, 141, 112, 0.7);
+  background: rgba(128, 54, 45, 0.72);
+}
+
+.secondary-button.is-stop:hover {
+  background: rgba(151, 62, 51, 0.82);
+}
+
 .primary-button:hover,
 .secondary-button:hover {
   transform: translateY(-2px);

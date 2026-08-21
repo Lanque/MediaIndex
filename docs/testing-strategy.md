@@ -38,6 +38,10 @@ search, and local JPEG thumbnail extraction. Set `MEDIAINDEX_SMOKE_VIDEO` and
 run the ignored `analyzes_real_video_through_openai_response_pipeline` test;
 private footage and generated thumbnails must not be committed.
 
+Deterministic cancellation tests verify that concurrent AI runs are rejected,
+a stop request is observed before frame/API work begins, and the run lock is
+released after cancellation.
+
 ## Planned component checks
 
 | Component | Planned checks |
