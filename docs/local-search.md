@@ -66,6 +66,8 @@ AI search is a separate, explicit workflow:
 AI results are ranked by embedding similarity and include the matching clip
 timestamp. Adjacent annotations from the same video within three seconds are
 coalesced after ranking, retaining the best-scoring timestamp for that event.
+Results are displayed in collapsible video groups: videos remain ordered by
+their best match, while each video's matching moments are ordered by timestamp.
 Press **Preview** to open the clip at that timestamp. The default
 sampling interval is five seconds with a maximum of 120 frames per file; use
 the values in **AI connection** to adjust the cost/coverage trade-off. The full

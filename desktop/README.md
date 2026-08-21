@@ -116,7 +116,9 @@ films, events, tutorials, travel, sports, performances, and gameplay rather than
 depending on game-specific labels. AI Search combines embedding similarity with
 exact/inflected keyword matching. Adjacent hits from the same video within
 three seconds are presented as one best-scoring moment, so one event does not
-appear separately at seconds 4, 5, and 6. If the provider, vision model, or
+appear separately at seconds 4, 5, and 6. AI search results are shown in
+collapsible video groups: videos are ordered by their best match and each
+video's moments are ordered by timestamp. If the provider, vision model, or
 embedding model changes, run **Analyze with AI** again; incompatible provider
 annotations are intentionally kept separate.
 
