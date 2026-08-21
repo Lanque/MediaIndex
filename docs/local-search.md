@@ -76,6 +76,9 @@ keyword matching and light inflection handling (`kill`/`killed`,
 folder again with that configuration; otherwise the app reports that no AI
 moments exist for the active model namespace.
 
+AI analysis runs in a background worker and reports the current clip through the
+progress line, so the desktop window remains interactive during long analyses.
+
 For **Local (Ollama)**, Ollama must be running at the configured base URL and
 the selected models must already be installed. For cloud providers, the app
 uses the API directly; a ChatGPT web subscription is not an API key. The API
