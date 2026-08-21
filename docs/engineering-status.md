@@ -16,6 +16,8 @@ of draft pull requests. The current implementation order is:
 | Security guardrails | #13 / #27 | draft PR, CI running or green |
 | AWS/Terraform scaffold | #12 / #28 | draft PR, static checks green |
 | Documentation maintenance | #14 / this PR | in review |
+| First selected-media preview job | #30 / #32 | draft PR, local checks green |
+| FastAPI sync runtime | #31 / next PR | implementation in progress |
 
 ## Deliberate limitations
 
