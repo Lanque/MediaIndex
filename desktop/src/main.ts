@@ -49,6 +49,26 @@ type AiIndexReport = {
   warnings: Array<{ path: string; message: string }>;
 };
 
+type AiProvider = "local" | "openai" | "gemini";
+
+type AiConfig = {
+  provider: AiProvider;
+  apiKey: string;
+  visionModel: string;
+  embeddingModel: string;
+  baseUrl: string;
+  ffmpegPath: string;
+  sampleIntervalSeconds: number;
+  maxFrames: number;
+};
+
+type AiConnectionReport = {
+  provider: string;
+  vision_model: string;
+  embedding_model: string;
+  embedding_dimensions: number;
+};
+
 type AiSearchResult = {
   path: string;
   content_hash: string;
@@ -98,6 +118,49 @@ app.innerHTML = `
             <span id="library-path">Choose a local folder to begin</span>
           </div>
         </div>
+        <details class="ai-settings" open>
+          <summary>AI connection</summary>
+          <p class="settings-help">
+            Choose local Ollama, OpenAI (ChatGPT API), or Gemini. Settings stay on this computer.
+          </p>
+          <form class="settings-form" id="ai-settings-form">
+            <label>Provider
+              <select id="ai-provider" name="provider">
+                <option value="local">Local (Ollama)</option>
+                <option value="openai">OpenAI (ChatGPT API)</option>
+                <option value="gemini">Google Gemini API</option>
+              </select>
+            </label>
+            <label id="ai-api-key-label">API key
+              <input id="ai-api-key" name="api-key" type="password" autocomplete="off" placeholder="Only for cloud providers" />
+            </label>
+            <label>Vision model
+              <input id="ai-vision-model" name="vision-model" placeholder="gemma4" />
+            </label>
+            <label>Embedding model
+              <input id="ai-embedding-model" name="embedding-model" placeholder="embeddinggemma" />
+            </label>
+            <label>Base URL
+              <input id="ai-base-url" name="base-url" placeholder="http://127.0.0.1:11434" />
+            </label>
+            <label>FFmpeg path <span class="optional-label">(optional)</span>
+              <input id="ai-ffmpeg-path" name="ffmpeg-path" placeholder="Uses PATH if empty" />
+            </label>
+            <div class="settings-grid">
+              <label>Every (s)
+                <input id="ai-sample-seconds" name="sample-seconds" min="1" type="number" />
+              </label>
+              <label>Max frames
+                <input id="ai-max-frames" name="max-frames" min="1" type="number" />
+              </label>
+            </div>
+            <div class="settings-actions">
+              <button class="secondary-button" id="save-ai-settings" type="submit">Save settings</button>
+              <button class="secondary-button" id="test-ai-connection" type="button">Test connection</button>
+            </div>
+            <p class="settings-status" id="ai-config-status" role="status"></p>
+          </form>
+        </details>
         <p class="section-label">Filters</p>
         <form class="filter-form" id="filter-form">
           <label>Folder<input id="filter-folder" name="folder" placeholder="day-one" /></label>
@@ -176,6 +239,19 @@ app.innerHTML = `
 
 const selectFolderButton = document.querySelector<HTMLButtonElement>("#select-folder");
 const analyzeAiButton = document.querySelector<HTMLButtonElement>("#analyze-ai");
+const aiSettingsForm = document.querySelector<HTMLFormElement>("#ai-settings-form");
+const aiProvider = document.querySelector<HTMLSelectElement>("#ai-provider");
+const aiApiKey = document.querySelector<HTMLInputElement>("#ai-api-key");
+const aiApiKeyLabel = document.querySelector<HTMLLabelElement>("#ai-api-key-label");
+const aiVisionModel = document.querySelector<HTMLInputElement>("#ai-vision-model");
+const aiEmbeddingModel = document.querySelector<HTMLInputElement>("#ai-embedding-model");
+const aiBaseUrl = document.querySelector<HTMLInputElement>("#ai-base-url");
+const aiFfmpegPath = document.querySelector<HTMLInputElement>("#ai-ffmpeg-path");
+const aiSampleSeconds = document.querySelector<HTMLInputElement>("#ai-sample-seconds");
+const aiMaxFrames = document.querySelector<HTMLInputElement>("#ai-max-frames");
+const saveAiSettingsButton = document.querySelector<HTMLButtonElement>("#save-ai-settings");
+const testAiConnectionButton = document.querySelector<HTMLButtonElement>("#test-ai-connection");
+const aiConfigStatus = document.querySelector<HTMLElement>("#ai-config-status");
 const searchButton = document.querySelector<HTMLButtonElement>("#search-submit");
 const filterButton = document.querySelector<HTMLButtonElement>("#filter-submit");
 const aiSearchButton = document.querySelector<HTMLButtonElement>("#ai-search-submit");
@@ -194,6 +270,117 @@ const previewVideo = document.querySelector<HTMLVideoElement>("#preview-video");
 const closePreviewButton = document.querySelector<HTMLButtonElement>("#close-preview");
 let selectedLibraryPath = "";
 let pendingPreviewTimestamp = 0;
+
+const AI_SETTINGS_STORAGE_KEY = "mediaindex.ai.settings.v1";
+
+function aiDefaults(provider: AiProvider): AiConfig {
+  if (provider === "openai") {
+    return {
+      provider,
+      apiKey: "",
+      visionModel: "gpt-4.1-mini",
+      embeddingModel: "text-embedding-3-small",
+      baseUrl: "https://api.openai.com/v1",
+      ffmpegPath: "",
+      sampleIntervalSeconds: 5,
+      maxFrames: 120,
+    };
+  }
+  if (provider === "gemini") {
+    return {
+      provider,
+      apiKey: "",
+      visionModel: "gemini-3.6-flash",
+      embeddingModel: "gemini-embedding-001",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      ffmpegPath: "",
+      sampleIntervalSeconds: 5,
+      maxFrames: 120,
+    };
+  }
+  return {
+    provider: "local",
+    apiKey: "",
+    visionModel: "gemma4",
+    embeddingModel: "embeddinggemma",
+    baseUrl: "http://127.0.0.1:11434",
+    ffmpegPath: "",
+    sampleIntervalSeconds: 5,
+    maxFrames: 120,
+  };
+}
+
+function readAiConfig(): AiConfig {
+  const provider = (aiProvider?.value as AiProvider) || "local";
+  return {
+    provider,
+    apiKey: aiApiKey?.value.trim() ?? "",
+    visionModel: aiVisionModel?.value.trim() ?? "",
+    embeddingModel: aiEmbeddingModel?.value.trim() ?? "",
+    baseUrl: aiBaseUrl?.value.trim() ?? "",
+    ffmpegPath: aiFfmpegPath?.value.trim() ?? "",
+    sampleIntervalSeconds: Math.max(1, Number(aiSampleSeconds?.value ?? 5) || 5),
+    maxFrames: Math.max(1, Number(aiMaxFrames?.value ?? 120) || 120),
+  };
+}
+
+function applyAiConfig(config: AiConfig): void {
+  if (aiProvider) aiProvider.value = config.provider;
+  if (aiApiKey) aiApiKey.value = config.apiKey;
+  if (aiVisionModel) aiVisionModel.value = config.visionModel;
+  if (aiEmbeddingModel) aiEmbeddingModel.value = config.embeddingModel;
+  if (aiBaseUrl) aiBaseUrl.value = config.baseUrl;
+  if (aiFfmpegPath) aiFfmpegPath.value = config.ffmpegPath;
+  if (aiSampleSeconds) aiSampleSeconds.value = String(config.sampleIntervalSeconds);
+  if (aiMaxFrames) aiMaxFrames.value = String(config.maxFrames);
+  updateAiProviderFields();
+}
+
+function updateAiProviderFields(): void {
+  const provider = (aiProvider?.value as AiProvider) || "local";
+  if (aiApiKeyLabel) aiApiKeyLabel.hidden = provider === "local";
+  if (aiApiKey) {
+    aiApiKey.placeholder = provider === "local" ? "Not needed for Local (Ollama)" : "Stored only in this app";
+  }
+  if (aiVisionModel) {
+    aiVisionModel.placeholder = provider === "local" ? "gemma4" : provider === "gemini" ? "gemini-3.6-flash" : "gpt-4.1-mini";
+  }
+  if (aiEmbeddingModel) {
+    aiEmbeddingModel.placeholder = provider === "local" ? "embeddinggemma" : provider === "gemini" ? "gemini-embedding-001" : "text-embedding-3-small";
+  }
+  if (aiBaseUrl) {
+    aiBaseUrl.placeholder = provider === "local"
+      ? "http://127.0.0.1:11434"
+      : provider === "gemini"
+        ? "https://generativelanguage.googleapis.com/v1beta"
+        : "https://api.openai.com/v1";
+  }
+}
+
+function loadAiConfig(): void {
+  const fallback = aiDefaults("local");
+  try {
+    const saved = JSON.parse(localStorage.getItem(AI_SETTINGS_STORAGE_KEY) ?? "null") as Partial<AiConfig> | null;
+    const provider = saved?.provider === "openai" || saved?.provider === "gemini" || saved?.provider === "local"
+      ? saved.provider
+      : fallback.provider;
+    applyAiConfig({
+      ...aiDefaults(provider),
+      ...saved,
+      provider,
+    });
+  } catch {
+    applyAiConfig(fallback);
+  }
+}
+
+function saveAiConfig(): void {
+  const config = readAiConfig();
+  localStorage.setItem(AI_SETTINGS_STORAGE_KEY, JSON.stringify(config));
+  if (aiConfigStatus) aiConfigStatus.textContent = "AI settings saved locally.";
+}
+
+loadAiConfig();
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>'"]/g, (character) => ({
@@ -380,7 +567,7 @@ async function searchAiLibrary(): Promise<void> {
   if (aiSearchStatus) aiSearchStatus.textContent = "Comparing your query with indexed visual moments…";
   if (libraryStatus) libraryStatus.textContent = "AI search in progress…";
   try {
-    const matches = await invoke<AiSearchResult[]>("search_ai", { query });
+    const matches = await invoke<AiSearchResult[]>("search_ai", { query, config: readAiConfig() });
     renderResults(matches.map((match) => ({
       path: match.path,
       content_hash: match.content_hash,
@@ -419,7 +606,10 @@ async function analyzeLibraryWithAi(): Promise<void> {
   if (libraryStatus) libraryStatus.textContent = "AI analysis in progress…";
   if (libraryPath) libraryPath.textContent = "Sampling frames and creating searchable descriptions";
   try {
-    const report = await invoke<AiIndexReport>("analyze_media_folder", { path: selectedLibraryPath });
+    const report = await invoke<AiIndexReport>("analyze_media_folder", {
+      path: selectedLibraryPath,
+      config: readAiConfig(),
+    });
     const warningSuffix = report.warnings.length ? ` · ${report.warnings.length} warnings` : "";
     const warningDetails = report.warnings
       .map((warning) => `${warning.path.split(/[\\/]/).pop() ?? warning.path}: ${warning.message}`)
@@ -443,6 +633,43 @@ async function analyzeLibraryWithAi(): Promise<void> {
     analyzeAiButton.textContent = originalLabel;
   }
 }
+
+async function testAiConnection(): Promise<void> {
+  if (!testAiConnectionButton) return;
+  testAiConnectionButton.disabled = true;
+  if (aiConfigStatus) aiConfigStatus.textContent = "Testing AI connection…";
+  try {
+    const report = await invoke<AiConnectionReport>("test_ai_connection", {
+      config: readAiConfig(),
+    });
+    if (aiConfigStatus) {
+      aiConfigStatus.textContent = "Connected: " + report.provider + " · " + report.embedding_model + " · " + report.embedding_dimensions + " dimensions";
+    }
+  } catch (error) {
+    if (aiConfigStatus) aiConfigStatus.textContent = String(error);
+  } finally {
+    testAiConnectionButton.disabled = false;
+  }
+}
+
+aiProvider?.addEventListener("change", () => {
+  const provider = (aiProvider.value as AiProvider) || "local";
+  const defaults = aiDefaults(provider);
+  if (aiApiKey) aiApiKey.value = "";
+  if (aiVisionModel) aiVisionModel.value = defaults.visionModel;
+  if (aiEmbeddingModel) aiEmbeddingModel.value = defaults.embeddingModel;
+  if (aiBaseUrl) aiBaseUrl.value = defaults.baseUrl;
+  updateAiProviderFields();
+});
+
+aiSettingsForm?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  saveAiConfig();
+});
+
+testAiConnectionButton?.addEventListener("click", () => {
+  void testAiConnection();
+});
 
 selectFolderButton?.addEventListener("click", async () => {
   const selected = await open({

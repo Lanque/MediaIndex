@@ -84,8 +84,12 @@ fn search_media(
 }
 
 #[tauri::command]
-fn analyze_media_folder(app: tauri::AppHandle, path: String) -> Result<ai::AiIndexReport, String> {
-    let settings = ai::AiSettings::from_environment()?;
+fn analyze_media_folder(
+    app: tauri::AppHandle,
+    path: String,
+    config: Option<ai::AiRequestConfig>,
+) -> Result<ai::AiIndexReport, String> {
+    let settings = ai::AiSettings::from_request(config)?;
     let mut index = open_local_index(&app)?;
     let root = Path::new(&path);
     let files = index
@@ -129,12 +133,22 @@ fn analyze_media_folder(app: tauri::AppHandle, path: String) -> Result<ai::AiInd
 fn search_ai(
     app: tauri::AppHandle,
     query: String,
+    config: Option<ai::AiRequestConfig>,
 ) -> Result<Vec<local_index::AiSearchResult>, String> {
-    let settings = ai::AiSettings::from_environment()?;
+    let settings = ai::AiSettings::from_request(config)?;
     let embedding = ai::embed_query(&query, &settings)?;
+    let model_namespace = settings.model_namespace();
     open_local_index(&app)?
-        .search_ai(&embedding, 100)
+        .search_ai(&embedding, 100, Some(&model_namespace))
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn test_ai_connection(
+    config: Option<ai::AiRequestConfig>,
+) -> Result<ai::AiConnectionReport, String> {
+    let settings = ai::AiSettings::from_request(config)?;
+    ai::test_connection(&settings)
 }
 
 #[tauri::command]
@@ -180,6 +194,7 @@ pub fn run() {
             search_media,
             analyze_media_folder,
             search_ai,
+            test_ai_connection,
             open_indexed_media_path
         ])
         .run(tauri::generate_context!())

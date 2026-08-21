@@ -409,6 +409,7 @@ impl SqliteIndex {
         &self,
         query_embedding: &[f32],
         limit: usize,
+        model_namespace: Option<&str>,
     ) -> Result<Vec<AiSearchResult>, IndexError> {
         let mut statement = self.connection.prepare(
             "SELECT ai_annotations.timestamp_ms, ai_annotations.description,
@@ -416,9 +417,10 @@ impl SqliteIndex {
                     local_files.path, local_files.content_hash, local_files.status
              FROM ai_annotations
              JOIN local_files ON local_files.content_hash = ai_annotations.content_hash
-             WHERE local_files.status = 'ACTIVE'",
+             WHERE local_files.status = 'ACTIVE'
+               AND (?1 IS NULL OR ai_annotations.model = ?1)",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map(params![model_namespace], |row| {
             let timestamp_ms: u64 = row.get(0)?;
             let description: String = row.get(1)?;
             let labels: Vec<String> =
@@ -978,12 +980,23 @@ mod tests {
             .expect("annotation should persist");
 
         let results = index
-            .search_ai(&[0.9, 0.1], 10)
+            .search_ai(&[0.9, 0.1], 10, None)
             .expect("AI search should work");
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].timestamp_ms, 12_000);
         assert!(results[0].score > 0.9);
+        assert_eq!(
+            index
+                .search_ai(&[0.9, 0.1], 10, Some("fixture"))
+                .expect("matching model namespace should work")
+                .len(),
+            1
+        );
+        assert!(index
+            .search_ai(&[0.9, 0.1], 10, Some("other-model"))
+            .expect("different model namespace should be empty")
+            .is_empty());
     }
 
     #[test]
