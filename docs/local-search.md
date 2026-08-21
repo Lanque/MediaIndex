@@ -65,10 +65,12 @@ the values in **AI connection** to adjust the cost/coverage trade-off. The full
 original video is never uploaded as one file, but sampled frames are sent to the
 configured provider. MediaIndex extracts all sampled frames for one clip in a
 single FFmpeg pass and batches embedding requests. Cloud providers receive up
-to 24 sampled frames per vision request and process up to four clips
-concurrently; local Ollama analysis remains sequential. The provider and model
-name are stored with each annotation, so embeddings from incompatible models
-are not mixed in one search.
+to eight sampled frames per vision request, sampled JPEGs are capped at 1280
+pixels wide, and up to two clips are processed concurrently. This avoids
+oversized parallel uploads while retaining high-detail HUD analysis; local
+Ollama analysis remains sequential. The provider and model name are stored with
+each annotation, so embeddings from incompatible models are not mixed in one
+search.
 
 The vision prompt also requests readable on-screen text from HUDs, kill feeds,
 subtitles, and overlays. Search ranking combines semantic similarity with

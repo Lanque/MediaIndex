@@ -2,10 +2,11 @@ use base64::Engine;
 use reqwest::blocking::{Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::error::Error as StdError;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::metadata::MediaMetadata;
 
@@ -18,6 +19,11 @@ const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com
 const DEFAULT_LOCAL_VISION_MODEL: &str = "gemma4";
 const DEFAULT_LOCAL_EMBEDDING_MODEL: &str = "embeddinggemma";
 const DEFAULT_LOCAL_BASE_URL: &str = "http://127.0.0.1:11434";
+const REMOTE_PARALLEL_FILE_LIMIT: usize = 2;
+const REMOTE_VISION_BATCH_SIZE: usize = 8;
+const MAX_EXTRACTED_FRAME_WIDTH: u32 = 1_280;
+const AI_CONNECT_TIMEOUT_SECONDS: u64 = 20;
+const AI_REQUEST_TIMEOUT_SECONDS: u64 = 180;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub enum AiProvider {
@@ -227,7 +233,7 @@ impl AiSettings {
 
     pub fn parallel_file_limit(&self) -> usize {
         if self.provider.is_remote() {
-            4
+            REMOTE_PARALLEL_FILE_LIMIT
         } else {
             1
         }
@@ -235,7 +241,7 @@ impl AiSettings {
 
     fn vision_batch_size(&self) -> usize {
         if self.provider.is_remote() {
-            24
+            REMOTE_VISION_BATCH_SIZE
         } else {
             4
         }
@@ -259,9 +265,7 @@ pub fn analyze_file_with_progress<F>(
 where
     F: Fn(AiFileProgress),
 {
-    let client = Client::builder()
-        .build()
-        .map_err(|error| format!("cannot create AI HTTP client: {error}"))?;
+    let client = build_http_client()?;
     progress(AiFileProgress {
         percent: 1,
         phase: "Extracting frames",
@@ -379,16 +383,12 @@ pub fn embed_query(query: &str, settings: &AiSettings) -> Result<Vec<f32>, Strin
     if query.trim().is_empty() {
         return Err("AI search query cannot be empty".to_owned());
     }
-    let client = Client::builder()
-        .build()
-        .map_err(|error| format!("cannot create AI HTTP client: {error}"))?;
+    let client = build_http_client()?;
     create_embedding(&client, query.trim(), settings, EmbeddingKind::Query)
 }
 
 pub fn test_connection(settings: &AiSettings) -> Result<AiConnectionReport, String> {
-    let client = Client::builder()
-        .build()
-        .map_err(|error| format!("cannot create AI HTTP client: {error}"))?;
+    let client = build_http_client()?;
     let embedding = create_embedding(
         &client,
         "MediaIndex connection test",
@@ -427,6 +427,44 @@ fn non_empty(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn build_http_client() -> Result<Client, String> {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(AI_CONNECT_TIMEOUT_SECONDS))
+        .timeout(Duration::from_secs(AI_REQUEST_TIMEOUT_SECONDS))
+        .pool_max_idle_per_host(REMOTE_PARALLEL_FILE_LIMIT)
+        .build()
+        .map_err(|error| format!("cannot create AI HTTP client: {error}"))
+}
+
+fn request_failure(operation: &str, error: &reqwest::Error) -> String {
+    let mut chain = vec![error.to_string()];
+    let mut source = StdError::source(error);
+    while let Some(cause) = source {
+        let detail = cause.to_string();
+        if chain.last() != Some(&detail) {
+            chain.push(detail);
+        }
+        source = cause.source();
+    }
+
+    let category = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection/TLS"
+    } else if error.is_body() {
+        "upload"
+    } else if error.is_decode() {
+        "response decoding"
+    } else {
+        "transport"
+    };
+    let root_cause = chain.last().cloned().unwrap_or_else(|| error.to_string());
+    format!(
+        "{operation} request failed ({category}): {root_cause}. Details: {}",
+        chain.join(" -> ")
+    )
+}
+
 fn provider_from_environment() -> Option<AiProvider> {
     match env_non_empty("MEDIAINDEX_AI_PROVIDER")?
         .to_ascii_lowercase()
@@ -450,7 +488,8 @@ fn extract_frames(path: &Path, settings: &AiSettings) -> Result<Vec<(u64, Vec<u8
         .map_err(|error| format!("cannot create temporary AI frame directory: {error}"))?;
     let output_pattern = output_directory.join("frame-%06d.jpg");
     let sample_seconds = (settings.sample_interval_ms / 1_000).max(1);
-    let filter = format!("fps=1/{sample_seconds}");
+    let filter =
+        format!("fps=1/{sample_seconds},scale=w='min({MAX_EXTRACTED_FRAME_WIDTH},iw)':h=-2");
     let mut command = Command::new(&settings.ffmpeg_executable);
     configure_hidden_process(&mut command);
     let output = command
@@ -458,7 +497,7 @@ fn extract_frames(path: &Path, settings: &AiSettings) -> Result<Vec<(u64, Vec<u8
         .arg(path)
         .args(["-vf", &filter, "-frames:v"])
         .arg(settings.max_frames_per_file.to_string())
-        .args(["-q:v", "4", "-f", "image2"])
+        .args(["-q:v", "5", "-f", "image2"])
         .arg(&output_pattern)
         .output()
         .map_err(|error| {
@@ -633,7 +672,7 @@ fn describe_openai(
             }]
         }))
         .send()
-        .map_err(|error| format!("OpenAI vision request failed: {error}"))?;
+        .map_err(|error| request_failure("OpenAI vision", &error))?;
     let body = read_json_response(response, "OpenAI vision")?;
     response_text(&body).ok_or_else(|| "OpenAI vision returned no output text".to_owned())
 }
@@ -664,7 +703,7 @@ fn describe_gemini(
             "generationConfig": {"responseMimeType": "application/json"}
         }))
         .send()
-        .map_err(|error| format!("Gemini vision request failed: {error}"))?;
+        .map_err(|error| request_failure("Gemini vision", &error))?;
     let body = read_json_response(response, "Gemini vision")?;
     response_text(&body).ok_or_else(|| "Gemini vision returned no candidate text".to_owned())
 }
@@ -688,7 +727,7 @@ fn describe_local(
             "stream": false
         }))
         .send()
-        .map_err(|error| format!("Local AI request failed: {error}"))?;
+        .map_err(|error| request_failure("Local AI vision", &error))?;
     let body = read_json_response(response, "Local AI vision")?;
     response_text(&body).ok_or_else(|| "Local AI returned no message content".to_owned())
 }
@@ -757,7 +796,7 @@ fn create_embeddings(
                     "input": texts
                 }))
                 .send()
-                .map_err(|error| format!("OpenAI embedding request failed: {error}"))?;
+                .map_err(|error| request_failure("OpenAI embedding", &error))?;
             let body = read_json_response(response, "OpenAI embedding")?;
             body.get("data")
                 .and_then(Value::as_array)
@@ -782,7 +821,7 @@ fn create_embeddings(
                     "input": texts
                 }))
                 .send()
-                .map_err(|error| format!("Local AI embedding request failed: {error}"))?;
+                .map_err(|error| request_failure("Local AI embedding", &error))?;
             let body = read_json_response(response, "Local AI embedding")?;
             body.get("embeddings")
                 .and_then(Value::as_array)
@@ -828,7 +867,7 @@ fn create_gemini_embedding(
             "taskType": task_type
         }))
         .send()
-        .map_err(|error| format!("Gemini embedding request failed: {error}"))?;
+        .map_err(|error| request_failure("Gemini embedding", &error))?;
     let body = read_json_response(response, "Gemini embedding")?;
     let embedding = body
         .get("embedding")
@@ -1069,68 +1108,69 @@ mod tests {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
         let address = listener.local_addr().expect("stub should have an address");
-        let handle = std::thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().expect("stub should accept a request");
-                let (request_line, request) = read_stub_request(&mut stream);
-                if request_line.starts_with("POST /responses ") {
-                    let image_count = request
-                        .pointer("/input/0/content")
-                        .and_then(Value::as_array)
-                        .expect("vision request should contain content")
-                        .iter()
-                        .filter(|item| {
-                            item.get("type").and_then(Value::as_str) == Some("input_image")
+        let handle = std::thread::spawn(move || loop {
+            let (mut stream, _) = listener.accept().expect("stub should accept a request");
+            let (request_line, request) = read_stub_request(&mut stream);
+            if request_line.starts_with("POST /responses ") {
+                let image_count = request
+                    .pointer("/input/0/content")
+                    .and_then(Value::as_array)
+                    .expect("vision request should contain content")
+                    .iter()
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("input_image"))
+                    .count();
+                assert!(image_count > 0, "vision request should contain images");
+                assert!(
+                    image_count <= REMOTE_VISION_BATCH_SIZE,
+                    "cloud vision request should stay within the upload bound"
+                );
+                assert_eq!(request.get("store"), Some(&Value::Bool(false)));
+                assert_eq!(
+                    request.pointer("/text/format/type").and_then(Value::as_str),
+                    Some("json_schema")
+                );
+                assert_eq!(
+                    request
+                        .pointer("/text/format/schema/properties/frames/maxItems")
+                        .and_then(Value::as_u64),
+                    Some(image_count as u64)
+                );
+                let analyses = (0..image_count)
+                    .map(|_| {
+                        json!({
+                            "description": "A Fortnite player eliminates an opponent",
+                            "labels": ["fortnite", "kill", "elimination"],
+                            "visible_text": ["ELIMINATED"],
+                            "confidence": 0.98
                         })
-                        .count();
-                    assert!(image_count > 0, "vision request should contain images");
-                    assert_eq!(request.get("store"), Some(&Value::Bool(false)));
-                    assert_eq!(
-                        request.pointer("/text/format/type").and_then(Value::as_str),
-                        Some("json_schema")
-                    );
-                    assert_eq!(
-                        request
-                            .pointer("/text/format/schema/properties/frames/maxItems")
-                            .and_then(Value::as_u64),
-                        Some(image_count as u64)
-                    );
-                    let analyses = (0..image_count)
-                        .map(|_| {
-                            json!({
-                                "description": "A Fortnite player eliminates an opponent",
-                                "labels": ["fortnite", "kill", "elimination"],
-                                "visible_text": ["ELIMINATED"],
-                                "confidence": 0.98
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    write_stub_response(
-                        &mut stream,
-                        &json!({
-                            "status": "completed",
-                            "error": null,
-                            "output": [{
-                                "content": [{
-                                    "type": "output_text",
-                                    "text": serde_json::to_string(&json!({"frames": analyses})).unwrap()
-                                }]
+                    })
+                    .collect::<Vec<_>>();
+                write_stub_response(
+                    &mut stream,
+                    &json!({
+                        "status": "completed",
+                        "error": null,
+                        "output": [{
+                            "content": [{
+                                "type": "output_text",
+                                "text": serde_json::to_string(&json!({"frames": analyses})).unwrap()
                             }]
-                        }),
-                    );
-                } else if request_line.starts_with("POST /embeddings ") {
-                    let input_count = request
-                        .get("input")
-                        .and_then(Value::as_array)
-                        .expect("embedding request should contain input")
-                        .len();
-                    let data = (0..input_count)
-                        .map(|index| json!({"index": index, "embedding": [1.0, 0.0, 0.5]}))
-                        .collect::<Vec<_>>();
-                    write_stub_response(&mut stream, &json!({"data": data}));
-                } else {
-                    panic!("unexpected stub request: {request_line}");
-                }
+                        }]
+                    }),
+                );
+            } else if request_line.starts_with("POST /embeddings ") {
+                let input_count = request
+                    .get("input")
+                    .and_then(Value::as_array)
+                    .expect("embedding request should contain input")
+                    .len();
+                let data = (0..input_count)
+                    .map(|index| json!({"index": index, "embedding": [1.0, 0.0, 0.5]}))
+                    .collect::<Vec<_>>();
+                write_stub_response(&mut stream, &json!({"data": data}));
+                break;
+            } else {
+                panic!("unexpected stub request: {request_line}");
             }
         });
         (format!("http://{address}"), handle)
@@ -1250,8 +1290,8 @@ mod tests {
         assert_eq!(settings.vision_model, "vision-test");
         assert_eq!(settings.embedding_model, "embedding-test");
         assert_eq!(settings.base_url, "https://example.test/v1");
-        assert_eq!(settings.parallel_file_limit(), 4);
-        assert_eq!(settings.vision_batch_size(), 24);
+        assert_eq!(settings.parallel_file_limit(), 2);
+        assert_eq!(settings.vision_batch_size(), 8);
         assert_eq!(
             settings.model_namespace(),
             "openai:vision-test:embedding-test"
@@ -1285,7 +1325,7 @@ mod tests {
         server.join().expect("stub should finish cleanly");
 
         println!(
-            "analyzed {} sampled frames in one cloud vision request",
+            "analyzed {} sampled frames across bounded cloud vision requests",
             annotations.len()
         );
         assert!(!annotations.is_empty());
