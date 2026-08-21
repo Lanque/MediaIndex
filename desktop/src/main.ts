@@ -312,16 +312,21 @@ function aiDefaults(provider: AiProvider): AiConfig {
 
 function readAiConfig(): AiConfig {
   const provider = (aiProvider?.value as AiProvider) || "local";
+  const defaults = aiDefaults(provider);
   return {
     provider,
     apiKey: aiApiKey?.value.trim() ?? "",
-    visionModel: aiVisionModel?.value.trim() ?? "",
-    embeddingModel: aiEmbeddingModel?.value.trim() ?? "",
-    baseUrl: aiBaseUrl?.value.trim() ?? "",
+    visionModel: aiVisionModel?.value.trim() || defaults.visionModel,
+    embeddingModel: aiEmbeddingModel?.value.trim() || defaults.embeddingModel,
+    baseUrl: aiBaseUrl?.value.trim() || defaults.baseUrl,
     ffmpegPath: aiFfmpegPath?.value.trim() ?? "",
     sampleIntervalSeconds: Math.max(1, Number(aiSampleSeconds?.value ?? 5) || 5),
     maxFrames: Math.max(1, Number(aiMaxFrames?.value ?? 120) || 120),
   };
+}
+
+function aiProviderLabel(provider: AiProvider): string {
+  return provider === "openai" ? "OpenAI" : provider === "gemini" ? "Gemini" : "Local (Ollama)";
 }
 
 function applyAiConfig(config: AiConfig): void {
@@ -374,10 +379,15 @@ function loadAiConfig(): void {
   }
 }
 
-function saveAiConfig(): void {
+function saveAiConfig(): AiConfig {
   const config = readAiConfig();
-  localStorage.setItem(AI_SETTINGS_STORAGE_KEY, JSON.stringify(config));
-  if (aiConfigStatus) aiConfigStatus.textContent = "AI settings saved locally.";
+  try {
+    localStorage.setItem(AI_SETTINGS_STORAGE_KEY, JSON.stringify(config));
+    if (aiConfigStatus) aiConfigStatus.textContent = "AI settings saved locally.";
+  } catch (error) {
+    if (aiConfigStatus) aiConfigStatus.textContent = `Could not save AI settings: ${String(error)}`;
+  }
+  return config;
 }
 
 loadAiConfig();
@@ -564,10 +574,13 @@ async function searchAiLibrary(): Promise<void> {
     aiSearchButton.disabled = true;
     aiSearchButton.textContent = "AI searching…";
   }
-  if (aiSearchStatus) aiSearchStatus.textContent = "Comparing your query with indexed visual moments…";
+  const config = saveAiConfig();
+  if (aiSearchStatus) {
+    aiSearchStatus.textContent = `Using ${aiProviderLabel(config.provider)} · ${config.embeddingModel}. Comparing indexed visual moments…`;
+  }
   if (libraryStatus) libraryStatus.textContent = "AI search in progress…";
   try {
-    const matches = await invoke<AiSearchResult[]>("search_ai", { query, config: readAiConfig() });
+    const matches = await invoke<AiSearchResult[]>("search_ai", { query, config });
     renderResults(matches.map((match) => ({
       path: match.path,
       content_hash: match.content_hash,
@@ -603,12 +616,13 @@ async function analyzeLibraryWithAi(): Promise<void> {
   analyzeAiButton.disabled = true;
   const originalLabel = analyzeAiButton.textContent ?? "Analyze with AI";
   analyzeAiButton.textContent = "Analyzing…";
+  const config = saveAiConfig();
   if (libraryStatus) libraryStatus.textContent = "AI analysis in progress…";
-  if (libraryPath) libraryPath.textContent = "Sampling frames and creating searchable descriptions";
+  if (libraryPath) libraryPath.textContent = `Using ${aiProviderLabel(config.provider)} · ${config.visionModel} / ${config.embeddingModel}`;
   try {
     const report = await invoke<AiIndexReport>("analyze_media_folder", {
       path: selectedLibraryPath,
-      config: readAiConfig(),
+      config,
     });
     const warningSuffix = report.warnings.length ? ` · ${report.warnings.length} warnings` : "";
     const warningDetails = report.warnings
@@ -637,10 +651,11 @@ async function analyzeLibraryWithAi(): Promise<void> {
 async function testAiConnection(): Promise<void> {
   if (!testAiConnectionButton) return;
   testAiConnectionButton.disabled = true;
-  if (aiConfigStatus) aiConfigStatus.textContent = "Testing AI connection…";
+  const config = saveAiConfig();
+  if (aiConfigStatus) aiConfigStatus.textContent = `Testing ${aiProviderLabel(config.provider)} · ${config.embeddingModel}…`;
   try {
     const report = await invoke<AiConnectionReport>("test_ai_connection", {
-      config: readAiConfig(),
+      config,
     });
     if (aiConfigStatus) {
       aiConfigStatus.textContent = "Connected: " + report.provider + " · " + report.embedding_model + " · " + report.embedding_dimensions + " dimensions";
@@ -660,6 +675,7 @@ aiProvider?.addEventListener("change", () => {
   if (aiEmbeddingModel) aiEmbeddingModel.value = defaults.embeddingModel;
   if (aiBaseUrl) aiBaseUrl.value = defaults.baseUrl;
   updateAiProviderFields();
+  saveAiConfig();
 });
 
 aiSettingsForm?.addEventListener("submit", (event) => {
