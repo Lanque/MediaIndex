@@ -2,7 +2,6 @@ pub mod local_index;
 pub mod metadata;
 pub mod scanner;
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::Manager;
@@ -23,11 +22,14 @@ fn index_media_folder(
     app: tauri::AppHandle,
     path: String,
 ) -> Result<local_index::IndexReport, String> {
-    let scan = scanner::scan_folder(Path::new(&path), &scanner::ScanOptions::default())
+    let mut scan = scanner::scan_folder(Path::new(&path), &scanner::ScanOptions::default())
         .map_err(|error| error.to_string())?;
+    let (metadata_by_path, metadata_warnings) =
+        metadata::collect_metadata(&scan.files, &metadata::FfprobeMetadataProbe::default());
+    scan.warnings.extend(metadata_warnings);
     let mut index = open_local_index(&app)?;
     index
-        .reconcile(&scan, &HashMap::new())
+        .reconcile(&scan, &metadata_by_path)
         .map_err(|error| error.to_string())
 }
 

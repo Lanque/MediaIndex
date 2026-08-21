@@ -2,6 +2,7 @@ use crate::metadata::MediaMetadata;
 use crate::scanner::{DiscoveredFile, ScanReport, ScanWarning};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::path::Path;
@@ -115,6 +116,29 @@ pub struct SearchQuery {
     pub min_duration_ms: Option<u64>,
     pub max_duration_ms: Option<u64>,
     pub codec: Option<String>,
+    #[serde(default)]
+    pub sort_by: SearchSortField,
+    #[serde(default)]
+    pub sort_direction: SearchSortDirection,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSortField {
+    #[default]
+    Name,
+    Duration,
+    Size,
+    Modified,
+    Resolution,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSortDirection {
+    #[default]
+    Asc,
+    Desc,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -334,6 +358,8 @@ impl SqliteIndex {
             }
         }
 
+        results.sort_by(|left, right| compare_results(left, right, query));
+
         Ok(results)
     }
 
@@ -518,6 +544,56 @@ fn matches_query(result: &SearchResult, query: &SearchQuery) -> bool {
     }
 
     true
+}
+
+fn compare_results(left: &SearchResult, right: &SearchResult, query: &SearchQuery) -> Ordering {
+    let primary = match query.sort_by {
+        SearchSortField::Name => path_key(&left.path).cmp(&path_key(&right.path)),
+        SearchSortField::Duration => compare_optional(
+            left.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.duration_ms),
+            right
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.duration_ms),
+        ),
+        SearchSortField::Size => left.size_bytes.cmp(&right.size_bytes),
+        SearchSortField::Modified => {
+            compare_optional(left.modified_unix_ms, right.modified_unix_ms)
+        }
+        SearchSortField::Resolution => compare_optional(
+            left.metadata.as_ref().and_then(resolution_key),
+            right.metadata.as_ref().and_then(resolution_key),
+        ),
+    };
+
+    let primary = if query.sort_direction == SearchSortDirection::Desc {
+        primary.reverse()
+    } else {
+        primary
+    };
+
+    if primary == Ordering::Equal {
+        path_key(&left.path).cmp(&path_key(&right.path))
+    } else {
+        primary
+    }
+}
+
+fn compare_optional<T: Ord>(left: Option<T>, right: Option<T>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+    }
+}
+
+fn resolution_key(metadata: &MediaMetadata) -> Option<(u64, u32, u32)> {
+    let width = metadata.width?;
+    let height = metadata.height?;
+    Some((u64::from(width) * u64::from(height), width, height))
 }
 
 fn metadata_search_text(metadata: Option<&MediaMetadata>) -> String {
@@ -739,12 +815,83 @@ mod tests {
                 min_duration_ms: Some(10_000),
                 max_duration_ms: Some(20_000),
                 codec: Some("aac".to_owned()),
+                sort_by: SearchSortField::Name,
+                sort_direction: SearchSortDirection::Asc,
             })
             .expect("search should work locally");
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "/library/day-one/scene-a.mp4");
         assert!(!results[0].available);
+    }
+
+    #[test]
+    fn sorts_results_by_duration_and_keeps_path_order_for_ties() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        let files = vec![
+            DiscoveredFile {
+                path: "/library/long.mp4".to_owned(),
+                size_bytes: 20,
+                modified_unix_ms: Some(2),
+                content_hash: "hash-long".to_owned(),
+            },
+            DiscoveredFile {
+                path: "/library/short.mp4".to_owned(),
+                size_bytes: 10,
+                modified_unix_ms: Some(1),
+                content_hash: "hash-short".to_owned(),
+            },
+        ];
+        let mut metadata_by_path = HashMap::new();
+        metadata_by_path.insert(
+            "/library/long.mp4".to_owned(),
+            MediaMetadata {
+                duration_ms: Some(20_000),
+                size_bytes: Some(20),
+                container: Some("mp4".to_owned()),
+                video_codec: None,
+                audio_codec: None,
+                width: Some(1920),
+                height: Some(1080),
+                frame_rate: None,
+                start_time: None,
+                creation_time: None,
+            },
+        );
+        metadata_by_path.insert(
+            "/library/short.mp4".to_owned(),
+            MediaMetadata {
+                duration_ms: Some(5_000),
+                size_bytes: Some(10),
+                container: Some("mp4".to_owned()),
+                video_codec: None,
+                audio_codec: None,
+                width: Some(1280),
+                height: Some(720),
+                frame_rate: None,
+                start_time: None,
+                creation_time: None,
+            },
+        );
+        index
+            .reconcile(&report(files), &metadata_by_path)
+            .expect("fixtures should be indexed");
+
+        let results = index
+            .search(&SearchQuery {
+                sort_by: SearchSortField::Duration,
+                sort_direction: SearchSortDirection::Asc,
+                ..SearchQuery::default()
+            })
+            .expect("sorted search should work");
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/library/short.mp4", "/library/long.mp4"]
+        );
     }
 
     #[test]
