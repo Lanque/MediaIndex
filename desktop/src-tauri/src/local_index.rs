@@ -405,8 +405,17 @@ impl SqliteIndex {
             .query_row("SELECT COUNT(*) FROM ai_annotations", [], |row| row.get(0))?)
     }
 
+    pub fn ai_annotation_count_for_model(&self, model_namespace: &str) -> Result<u64, IndexError> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM ai_annotations WHERE model = ?1",
+            params![model_namespace],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn search_ai(
         &self,
+        query_text: &str,
         query_embedding: &[f32],
         limit: usize,
         model_namespace: Option<&str>,
@@ -465,9 +474,11 @@ impl SqliteIndex {
                     content_hash,
                     status,
                 )| {
+                    let semantic_score = cosine_similarity(query_embedding, &stored_embedding)?;
+                    let keyword_score = lexical_relevance(query_text, &description, &labels);
                     Some(AiSearchResult {
                         timestamp_ms,
-                        score: cosine_similarity(query_embedding, &stored_embedding)?,
+                        score: (semantic_score * 0.75 + keyword_score * 0.25).max(0.0),
                         description,
                         labels,
                         available: status == "ACTIVE" && Path::new(&path).is_file(),
@@ -630,6 +641,59 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
     }
     let denominator = left_norm.sqrt() * right_norm.sqrt();
     (denominator > 0.0).then_some(dot / denominator)
+}
+
+fn lexical_relevance(query: &str, description: &str, labels: &[String]) -> f32 {
+    let query_terms = search_terms(query);
+    if query_terms.is_empty() {
+        return 0.0;
+    }
+    let searchable = format!(
+        "{} {}",
+        description.to_ascii_lowercase(),
+        labels.join(" ").to_ascii_lowercase()
+    );
+    let matched = query_terms
+        .iter()
+        .filter(|term| {
+            let stem = search_stem(term);
+            searchable.contains(term.as_str()) || (!stem.is_empty() && searchable.contains(&stem))
+        })
+        .count();
+    matched as f32 / query_terms.len() as f32
+}
+
+fn search_terms(value: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for term in value
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|term| term.len() >= 3)
+    {
+        if !terms.iter().any(|existing| existing == term) {
+            terms.push(term.to_owned());
+        }
+    }
+    terms
+}
+
+fn search_stem(term: &str) -> String {
+    if term.ends_with("ation") && term.len() > 6 {
+        return term[..term.len() - 3].to_owned();
+    }
+    if term.ends_with("ing") && term.len() > 5 {
+        return term[..term.len() - 3].to_owned();
+    }
+    if term.ends_with("ed") && term.len() > 4 {
+        return term[..term.len() - 2].to_owned();
+    }
+    if term.ends_with('e') && term.len() > 4 {
+        return term[..term.len() - 1].to_owned();
+    }
+    if term.ends_with('s') && term.len() > 4 {
+        return term[..term.len() - 1].to_owned();
+    }
+    term.to_owned()
 }
 
 fn matches_query(result: &SearchResult, query: &SearchQuery) -> bool {
@@ -980,7 +1044,7 @@ mod tests {
             .expect("annotation should persist");
 
         let results = index
-            .search_ai(&[0.9, 0.1], 10, None)
+            .search_ai("fortnite kill", &[0.9, 0.1], 10, None)
             .expect("AI search should work");
 
         assert_eq!(results.len(), 1);
@@ -988,15 +1052,46 @@ mod tests {
         assert!(results[0].score > 0.9);
         assert_eq!(
             index
-                .search_ai(&[0.9, 0.1], 10, Some("fixture"))
+                .search_ai("elimination", &[0.9, 0.1], 10, Some("fixture"))
                 .expect("matching model namespace should work")
                 .len(),
             1
         );
         assert!(index
-            .search_ai(&[0.9, 0.1], 10, Some("other-model"))
+            .search_ai("elimination", &[0.9, 0.1], 10, Some("other-model"))
             .expect("different model namespace should be empty")
             .is_empty());
+    }
+
+    #[test]
+    fn boosts_inflected_event_keywords_in_ai_search() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/elimination.mp4", "hash-elimination")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        index
+            .replace_ai_annotations(
+                "hash-elimination",
+                &[AiAnnotation {
+                    timestamp_ms: 5_000,
+                    description: "The kill feed shows an enemy eliminated".to_owned(),
+                    labels: vec!["on-screen text: ELIMINATED".to_owned()],
+                    embedding: vec![0.1, 0.9],
+                    confidence: Some(0.9),
+                    model: "fixture".to_owned(),
+                }],
+            )
+            .expect("annotation should persist");
+
+        let results = index
+            .search_ai("elimination", &[0.0, 1.0], 10, Some("fixture"))
+            .expect("AI search should work");
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].score > 0.99);
     }
 
     #[test]

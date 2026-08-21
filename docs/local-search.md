@@ -63,8 +63,18 @@ timestamp. Press **Preview** to open the clip at that timestamp. The default
 sampling interval is five seconds with a maximum of 120 frames per file; use
 the values in **AI connection** to adjust the cost/coverage trade-off. The full
 original video is never uploaded as one file, but sampled frames are sent to the
-configured provider. The provider and model name are stored with each
-annotation, so embeddings from incompatible models are not mixed in one search.
+configured provider. MediaIndex extracts all sampled frames for one clip in a
+single FFmpeg pass and batches embedding requests. The provider and model name
+are stored with each annotation, so embeddings from incompatible models are not
+mixed in one search.
+
+The vision prompt also requests readable on-screen text from HUDs, kill feeds,
+subtitles, and overlays. Search ranking combines semantic similarity with
+keyword matching and light inflection handling (`kill`/`killed`,
+`elimination`/`eliminated`). For short-lived events, set **Every (s)** to `2` or
+`1` before analysis. Changing provider or embedding model requires analyzing the
+folder again with that configuration; otherwise the app reports that no AI
+moments exist for the active model namespace.
 
 For **Local (Ollama)**, Ollama must be running at the configured base URL and
 the selected models must already be installed. For cloud providers, the app

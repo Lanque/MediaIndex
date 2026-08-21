@@ -74,9 +74,19 @@ the selected vision and embedding models available (for example `gemma4` and
 `embeddinggemma`). The default endpoint is `http://127.0.0.1:11434`.
 
 FFmpeg is resolved from the optional path in **AI connection**, then from the
-`MEDIAINDEX_FFMPEG_PATH` environment variable, then from `PATH`. Sampling
-defaults to one frame per five seconds and at most 120 frames per file; the
-interval and limit can be changed directly in the same panel.
+`MEDIAINDEX_FFMPEG_PATH` environment variable, then from `PATH`. Frame
+extraction runs once per clip and embeddings are sent in batches, so analysis is
+substantially faster than making one FFmpeg and embedding request per frame.
+Sampling defaults to one frame per five seconds and at most 120 frames per file;
+for short, fast events such as a kill feed, set **Every (s)** to `2` or `1`.
+The progress line shows the current clip while analysis is running.
+
+The vision result stores readable HUD/kill-feed/subtitle text together with the
+description. AI Search combines embedding similarity with exact/inflected
+keyword matching, so `kill`, `killed`, `elimination`, and `eliminated` can match
+the same indexed moment when the text or event was captured. If the provider or
+embedding model changes, run **Analyze with AI** again; incompatible provider
+annotations are intentionally kept separate.
 
 The environment variables remain available for automation and older launch
 scripts (`MEDIAINDEX_AI_PROVIDER`, provider-specific API keys, model names,

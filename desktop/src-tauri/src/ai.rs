@@ -79,6 +79,14 @@ pub struct AiIndexReport {
     pub warnings: Vec<AiWarning>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct AiProgress {
+    pub completed_files: u64,
+    pub total_files: u64,
+    pub current_file: String,
+    pub provider: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AiConnectionReport {
     pub provider: String,
@@ -212,37 +220,93 @@ impl AiSettings {
 
 pub fn analyze_file(
     path: &Path,
-    metadata: Option<&MediaMetadata>,
+    _metadata: Option<&MediaMetadata>,
     settings: &AiSettings,
 ) -> Result<Vec<AiAnnotation>, String> {
-    let duration_ms = metadata
-        .and_then(|value| value.duration_ms)
-        .unwrap_or(settings.sample_interval_ms)
-        .max(1);
-    let mut timestamps = Vec::new();
-    let mut timestamp_ms = 0;
-    while timestamps.len() < settings.max_frames_per_file && timestamp_ms < duration_ms {
-        timestamps.push(timestamp_ms);
-        timestamp_ms = timestamp_ms.saturating_add(settings.sample_interval_ms);
-    }
-    if timestamps.is_empty() {
-        timestamps.push(0);
-    }
-
     let client = Client::builder()
         .build()
         .map_err(|error| format!("cannot create AI HTTP client: {error}"))?;
-    let mut annotations = Vec::with_capacity(timestamps.len());
-    for timestamp_ms in timestamps {
-        let frame = extract_frame(path, timestamp_ms, settings)?;
-        let analysis = describe_frame(&client, &frame, timestamp_ms, settings)?;
-        let embedding_text = format!("{}\n{}", analysis.description, analysis.labels.join(", "));
-        let embedding =
-            create_embedding(&client, &embedding_text, settings, EmbeddingKind::Document)?;
+    let frames = extract_frames(path, settings)?;
+    let mut analyses = Vec::with_capacity(frames.len());
+    let mut frame_errors = Vec::new();
+    for frame_batch in frames.chunks(4) {
+        match describe_frames(&client, frame_batch, settings) {
+            Ok(batch) if batch.len() == frame_batch.len() => {
+                analyses.extend(
+                    frame_batch
+                        .iter()
+                        .map(|(timestamp_ms, _)| *timestamp_ms)
+                        .zip(batch),
+                );
+            }
+            Ok(batch) => frame_errors.push(format!(
+                "vision returned {} analyses for {} frames",
+                batch.len(),
+                frame_batch.len()
+            )),
+            Err(error) => frame_errors.push(format!(
+                "{}-{} ms: {error}",
+                frame_batch.first().map(|frame| frame.0).unwrap_or_default(),
+                frame_batch.last().map(|frame| frame.0).unwrap_or_default()
+            )),
+        }
+    }
+    if analyses.is_empty() {
+        return Err(format!(
+            "AI vision produced no usable frames for {}: {}",
+            path.display(),
+            frame_errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "no frame analysis was returned".to_owned())
+        ));
+    }
+
+    let embedding_texts = analyses
+        .iter()
+        .map(|(_, analysis)| {
+            format!(
+                "{}\nLabels: {}\nOn-screen text: {}",
+                analysis.description,
+                analysis.labels.join(", "),
+                analysis.visible_text.join(" | ")
+            )
+        })
+        .collect::<Vec<_>>();
+    let embeddings =
+        create_embeddings(&client, &embedding_texts, settings, EmbeddingKind::Document)?;
+    if embeddings.len() != analyses.len() {
+        return Err(format!(
+            "AI returned {} embeddings for {} analyzed frames",
+            embeddings.len(),
+            analyses.len()
+        ));
+    }
+
+    let mut annotations = Vec::with_capacity(analyses.len());
+    for ((timestamp_ms, analysis), embedding) in analyses.into_iter().zip(embeddings) {
+        let visible_text = normalize_labels(analysis.visible_text);
+        let mut labels = normalize_labels(analysis.labels);
+        labels.extend(
+            visible_text
+                .iter()
+                .map(|text| format!("on-screen text: {text}")),
+        );
+        labels.sort();
+        labels.dedup();
+        let description = if visible_text.is_empty() {
+            analysis.description
+        } else {
+            format!(
+                "{} On-screen text: {}",
+                analysis.description,
+                visible_text.join(" | ")
+            )
+        };
         annotations.push(AiAnnotation {
             timestamp_ms,
-            description: analysis.description,
-            labels: analysis.labels,
+            description,
+            labels,
             embedding,
             confidence: analysis.confidence,
             model: settings.model_namespace(),
@@ -316,28 +380,27 @@ fn provider_from_environment() -> Option<AiProvider> {
     }
 }
 
-fn extract_frame(path: &Path, timestamp_ms: u64, settings: &AiSettings) -> Result<Vec<u8>, String> {
+fn extract_frames(path: &Path, settings: &AiSettings) -> Result<Vec<(u64, Vec<u8>)>, String> {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_nanos())
         .unwrap_or_default();
-    let output_path =
-        std::env::temp_dir().join(format!("mediaindex-ai-{}-{unique}.jpg", std::process::id()));
-    let timestamp = format_seconds(timestamp_ms);
+    let output_directory =
+        std::env::temp_dir().join(format!("mediaindex-ai-{}-{unique}", std::process::id()));
+    fs::create_dir_all(&output_directory)
+        .map_err(|error| format!("cannot create temporary AI frame directory: {error}"))?;
+    let output_pattern = output_directory.join("frame-%06d.jpg");
+    let sample_seconds = (settings.sample_interval_ms / 1_000).max(1);
+    let filter = format!("fps=1/{sample_seconds}");
     let mut command = Command::new(&settings.ffmpeg_executable);
     configure_hidden_process(&mut command);
     let output = command
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-ss",
-            &timestamp,
-            "-i",
-        ])
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
         .arg(path)
-        .args(["-frames:v", "1", "-q:v", "4", "-f", "image2"])
-        .arg(&output_path)
+        .args(["-vf", &filter, "-frames:v"])
+        .arg(settings.max_frames_per_file.to_string())
+        .args(["-q:v", "4", "-f", "image2"])
+        .arg(&output_pattern)
         .output()
         .map_err(|error| {
             format!(
@@ -348,7 +411,7 @@ fn extract_frame(path: &Path, timestamp_ms: u64, settings: &AiSettings) -> Resul
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let _ = fs::remove_file(&output_path);
+        let _ = fs::remove_dir_all(&output_directory);
         return Err(if stderr.is_empty() {
             format!(
                 "FFmpeg failed for {} with status {}",
@@ -360,10 +423,26 @@ fn extract_frame(path: &Path, timestamp_ms: u64, settings: &AiSettings) -> Resul
         });
     }
 
-    let frame = fs::read(&output_path)
-        .map_err(|error| format!("cannot read extracted AI frame: {error}"))?;
-    let _ = fs::remove_file(&output_path);
-    Ok(frame)
+    let mut frames = Vec::new();
+    for index in 1..=settings.max_frames_per_file {
+        let frame_path = output_directory.join(format!("frame-{index:06}.jpg"));
+        if !frame_path.is_file() {
+            break;
+        }
+        let frame = fs::read(&frame_path).map_err(|error| {
+            format!(
+                "cannot read extracted AI frame {}: {error}",
+                frame_path.display()
+            )
+        })?;
+        let timestamp_ms = (index as u64 - 1).saturating_mul(settings.sample_interval_ms);
+        frames.push((timestamp_ms, frame));
+    }
+    let _ = fs::remove_dir_all(&output_directory);
+    if frames.is_empty() {
+        return Err(format!("FFmpeg produced no frames for {}", path.display()));
+    }
+    Ok(frames)
 }
 
 fn configure_hidden_process(command: &mut Command) {
@@ -375,15 +454,13 @@ fn configure_hidden_process(command: &mut Command) {
     }
 }
 
-fn format_seconds(timestamp_ms: u64) -> String {
-    format!("{:.3}", timestamp_ms as f64 / 1_000.0)
-}
-
 #[derive(Debug, Deserialize)]
 struct FrameAnalysis {
     description: String,
     #[serde(default)]
     labels: Vec<String>,
+    #[serde(default)]
+    visible_text: Vec<String>,
     confidence: Option<f32>,
 }
 
@@ -393,30 +470,50 @@ enum EmbeddingKind {
     Query,
 }
 
-fn describe_frame(
+fn describe_frames(
     client: &Client,
-    frame: &[u8],
-    timestamp_ms: u64,
+    frames: &[(u64, Vec<u8>)],
     settings: &AiSettings,
-) -> Result<FrameAnalysis, String> {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(frame);
+) -> Result<Vec<FrameAnalysis>, String> {
+    let encoded_frames = frames
+        .iter()
+        .map(|(timestamp_ms, frame)| {
+            (
+                *timestamp_ms,
+                base64::engine::general_purpose::STANDARD.encode(frame),
+            )
+        })
+        .collect::<Vec<_>>();
+    let timestamps = encoded_frames
+        .iter()
+        .map(|(timestamp_ms, _)| format!("{timestamp_ms} ms"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let prompt = format!(
-        "Analyze this video frame at timestamp {timestamp_ms} ms. This is for a searchable local video library. Return only JSON with keys description (short factual sentence), labels (lowercase array of useful visual/event labels), and confidence (number from 0 to 1). Include gameplay context and visible events such as elimination, enemy defeated, player knocked, fight, building, item pickup, or victory only when supported by the frame. Add synonyms that make natural-language search useful, but do not invent events that are not visible."
+        "Analyze these video frames in order for a searchable local video library. The frame timestamps, in order, are: {timestamps}. Return only a JSON array with exactly one object per frame, in the same order. Each object must have description (short factual sentence), labels (lowercase array of useful visual/event labels), visible_text (array of exact readable words or short phrases from HUD, kill feed, subtitles, menus, or score overlays), and confidence (number from 0 to 1). Inspect the whole frame carefully, especially small UI text. Include gameplay context and visible events such as elimination, eliminated, kill, killed, enemy defeated, player knocked, fight, building, item pickup, or victory only when supported by the frame. Add useful synonyms when the frame supports them, but never invent an event or text that is not visible. If no text is readable in a frame, return an empty visible_text array for that frame."
     );
     let text = match settings.provider {
-        AiProvider::OpenAI => describe_openai(client, &encoded, &prompt, settings)?,
-        AiProvider::Gemini => describe_gemini(client, &encoded, &prompt, settings)?,
-        AiProvider::Local => describe_local(client, &encoded, &prompt, settings)?,
+        AiProvider::OpenAI => describe_openai(client, &encoded_frames, &prompt, settings)?,
+        AiProvider::Gemini => describe_gemini(client, &encoded_frames, &prompt, settings)?,
+        AiProvider::Local => describe_local(client, &encoded_frames, &prompt, settings)?,
     };
-    parse_frame_analysis(&text)
+    parse_frame_analyses(&text)
 }
 
 fn describe_openai(
     client: &Client,
-    encoded: &str,
+    encoded_frames: &[(u64, String)],
     prompt: &str,
     settings: &AiSettings,
 ) -> Result<String, String> {
+    let mut content = vec![json!({"type": "input_text", "text": prompt})];
+    content.extend(encoded_frames.iter().map(|(_, encoded)| {
+        json!({
+            "type": "input_image",
+            "image_url": format!("data:image/jpeg;base64,{encoded}"),
+            "detail": "high"
+        })
+    }));
     let response = client
         .post(format!("{}/responses", settings.base_url))
         .bearer_auth(&settings.api_key)
@@ -424,10 +521,7 @@ fn describe_openai(
             "model": settings.vision_model,
             "input": [{
                 "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": format!("data:image/jpeg;base64,{encoded}"), "detail": "low"}
-                ]
+                "content": content
             }]
         }))
         .send()
@@ -438,10 +532,16 @@ fn describe_openai(
 
 fn describe_gemini(
     client: &Client,
-    encoded: &str,
+    encoded_frames: &[(u64, String)],
     prompt: &str,
     settings: &AiSettings,
 ) -> Result<String, String> {
+    let mut parts = vec![json!({"text": prompt})];
+    parts.extend(
+        encoded_frames.iter().map(
+            |(_, encoded)| json!({"inline_data": {"mime_type": "image/jpeg", "data": encoded}}),
+        ),
+    );
     let response = client
         .post(format!(
             "{}/models/{}:generateContent",
@@ -451,10 +551,7 @@ fn describe_gemini(
         .json(&json!({
             "contents": [{
                 "role": "user",
-                "parts": [
-                    {"text": prompt},
-                    {"inline_data": {"mime_type": "image/jpeg", "data": encoded}}
-                ]
+                "parts": parts
             }],
             "generationConfig": {"responseMimeType": "application/json"}
         }))
@@ -466,7 +563,7 @@ fn describe_gemini(
 
 fn describe_local(
     client: &Client,
-    encoded: &str,
+    encoded_frames: &[(u64, String)],
     prompt: &str,
     settings: &AiSettings,
 ) -> Result<String, String> {
@@ -474,7 +571,11 @@ fn describe_local(
         .post(format!("{}/api/chat", settings.base_url))
         .json(&json!({
             "model": settings.vision_model,
-            "messages": [{"role": "user", "content": prompt, "images": [encoded]}],
+            "messages": [{
+                "role": "user",
+                "content": prompt,
+                "images": encoded_frames.iter().map(|(_, encoded)| encoded).collect::<Vec<_>>()
+            }],
             "format": "json",
             "stream": false
         }))
@@ -484,17 +585,34 @@ fn describe_local(
     response_text(&body).ok_or_else(|| "Local AI returned no message content".to_owned())
 }
 
-fn parse_frame_analysis(text: &str) -> Result<FrameAnalysis, String> {
+fn parse_frame_analyses(text: &str) -> Result<Vec<FrameAnalysis>, String> {
     let json_text = strip_json_fence(text);
-    let parsed: FrameAnalysis = serde_json::from_str(&json_text)
-        .or_else(|_| serde_json::from_str(extract_json_object(&json_text).unwrap_or(&json_text)))
-        .map_err(|error| format!("AI returned an invalid annotation: {error}"))?;
+    let parsed: Vec<FrameAnalysis> = serde_json::from_str(&json_text)
+        .or_else(|_| {
+            serde_json::from_str::<FrameAnalysis>(
+                extract_json_object(&json_text).unwrap_or(&json_text),
+            )
+            .map(|frame| vec![frame])
+        })
+        .or_else(|_| {
+            serde_json::from_str::<Value>(&json_text)
+                .ok()
+                .and_then(|value| value.get("frames").cloned())
+                .ok_or_else(|| serde_json::Error::io(std::io::Error::other("missing frames")))
+                .and_then(|value| serde_json::from_value(value))
+        })
+        .map_err(|error| format!("AI returned invalid annotations: {error}"))?;
+    parsed.into_iter().map(normalize_frame_analysis).collect()
+}
+
+fn normalize_frame_analysis(parsed: FrameAnalysis) -> Result<FrameAnalysis, String> {
     if parsed.description.trim().is_empty() {
         return Err("AI returned an empty description".to_owned());
     }
     Ok(FrameAnalysis {
         description: parsed.description.trim().to_owned(),
         labels: normalize_labels(parsed.labels),
+        visible_text: normalize_labels(parsed.visible_text),
         confidence: parsed.confidence.map(|value| value.clamp(0.0, 1.0)),
     })
 }
@@ -505,77 +623,121 @@ fn create_embedding(
     settings: &AiSettings,
     kind: EmbeddingKind,
 ) -> Result<Vec<f32>, String> {
-    let embedding = match settings.provider {
+    create_embeddings(client, &[text.to_owned()], settings, kind)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "AI embedding returned no vector".to_owned())
+}
+
+fn create_embeddings(
+    client: &Client,
+    texts: &[String],
+    settings: &AiSettings,
+    kind: EmbeddingKind,
+) -> Result<Vec<Vec<f32>>, String> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let embeddings = match settings.provider {
         AiProvider::OpenAI => {
             let response = client
                 .post(format!("{}/embeddings", settings.base_url))
                 .bearer_auth(&settings.api_key)
                 .json(&json!({
                     "model": settings.embedding_model,
-                    "input": text
+                    "input": texts
                 }))
                 .send()
                 .map_err(|error| format!("OpenAI embedding request failed: {error}"))?;
             let body = read_json_response(response, "OpenAI embedding")?;
             body.get("data")
                 .and_then(Value::as_array)
-                .and_then(|items| items.first())
-                .and_then(|item| item.get("embedding"))
-                .and_then(Value::as_array)
-                .map(values_to_embedding)
-        }
-        AiProvider::Gemini => {
-            let task_type = match kind {
-                EmbeddingKind::Document => "RETRIEVAL_DOCUMENT",
-                EmbeddingKind::Query => "RETRIEVAL_QUERY",
-            };
-            let response = client
-                .post(format!(
-                    "{}/models/{}:embedContent",
-                    settings.base_url, settings.embedding_model
-                ))
-                .header("x-goog-api-key", &settings.api_key)
-                .json(&json!({
-                    "content": {"parts": [{"text": text}]},
-                    "taskType": task_type
-                }))
-                .send()
-                .map_err(|error| format!("Gemini embedding request failed: {error}"))?;
-            let body = read_json_response(response, "Gemini embedding")?;
-            body.get("embedding")
-                .and_then(|embedding| embedding.get("values"))
-                .and_then(Value::as_array)
-                .map(values_to_embedding)
-                .or_else(|| {
-                    body.get("embeddings")
-                        .and_then(Value::as_array)
-                        .and_then(|items| items.first())
-                        .and_then(|embedding| embedding.get("values"))
-                        .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.get("embedding").and_then(Value::as_array))
                         .map(values_to_embedding)
+                        .collect::<Vec<_>>()
                 })
+                .ok_or_else(|| "OpenAI embedding returned no vectors".to_owned())?
         }
+        AiProvider::Gemini => texts
+            .iter()
+            .map(|text| create_gemini_embedding(client, text, settings, kind))
+            .collect::<Result<Vec<_>, _>>()?,
         AiProvider::Local => {
             let response = client
                 .post(format!("{}/api/embed", settings.base_url))
                 .json(&json!({
                     "model": settings.embedding_model,
-                    "input": text
+                    "input": texts
                 }))
                 .send()
                 .map_err(|error| format!("Local AI embedding request failed: {error}"))?;
             let body = read_json_response(response, "Local AI embedding")?;
             body.get("embeddings")
                 .and_then(Value::as_array)
-                .and_then(|items| items.first())
-                .and_then(Value::as_array)
-                .map(values_to_embedding)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_array)
+                        .map(values_to_embedding)
+                        .collect::<Vec<_>>()
+                })
+                .ok_or_else(|| "Local AI embedding returned no vectors".to_owned())?
         }
     };
 
+    if embeddings.len() != texts.len() || embeddings.iter().any(Vec::is_empty) {
+        return Err(format!(
+            "AI embedding returned {} vectors for {} texts",
+            embeddings.len(),
+            texts.len()
+        ));
+    }
+    Ok(embeddings)
+}
+
+fn create_gemini_embedding(
+    client: &Client,
+    text: &str,
+    settings: &AiSettings,
+    kind: EmbeddingKind,
+) -> Result<Vec<f32>, String> {
+    let task_type = match kind {
+        EmbeddingKind::Document => "RETRIEVAL_DOCUMENT",
+        EmbeddingKind::Query => "RETRIEVAL_QUERY",
+    };
+    let response = client
+        .post(format!(
+            "{}/models/{}:embedContent",
+            settings.base_url, settings.embedding_model
+        ))
+        .header("x-goog-api-key", &settings.api_key)
+        .json(&json!({
+            "content": {"parts": [{"text": text}]},
+            "taskType": task_type
+        }))
+        .send()
+        .map_err(|error| format!("Gemini embedding request failed: {error}"))?;
+    let body = read_json_response(response, "Gemini embedding")?;
+    let embedding = body
+        .get("embedding")
+        .and_then(|embedding| embedding.get("values"))
+        .and_then(Value::as_array)
+        .map(values_to_embedding)
+        .or_else(|| {
+            body.get("embeddings")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|embedding| embedding.get("values"))
+                .and_then(Value::as_array)
+                .map(values_to_embedding)
+        });
     embedding
-        .filter(|embedding| !embedding.is_empty())
-        .ok_or_else(|| "AI embedding returned no vector".to_owned())
+        .filter(|values| !values.is_empty())
+        .ok_or_else(|| "Gemini embedding returned no vector".to_owned())
 }
 
 fn values_to_embedding(values: &Vec<Value>) -> Vec<f32> {
@@ -780,6 +942,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_visible_screen_text_for_search() {
+        let parsed = parse_frame_analyses(
+            r#"{"description":"A player wins a fight","labels":["Victory"],"visible_text":["ELIMINATED","Victory Royale"],"confidence":0.9}"#,
+        )
+        .expect("frame analysis should parse")
+        .into_iter()
+        .next()
+        .expect("one frame should be returned");
+
+        assert_eq!(parsed.visible_text, vec!["eliminated", "victory royale"]);
+    }
+
+    #[test]
     fn builds_local_settings_without_an_api_key() {
         let settings = AiSettings::from_request(Some(AiRequestConfig {
             provider: Some(AiProvider::Local),
@@ -813,10 +988,5 @@ mod tests {
             settings.model_namespace(),
             "openai:vision-test:embedding-test"
         );
-    }
-
-    #[test]
-    fn calculates_timestamp_format_without_float_drift() {
-        assert_eq!(format_seconds(12_345), "12.345");
     }
 }

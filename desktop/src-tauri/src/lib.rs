@@ -6,7 +6,7 @@ pub mod scanner;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command]
@@ -107,7 +107,19 @@ fn analyze_media_folder(
         annotation_count: 0,
         warnings: Vec::new(),
     };
-    for file in files {
+    let total_files = files.len() as u64;
+    let provider = settings.model_namespace();
+    for (file_index, file) in files.into_iter().enumerate() {
+        let current_file = file.path.clone();
+        let _ = app.emit(
+            "ai-progress",
+            ai::AiProgress {
+                completed_files: file_index as u64,
+                total_files,
+                current_file: current_file.clone(),
+                provider: provider.clone(),
+            },
+        );
         let metadata = index
             .get_asset_metadata(&file.content_hash)
             .map_err(|error| error.to_string())?;
@@ -124,6 +136,15 @@ fn analyze_media_folder(
                 message: error,
             }),
         }
+        let _ = app.emit(
+            "ai-progress",
+            ai::AiProgress {
+                completed_files: (file_index + 1) as u64,
+                total_files,
+                current_file,
+                provider: provider.clone(),
+            },
+        );
     }
 
     Ok(report)
@@ -136,10 +157,20 @@ fn search_ai(
     config: Option<ai::AiRequestConfig>,
 ) -> Result<Vec<local_index::AiSearchResult>, String> {
     let settings = ai::AiSettings::from_request(config)?;
-    let embedding = ai::embed_query(&query, &settings)?;
     let model_namespace = settings.model_namespace();
-    open_local_index(&app)?
-        .search_ai(&embedding, 100, Some(&model_namespace))
+    let index = open_local_index(&app)?;
+    if index
+        .ai_annotation_count_for_model(&model_namespace)
+        .map_err(|error| error.to_string())?
+        == 0
+    {
+        return Err(format!(
+            "No AI moments indexed for {model_namespace}. Analyze the folder with this provider and model first."
+        ));
+    }
+    let embedding = ai::embed_query(&query, &settings)?;
+    index
+        .search_ai(&query, &embedding, 100, Some(&model_namespace))
         .map_err(|error| error.to_string())
 }
 
