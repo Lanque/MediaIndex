@@ -32,7 +32,7 @@ The desktop shell now includes the first local scanner slice from issue [#3](htt
 - recursive discovery of configured media extensions;
 - deterministic path ordering;
 - SHA-256 content hashes computed locally;
-- symlink skipping so a scan cannot follow a linked folder outside the selected root;
+- iterative traversal that skips symlinks and Windows junction/reparse points so a scan cannot recurse outside the selected root or overflow the call stack;
 - warnings for unreadable directories or files instead of aborting the whole scan;
 - pure change classification for new, unchanged, modified, moved, and deleted files.
 - local FFprobe metadata extraction through a replaceable Rust interface;
