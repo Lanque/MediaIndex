@@ -604,7 +604,66 @@ function openPreview(path: string, name: string, timestampMs = 0): void {
   previewDialog.hidden = false;
 }
 
-function renderResults(results: SearchResult[]): void {
+function renderResultCard(result: SearchResult, index: number, grouped = false): string {
+  const metadata = result.metadata;
+  const details = result.ai_description
+    ? `AI match ${Math.round((result.match_score ?? 0) * 100)}% · ${result.ai_description}`
+    : metadata
+      ? `${formatDuration(metadata.duration_ms)} · ${formatBytes(result.size_bytes)} · ${metadata.width ?? "?"}×${metadata.height ?? "?"} · ${metadata.frame_rate ?? "?"} fps · ${metadata.video_codec ?? "?"}`
+      : "Technical metadata unavailable";
+  const status = result.available ? "Available" : "Unavailable — rescan or restore this path";
+  const fileName = result.path.split(/[\\/]/).pop() ?? result.path;
+  const momentLabel = result.timestamp_ms == null ? "Matching moment" : `Moment @ ${formatDuration(result.timestamp_ms)}`;
+  const title = grouped ? momentLabel : fileName;
+  const previewLabel = result.timestamp_ms ? `Preview @ ${formatDuration(result.timestamp_ms)}` : "Preview";
+  return `<article class="result-card ${grouped ? "result-card-grouped" : ""} ${result.available ? "" : "result-card-unavailable"}">
+    <div>
+      <p class="result-index">${String(index + 1).padStart(2, "0")}</p>
+      <h3>${escapeHtml(title)}</h3>
+      ${grouped ? "" : `<p>${escapeHtml(result.path)}</p>`}
+      <span>${escapeHtml(details)} · ${escapeHtml(status)}</span>
+    </div>
+    <div class="result-actions">
+      <button class="secondary-button preview-result" data-name="${escapeHtml(fileName)}" data-path="${escapeHtml(result.path)}" data-timestamp-ms="${result.timestamp_ms ?? 0}" ${result.available ? "" : "disabled"}>${escapeHtml(previewLabel)}</button>
+      <button class="secondary-button open-result" data-path="${escapeHtml(result.path)}" ${result.available ? "" : "disabled"}>Open</button>
+    </div>
+  </article>`;
+}
+
+function renderGroupedAiResults(results: SearchResult[]): string {
+  const groups = new Map<string, SearchResult[]>();
+  for (const result of results) {
+    const key = result.content_hash || result.path.toLocaleLowerCase();
+    const group = groups.get(key) ?? [];
+    group.push(result);
+    groups.set(key, group);
+  }
+
+  return Array.from(groups.values()).map((group, groupIndex) => {
+    const rankedFirst = group[0];
+    const fileName = rankedFirst.path.split(/[\\/]/).pop() ?? rankedFirst.path;
+    const moments = [...group].sort((left, right) =>
+      (left.timestamp_ms ?? 0) - (right.timestamp_ms ?? 0)
+    );
+    const bestScore = Math.max(...group.map((result) => result.match_score ?? 0));
+    const momentCount = `${moments.length} ${moments.length === 1 ? "moment" : "moments"}`;
+    return `<details class="video-result-group" ${groupIndex === 0 ? "open" : ""}>
+      <summary>
+        <span class="video-folder-icon" aria-hidden="true"></span>
+        <span class="video-group-heading">
+          <strong>${escapeHtml(fileName)}</strong>
+          <small>${escapeHtml(rankedFirst.path)}</small>
+        </span>
+        <span class="video-group-count">${escapeHtml(momentCount)} · best ${Math.round(bestScore * 100)}%</span>
+      </summary>
+      <div class="video-group-results">
+        ${moments.map((result, index) => renderResultCard(result, index, true)).join("")}
+      </div>
+    </details>`;
+  }).join("");
+}
+
+function renderResults(results: SearchResult[], groupByVideo = false): void {
   if (!resultList || !emptyState) return;
   if (results.length === 0) {
     resultList.hidden = true;
@@ -619,28 +678,9 @@ function renderResults(results: SearchResult[]): void {
     resultsNote.hidden = results.length <= MAX_RENDERED_RESULTS;
     resultsNote.textContent = `Showing the first ${MAX_RENDERED_RESULTS} of ${results.length} matches. Refine your search to see a smaller set.`;
   }
-  resultList.innerHTML = visibleResults.map((result, index) => {
-    const metadata = result.metadata;
-    const details = result.ai_description
-      ? `AI match ${Math.round((result.match_score ?? 0) * 100)}% · ${result.ai_description}`
-      : metadata
-        ? `${formatDuration(metadata.duration_ms)} · ${formatBytes(result.size_bytes)} · ${metadata.width ?? "?"}×${metadata.height ?? "?"} · ${metadata.frame_rate ?? "?"} fps · ${metadata.video_codec ?? "?"}`
-        : "Technical metadata unavailable";
-    const status = result.available ? "Available" : "Unavailable — rescan or restore this path";
-    const previewLabel = result.timestamp_ms ? `Preview @ ${formatDuration(result.timestamp_ms)}` : "Preview";
-    return `<article class="result-card ${result.available ? "" : "result-card-unavailable"}">
-      <div>
-        <p class="result-index">${String(index + 1).padStart(2, "0")}</p>
-        <h3>${escapeHtml(result.path.split(/[\\/]/).pop() ?? result.path)}</h3>
-        <p>${escapeHtml(result.path)}</p>
-        <span>${escapeHtml(details)} · ${escapeHtml(status)}</span>
-      </div>
-      <div class="result-actions">
-        <button class="secondary-button preview-result" data-name="${escapeHtml(result.path.split(/[\\/]/).pop() ?? result.path)}" data-path="${escapeHtml(result.path)}" data-timestamp-ms="${result.timestamp_ms ?? 0}" ${result.available ? "" : "disabled"}>${escapeHtml(previewLabel)}</button>
-        <button class="secondary-button open-result" data-path="${escapeHtml(result.path)}" ${result.available ? "" : "disabled"}>Open</button>
-      </div>
-    </article>`;
-  }).join("");
+  resultList.innerHTML = groupByVideo
+    ? renderGroupedAiResults(visibleResults)
+    : visibleResults.map((result, index) => renderResultCard(result, index)).join("");
   resultList.querySelectorAll<HTMLButtonElement>(".preview-result").forEach((button) => {
     button.addEventListener("click", () => {
       openPreview(
@@ -706,7 +746,7 @@ async function searchAiLibrary(): Promise<void> {
   if (libraryStatus) libraryStatus.textContent = "AI search in progress…";
   try {
     const matches = await invoke<AiSearchResult[]>("search_ai", { query, config });
-    renderResults(matches.map((match) => ({
+    const displayResults: SearchResult[] = matches.map((match) => ({
       path: match.path,
       content_hash: match.content_hash,
       size_bytes: 0,
@@ -717,11 +757,13 @@ async function searchAiLibrary(): Promise<void> {
       ai_description: `${match.description} · ${match.labels.join(", ")}`,
       match_score: match.score,
       metadata: null,
-    })));
-    if (clipCount) clipCount.textContent = `${matches.length} AI matches`;
-    if (libraryStatus) libraryStatus.textContent = `${matches.length} AI matches for “${query}”`;
+    }));
+    renderResults(displayResults, true);
+    const videoCount = new Set(matches.map((match) => match.content_hash)).size;
+    if (clipCount) clipCount.textContent = `${videoCount} videos · ${matches.length} moments`;
+    if (libraryStatus) libraryStatus.textContent = `${matches.length} AI moments in ${videoCount} videos for “${query}”`;
     if (aiSearchStatus) aiSearchStatus.textContent = matches.length
-      ? "AI matches are timestamped; Preview opens at the matching moment."
+      ? "AI moments are grouped by video and sorted by timestamp; Preview opens at the matching moment."
       : "No AI matches. Analyze the selected folder first or try another description.";
   } catch (error) {
     const message = String(error);

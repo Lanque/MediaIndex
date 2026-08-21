@@ -412,6 +412,86 @@ button:disabled {
   margin-top: 24px;
 }
 
+.video-result-group {
+  overflow: hidden;
+  border: 1px solid #2b3b63;
+  border-radius: 16px;
+  background: #10192f;
+}
+
+.video-result-group[open] {
+  border-color: #3d5688;
+}
+
+.video-result-group summary {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 18px;
+  cursor: pointer;
+  list-style: none;
+  background: #141e39;
+}
+
+.video-result-group summary::-webkit-details-marker {
+  display: none;
+}
+
+.video-result-group summary:hover {
+  background: #182543;
+}
+
+.video-folder-icon::before {
+  content: "📁";
+  font-size: 1.25rem;
+}
+
+.video-result-group[open] .video-folder-icon::before {
+  content: "📂";
+}
+
+.video-group-heading {
+  min-width: 0;
+  flex: 1;
+}
+
+.video-group-heading strong,
+.video-group-heading small {
+  display: block;
+}
+
+.video-group-heading strong {
+  overflow: hidden;
+  color: #eef3ff;
+  font-size: 0.92rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.video-group-heading small {
+  overflow: hidden;
+  margin-top: 4px;
+  color: #8295bc;
+  font-size: 0.7rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.video-group-count {
+  flex: 0 0 auto;
+  padding: 6px 9px;
+  border: 1px solid #354a76;
+  border-radius: 999px;
+  color: #b5c8ec;
+  font-size: 0.7rem;
+}
+
+.video-group-results {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
 .result-card {
   display: flex;
   align-items: center;
@@ -421,6 +501,13 @@ button:disabled {
   border: 1px solid #2b3b63;
   border-radius: 14px;
   background: #141e39;
+}
+
+.result-card-grouped {
+  padding: 14px 16px;
+  border-color: #26385d;
+  border-radius: 10px;
+  background: #111b33;
 }
 
 .result-card h3,
@@ -474,6 +561,18 @@ button:disabled {
 .result-actions .secondary-button {
   padding: 10px 12px;
   font-size: 0.78rem;
+}
+
+@media (max-width: 760px) {
+  .video-result-group summary,
+  .result-card {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .video-group-count {
+    margin-left: 38px;
+  }
 }
 
 .results-note {
