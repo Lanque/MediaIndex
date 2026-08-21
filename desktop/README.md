@@ -150,7 +150,12 @@ embedding model changes, run **Analyze with AI** again; incompatible provider
 annotations are intentionally kept separate.
 
 AI analysis runs in a background worker, so the desktop window remains
-responsive while FFmpeg and network requests are in progress.
+responsive while FFmpeg and network requests are in progress. While analysis
+is running, **Analyze with AI** becomes **Stop analysis**. Stopping prevents new
+files and frame batches from starting; a request that has already been sent may
+finish before the run stops. Completed clips are kept and remain searchable,
+and a later analysis continues with clips that are still missing for the active
+provider/model namespace. A second analysis cannot start while one is active.
 
 The production WebView uses a restrictive Content Security Policy. Local video
 paths are not exposed through a whole-disk asset scope: clicking Preview asks

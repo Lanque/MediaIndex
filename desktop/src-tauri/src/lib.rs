@@ -12,6 +12,56 @@ use std::sync::{mpsc, Arc, Mutex};
 use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
+#[derive(Default)]
+struct AiAnalysisFlags {
+    running: bool,
+    cancel_requested: bool,
+}
+
+#[derive(Clone, Default)]
+struct AiAnalysisControl {
+    flags: Arc<Mutex<AiAnalysisFlags>>,
+}
+
+impl AiAnalysisControl {
+    fn begin(&self) -> Result<AiAnalysisRunGuard, String> {
+        let mut flags = lock_unpoisoned(&self.flags);
+        if flags.running {
+            return Err("AI analysis is already running".to_owned());
+        }
+        flags.running = true;
+        flags.cancel_requested = false;
+        Ok(AiAnalysisRunGuard {
+            control: self.clone(),
+        })
+    }
+
+    fn request_cancel(&self) -> bool {
+        let mut flags = lock_unpoisoned(&self.flags);
+        if !flags.running {
+            return false;
+        }
+        flags.cancel_requested = true;
+        true
+    }
+
+    fn is_cancelled(&self) -> bool {
+        lock_unpoisoned(&self.flags).cancel_requested
+    }
+}
+
+struct AiAnalysisRunGuard {
+    control: AiAnalysisControl,
+}
+
+impl Drop for AiAnalysisRunGuard {
+    fn drop(&mut self) {
+        let mut flags = lock_unpoisoned(&self.control.flags);
+        flags.running = false;
+        flags.cancel_requested = false;
+    }
+}
+
 #[tauri::command]
 fn scan_media_folder(path: String) -> Result<scanner::ScanReport, String> {
     scanner::scan_folder(Path::new(&path), &scanner::ScanOptions::default())
@@ -114,11 +164,20 @@ async fn analyze_media_folder(
     config: Option<ai::AiRequestConfig>,
     force: Option<bool>,
 ) -> Result<ai::AiIndexReport, String> {
+    let control = app.state::<AiAnalysisControl>().inner().clone();
+    let run_guard = control.begin()?;
+    let worker_control = control.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        analyze_media_folder_blocking(app, path, config, force.unwrap_or(false))
+        let _run_guard = run_guard;
+        analyze_media_folder_blocking(app, path, config, force.unwrap_or(false), &worker_control)
     })
     .await
     .map_err(|error| format!("AI analysis worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn cancel_ai_analysis(control: tauri::State<'_, AiAnalysisControl>) -> bool {
+    control.request_cancel()
 }
 
 fn analyze_media_folder_blocking(
@@ -126,6 +185,7 @@ fn analyze_media_folder_blocking(
     path: String,
     config: Option<ai::AiRequestConfig>,
     force: bool,
+    control: &AiAnalysisControl,
 ) -> Result<ai::AiIndexReport, String> {
     let settings = ai::AiSettings::from_request(config)?;
     let mut index = open_local_index(&app)?;
@@ -159,6 +219,7 @@ fn analyze_media_folder_blocking(
         analyzed_file_count: 0,
         skipped_file_count,
         annotation_count: 0,
+        cancelled: false,
         warnings: Vec::new(),
     };
     let total_files = files.len() as u64;
@@ -195,14 +256,18 @@ fn analyze_media_folder_blocking(
             let worker_settings = settings.clone();
             let worker_provider = provider.clone();
             let worker_app = app.clone();
+            let worker_control = control.clone();
 
             scope.spawn(move || loop {
+                if worker_control.is_cancelled() {
+                    break;
+                }
                 let task = lock_unpoisoned(&worker_tasks).pop_front();
                 let Some((file_index, file, metadata)) = task else {
                     break;
                 };
                 let current_file = file.path.clone();
-                let result = ai::analyze_file_with_progress(
+                let result = ai::analyze_file_with_progress_and_cancel(
                     Path::new(&current_file),
                     metadata.as_ref(),
                     &worker_settings,
@@ -219,7 +284,12 @@ fn analyze_media_folder_blocking(
                             progress.phase,
                         );
                     },
+                    || worker_control.is_cancelled(),
                 );
+                if matches!(&result, Err(error) if error == ai::AI_ANALYSIS_CANCELLED_MESSAGE) {
+                    let _ = worker_sender.send((file_index, file, result));
+                    break;
+                }
                 let percent = update_overall_progress(&worker_progress, file_index, 100);
                 let completed = worker_completed.fetch_add(1, Ordering::Relaxed) + 1;
                 let phase = if result.is_ok() {
@@ -255,6 +325,9 @@ fn analyze_media_folder_blocking(
                     .replace_ai_annotations(&file.content_hash, &annotations)
                     .map_err(|error| error.to_string())?;
             }
+            Err(error) if error == ai::AI_ANALYSIS_CANCELLED_MESSAGE => {
+                report.cancelled = true;
+            }
             Err(error) => report.warnings.push(ai::AiWarning {
                 path: file.path,
                 message: error,
@@ -262,15 +335,19 @@ fn analyze_media_folder_blocking(
         }
     }
 
-    emit_ai_progress(
-        &app,
-        total_files,
-        total_files,
-        path,
-        provider,
-        100,
-        "Analysis complete",
-    );
+    report.cancelled |= control.is_cancelled();
+
+    if !report.cancelled {
+        emit_ai_progress(
+            &app,
+            total_files,
+            total_files,
+            path,
+            provider,
+            100,
+            "Analysis complete",
+        );
+    }
 
     Ok(report)
 }
@@ -454,6 +531,7 @@ fn open_local_index(app: &tauri::AppHandle) -> Result<local_index::SqliteIndex, 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(AiAnalysisControl::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -463,6 +541,7 @@ pub fn run() {
             search_media,
             get_indexed_library_path,
             analyze_media_folder,
+            cancel_ai_analysis,
             search_ai,
             get_ai_thumbnail,
             test_ai_connection,
@@ -488,6 +567,21 @@ mod tests {
         assert_eq!(update_overall_progress(&progress, 3, 100), 65);
         assert_eq!(update_overall_progress(&progress, 0, 100), 87);
         assert_eq!(update_overall_progress(&progress, 1, 100), 100);
+    }
+
+    #[test]
+    fn analysis_control_prevents_overlap_and_resets_after_cancellation() {
+        let control = AiAnalysisControl::default();
+        let guard = control.begin().expect("first analysis should start");
+
+        assert!(control.begin().is_err());
+        assert!(control.request_cancel());
+        assert!(control.is_cancelled());
+
+        drop(guard);
+        assert!(!control.request_cancel());
+        assert!(!control.is_cancelled());
+        assert!(control.begin().is_ok());
     }
 
     #[test]

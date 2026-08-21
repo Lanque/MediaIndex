@@ -67,6 +67,10 @@ delivery, stale cursors, authorization failures, and worker crashes.
 - **Analyze with AI** skips content that already has annotations in the active
   provider/model namespace. Reanalysis is a one-run checkbox that is never
   persisted and resets after the run.
+- Only one AI analysis can run at a time. The stop control prevents additional
+  files and frame batches from starting, keeps completed clip annotations, and
+  lets a later run continue with missing clips. A cloud request already sent to
+  the provider may finish before cancellation takes effect.
 - Focused search limits low-ranking results, videos, and moments without making
   another vision request. Query embeddings remain the only AI call during
   search.

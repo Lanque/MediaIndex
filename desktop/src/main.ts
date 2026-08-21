@@ -48,6 +48,7 @@ type AiIndexReport = {
   analyzed_file_count: number;
   skipped_file_count: number;
   annotation_count: number;
+  cancelled: boolean;
   warnings: Array<{ path: string; message: string }>;
 };
 
@@ -335,6 +336,9 @@ let pendingPreviewTimestamp = 0;
 let previewGeneration = 0;
 let lastAiProgressPercent = 0;
 let thumbnailGeneration = 0;
+let aiAnalysisRunning = false;
+let aiCancellationPending = false;
+let aiStopRequested = false;
 const thumbnailCache = new Map<string, string>();
 
 const AI_SETTINGS_STORAGE_KEY = "mediaindex.ai.settings.v1";
@@ -529,12 +533,15 @@ function showAiProgress(percent: number, label: string, isError = false): void {
 
 void listen<AiProgress>("ai-progress", ({ payload }) => {
   const fileName = payload.current_file.split(/[\\/]/).pop() ?? payload.current_file;
-  showAiProgress(payload.percent, payload.phase);
+  const phase = aiStopRequested ? "Stopping after current request…" : payload.phase;
+  showAiProgress(payload.percent, phase);
   if (libraryStatus) {
-    libraryStatus.textContent = `AI analysis ${payload.percent}% · ${payload.completed_files}/${payload.total_files} clips`;
+    libraryStatus.textContent = aiStopRequested
+      ? `Stopping AI analysis · ${payload.completed_files}/${payload.total_files} clips saved`
+      : `AI analysis ${payload.percent}% · ${payload.completed_files}/${payload.total_files} clips`;
   }
   if (libraryPath) {
-    libraryPath.textContent = `${payload.phase} · ${fileName} · ${payload.provider}`;
+    libraryPath.textContent = `${phase} · ${fileName} · ${payload.provider}`;
   }
 });
 
@@ -890,9 +897,14 @@ async function searchAiLibrary(): Promise<void> {
 
 async function analyzeLibraryWithAi(): Promise<void> {
   if (!selectedLibraryPath || !analyzeAiButton) return;
-  analyzeAiButton.disabled = true;
-  const originalLabel = analyzeAiButton.textContent ?? "Analyze with AI";
-  analyzeAiButton.textContent = "Analyzing…";
+  aiAnalysisRunning = true;
+  aiCancellationPending = false;
+  aiStopRequested = false;
+  analyzeAiButton.disabled = false;
+  analyzeAiButton.textContent = "Stop analysis";
+  analyzeAiButton.classList.add("is-stop");
+  analyzeAiButton.setAttribute("aria-pressed", "true");
+  if (selectFolderButton) selectFolderButton.disabled = true;
   const config = saveAiConfig();
   showAiProgress(0, "Preparing clips");
   if (libraryStatus) libraryStatus.textContent = "AI analysis in progress…";
@@ -903,24 +915,31 @@ async function analyzeLibraryWithAi(): Promise<void> {
       config,
       force: config.reanalyzeExisting,
     });
-    const warningSuffix = report.warnings.length ? ` · ${report.warnings.length} warnings` : "";
-    const warningDetails = summarizeAiWarnings(report.warnings);
-    showAiProgress(100, report.warnings.length ? "Analysis complete with warnings" : "Analysis complete");
-    const skippedSuffix = report.skipped_file_count ? ` · ${report.skipped_file_count} already ready` : "";
-    if (libraryStatus) libraryStatus.textContent = `AI indexed ${report.analyzed_file_count} clips${skippedSuffix}${warningSuffix}`;
-    if (libraryPath) {
-      libraryPath.textContent = report.analyzed_file_count === 0 && report.skipped_file_count > 0
-        ? "Existing AI index kept · no API credits used"
-        : warningDetails
-          ? `${report.annotation_count} new visual moments stored locally · ${warningDetails}`
-          : `${report.annotation_count} new visual moments stored locally`;
-    }
-    if (aiSearchStatus) {
-      aiSearchStatus.textContent = warningDetails
-        ? `AI warnings: ${warningDetails}`
-        : report.analyzed_file_count === 0 && report.skipped_file_count > 0
-          ? "No API work needed — every clip is already analyzed with this model."
-          : "AI index ready. Search for a person, action, place, event, or visible text.";
+    if (report.cancelled) {
+      showAiProgress(lastAiProgressPercent, "Analysis stopped");
+      if (libraryStatus) libraryStatus.textContent = `AI analysis stopped · ${report.analyzed_file_count} clips saved`;
+      if (libraryPath) libraryPath.textContent = `${report.annotation_count} new visual moments kept · unstarted clips were not charged`;
+      if (aiSearchStatus) aiSearchStatus.textContent = "Completed clips remain searchable. Start analysis again later to continue with missing clips.";
+    } else {
+      const warningSuffix = report.warnings.length ? ` · ${report.warnings.length} warnings` : "";
+      const warningDetails = summarizeAiWarnings(report.warnings);
+      showAiProgress(100, report.warnings.length ? "Analysis complete with warnings" : "Analysis complete");
+      const skippedSuffix = report.skipped_file_count ? ` · ${report.skipped_file_count} already ready` : "";
+      if (libraryStatus) libraryStatus.textContent = `AI indexed ${report.analyzed_file_count} clips${skippedSuffix}${warningSuffix}`;
+      if (libraryPath) {
+        libraryPath.textContent = report.analyzed_file_count === 0 && report.skipped_file_count > 0
+          ? "Existing AI index kept · no API credits used"
+          : warningDetails
+            ? `${report.annotation_count} new visual moments stored locally · ${warningDetails}`
+            : `${report.annotation_count} new visual moments stored locally`;
+      }
+      if (aiSearchStatus) {
+        aiSearchStatus.textContent = warningDetails
+          ? `AI warnings: ${warningDetails}`
+          : report.analyzed_file_count === 0 && report.skipped_file_count > 0
+            ? "No API work needed — every clip is already analyzed with this model."
+            : "AI index ready. Search for a person, action, place, event, or visible text.";
+      }
     }
   } catch (error) {
     if (libraryStatus) libraryStatus.textContent = "AI analysis failed";
@@ -931,8 +950,38 @@ async function analyzeLibraryWithAi(): Promise<void> {
       aiReanalyzeExisting.checked = false;
       saveAiConfig();
     }
+    aiAnalysisRunning = false;
+    aiCancellationPending = false;
+    aiStopRequested = false;
+    analyzeAiButton.disabled = !selectedLibraryPath;
+    analyzeAiButton.textContent = "Analyze with AI";
+    analyzeAiButton.classList.remove("is-stop");
+    analyzeAiButton.setAttribute("aria-pressed", "false");
+    if (selectFolderButton) selectFolderButton.disabled = false;
+  }
+}
+
+async function cancelAiAnalysis(): Promise<void> {
+  if (!aiAnalysisRunning || aiCancellationPending || !analyzeAiButton) return;
+  aiCancellationPending = true;
+  analyzeAiButton.disabled = true;
+  analyzeAiButton.textContent = "Stopping…";
+  showAiProgress(lastAiProgressPercent, "Stopping after current request…");
+  if (libraryStatus) libraryStatus.textContent = "Stopping AI analysis…";
+  if (libraryPath) libraryPath.textContent = "No new files or frame batches will start. The current API request may still finish.";
+  try {
+    aiStopRequested = await invoke<boolean>("cancel_ai_analysis");
+    if (!aiStopRequested && libraryPath) {
+      libraryPath.textContent = "Analysis is already finishing.";
+    }
+  } catch (error) {
+    if (libraryStatus) libraryStatus.textContent = "Could not stop AI analysis";
+    if (libraryPath) libraryPath.textContent = conciseMessage(error);
+    aiStopRequested = false;
     analyzeAiButton.disabled = false;
-    analyzeAiButton.textContent = originalLabel;
+    analyzeAiButton.textContent = "Stop analysis";
+  } finally {
+    aiCancellationPending = false;
   }
 }
 
@@ -1043,7 +1092,8 @@ document.querySelector<HTMLFormElement>("#ai-search-form")?.addEventListener("su
 });
 
 analyzeAiButton?.addEventListener("click", () => {
-  void analyzeLibraryWithAi();
+  if (aiAnalysisRunning) void cancelAiAnalysis();
+  else void analyzeLibraryWithAi();
 });
 
 document.querySelector<HTMLButtonElement>("#learn-more")?.addEventListener(
