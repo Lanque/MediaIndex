@@ -1,0 +1,31 @@
+# Local search and clip opening
+
+Search runs against the SQLite index on the same machine. It does not need a
+network connection and does not read media bytes again after indexing.
+
+## Supported filters
+
+The desktop search form supports:
+
+- keyword: file name, path, container, codec, frame rate, and timestamp metadata;
+- folder: a case-insensitive path fragment;
+- date from/to: the local file modification date;
+- resolution: exact `WIDTHxHEIGHT`, for example `1920x1080`;
+- FPS: an exact FFprobe rate such as `30000/1001` or its decimal form `29.97`;
+- duration min/max: seconds in the UI, converted to milliseconds in the index;
+- codec: a fragment matching the video or audio codec.
+
+## Example
+
+To find a 29.97 FPS H.264 clip from the first shooting day:
+
+1. Select the footage folder and wait for indexing to finish.
+2. Enter `day-one` in Folder, `1920x1080` in Resolution, `29.97` in FPS,
+   and `h264` in Codec.
+3. Press **Apply filters** or use the keyword search.
+4. Press **Open** on an available result to open the original file at its
+   current local path.
+
+An unavailable result remains visible with an explicit status so a stale path
+is distinguishable from a search miss. The Open button is disabled until a
+future scan confirms that the local file is available again.

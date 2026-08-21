@@ -40,5 +40,7 @@ The desktop shell now includes the first local scanner slice from issue [#3](htt
 - actionable metadata error state when FFprobe is unavailable, fails, or returns invalid JSON.
 - a versioned SQLite local index where content hashes identify assets and paths identify locations;
 - idempotent re-indexing with duplicate, moved, modified, deleted, and incomplete-scan handling.
+- offline search across file names and technical metadata with folder, date, resolution, FPS, duration, and codec filters;
+- opening available original files from a result while clearly identifying unavailable paths.
 
-The searchable result list remains separate work in issue [#6](https://github.com/Lanque/MediaIndex/issues/6). See [docs/local-index.md](../docs/local-index.md) for the schema and hashing policy.
+See [docs/local-index.md](../docs/local-index.md) for the schema and hashing policy and [docs/local-search.md](../docs/local-search.md) for the supported filters and usage example.

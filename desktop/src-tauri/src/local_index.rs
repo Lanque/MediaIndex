@@ -1,7 +1,7 @@
 use crate::metadata::MediaMetadata;
 use crate::scanner::{DiscoveredFile, ScanReport, ScanWarning};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::path::Path;
@@ -102,6 +102,30 @@ pub struct IndexedFile {
     pub size_bytes: u64,
     pub modified_unix_ms: Option<u64>,
     pub status: LocalFileStatus,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SearchQuery {
+    pub keyword: Option<String>,
+    pub folder: Option<String>,
+    pub date_from_unix_ms: Option<u64>,
+    pub date_to_unix_ms: Option<u64>,
+    pub resolution: Option<String>,
+    pub frame_rate: Option<String>,
+    pub min_duration_ms: Option<u64>,
+    pub max_duration_ms: Option<u64>,
+    pub codec: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SearchResult {
+    pub path: String,
+    pub content_hash: String,
+    pub size_bytes: u64,
+    pub modified_unix_ms: Option<u64>,
+    pub status: LocalFileStatus,
+    pub available: bool,
+    pub metadata: Option<MediaMetadata>,
 }
 
 #[derive(Clone, Debug)]
@@ -274,6 +298,45 @@ impl SqliteIndex {
             .map_err(Into::into)
     }
 
+    pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>, IndexError> {
+        let mut statement = self.connection.prepare(
+            "SELECT local_files.path, local_files.content_hash, local_files.size_bytes,
+                    local_files.modified_unix_ms, local_files.status, media_assets.metadata_json
+             FROM local_files
+             JOIN media_assets ON media_assets.content_hash = local_files.content_hash
+             ORDER BY local_files.path",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut results = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let content_hash: String = row.get(1)?;
+            let size_bytes: u64 = row.get(2)?;
+            let modified_unix_ms: Option<u64> = row.get(3)?;
+            let status: LocalFileStatus = parse_status(&row.get::<_, String>(4)?);
+            let metadata_json: Option<String> = row.get(5)?;
+            let metadata = metadata_json
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?;
+            let result = SearchResult {
+                available: status == LocalFileStatus::Active && Path::new(&path).is_file(),
+                path,
+                content_hash,
+                size_bytes,
+                modified_unix_ms,
+                status,
+                metadata,
+            };
+
+            if matches_query(&result, query) {
+                results.push(result);
+            }
+        }
+
+        Ok(results)
+    }
+
     fn from_connection(connection: Connection) -> Result<Self, IndexError> {
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         connection.execute_batch(
@@ -357,6 +420,156 @@ fn parse_status(status: &str) -> LocalFileStatus {
         "MISSING" => LocalFileStatus::Missing,
         _ => LocalFileStatus::Active,
     }
+}
+
+fn matches_query(result: &SearchResult, query: &SearchQuery) -> bool {
+    if let Some(keyword) = non_empty_lowercase(query.keyword.as_deref()) {
+        let searchable = format!(
+            "{} {}",
+            result.path.to_ascii_lowercase(),
+            metadata_search_text(result.metadata.as_ref()).to_ascii_lowercase()
+        );
+        if !searchable.contains(&keyword) {
+            return false;
+        }
+    }
+
+    if let Some(folder) = non_empty_lowercase(query.folder.as_deref()) {
+        if !path_key(&result.path).contains(&folder) {
+            return false;
+        }
+    }
+
+    if let Some(date_from) = query.date_from_unix_ms {
+        if result
+            .modified_unix_ms
+            .map(|date| date < date_from)
+            .unwrap_or(true)
+        {
+            return false;
+        }
+    }
+    if let Some(date_to) = query.date_to_unix_ms {
+        if result
+            .modified_unix_ms
+            .map(|date| date > date_to)
+            .unwrap_or(true)
+        {
+            return false;
+        }
+    }
+
+    if let Some(resolution) = non_empty_lowercase(query.resolution.as_deref()) {
+        let actual = result.metadata.as_ref().and_then(|metadata| {
+            Some(format!("{}x{}", metadata.width?, metadata.height?).to_ascii_lowercase())
+        });
+        if actual.as_deref() != Some(resolution.as_str()) {
+            return false;
+        }
+    }
+
+    if let Some(frame_rate) = non_empty_lowercase(query.frame_rate.as_deref()) {
+        let actual = result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.frame_rate.as_deref());
+        if !actual.is_some_and(|actual| frame_rate_matches(actual, &frame_rate)) {
+            return false;
+        }
+    }
+
+    if let Some(min_duration) = query.min_duration_ms {
+        if result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.duration_ms)
+            .map(|duration| duration < min_duration)
+            .unwrap_or(true)
+        {
+            return false;
+        }
+    }
+    if let Some(max_duration) = query.max_duration_ms {
+        if result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.duration_ms)
+            .map(|duration| duration > max_duration)
+            .unwrap_or(true)
+        {
+            return false;
+        }
+    }
+
+    if let Some(codec) = non_empty_lowercase(query.codec.as_deref()) {
+        let matches_video = result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.video_codec.as_deref())
+            .is_some_and(|value| value.to_ascii_lowercase().contains(&codec));
+        let matches_audio = result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.audio_codec.as_deref())
+            .is_some_and(|value| value.to_ascii_lowercase().contains(&codec));
+        if !matches_video && !matches_audio {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn metadata_search_text(metadata: Option<&MediaMetadata>) -> String {
+    metadata
+        .map(|metadata| {
+            format!(
+                "{} {} {} {} {} {} {} {} {}",
+                metadata.container.as_deref().unwrap_or_default(),
+                metadata.video_codec.as_deref().unwrap_or_default(),
+                metadata.audio_codec.as_deref().unwrap_or_default(),
+                metadata
+                    .width
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                metadata
+                    .height
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                metadata.frame_rate.as_deref().unwrap_or_default(),
+                metadata.start_time.as_deref().unwrap_or_default(),
+                metadata.creation_time.as_deref().unwrap_or_default(),
+                metadata
+                    .duration_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn non_empty_lowercase(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    (!value.is_empty()).then(|| value.to_ascii_lowercase())
+}
+
+fn frame_rate_matches(actual: &str, expected: &str) -> bool {
+    if actual.eq_ignore_ascii_case(expected) {
+        return true;
+    }
+
+    let actual = rational_to_f64(actual);
+    let expected = expected.parse::<f64>().ok();
+    actual
+        .zip(expected)
+        .is_some_and(|(actual, expected)| (actual - expected).abs() < 0.01)
+}
+
+fn rational_to_f64(value: &str) -> Option<f64> {
+    let (numerator, denominator) = value.split_once('/')?;
+    let numerator = numerator.parse::<f64>().ok()?;
+    let denominator = denominator.parse::<f64>().ok()?;
+    (denominator != 0.0).then_some(numerator / denominator)
 }
 
 fn path_key(path: &str) -> String {
@@ -481,6 +694,57 @@ mod tests {
                 .expect("metadata should be readable"),
             Some(metadata)
         );
+    }
+
+    #[test]
+    fn searches_paths_and_technical_metadata_without_network_access() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        let metadata = MediaMetadata {
+            duration_ms: Some(12_345),
+            size_bytes: Some(1_048_576),
+            container: Some("mp4".to_owned()),
+            video_codec: Some("h264".to_owned()),
+            audio_codec: Some("aac".to_owned()),
+            width: Some(1920),
+            height: Some(1080),
+            frame_rate: Some("30000/1001".to_owned()),
+            start_time: Some("0.000000".to_owned()),
+            creation_time: Some("2026-08-21T10:15:00Z".to_owned()),
+        };
+        let mut metadata_by_path = HashMap::new();
+        metadata_by_path.insert("/library/day-one/scene-a.mp4".to_owned(), metadata);
+        index
+            .reconcile(
+                &ScanReport {
+                    files: vec![DiscoveredFile {
+                        path: "/library/day-one/scene-a.mp4".to_owned(),
+                        size_bytes: 9,
+                        modified_unix_ms: Some(1_000),
+                        content_hash: "hash-a".to_owned(),
+                    }],
+                    warnings: Vec::new(),
+                },
+                &metadata_by_path,
+            )
+            .expect("fixture should be indexed");
+
+        let results = index
+            .search(&SearchQuery {
+                keyword: Some("h264".to_owned()),
+                folder: Some("day-one".to_owned()),
+                date_from_unix_ms: Some(900),
+                date_to_unix_ms: Some(1_100),
+                resolution: Some("1920x1080".to_owned()),
+                frame_rate: Some("29.97".to_owned()),
+                min_duration_ms: Some(10_000),
+                max_duration_ms: Some(20_000),
+                codec: Some("aac".to_owned()),
+            })
+            .expect("search should work locally");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "/library/day-one/scene-a.mp4");
+        assert!(!results[0].available);
     }
 
     #[test]

@@ -1,11 +1,42 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openPath } from "@tauri-apps/plugin-opener";
 import "./styles.css";
 
 type IndexReport = {
   active_file_count: number;
   changes: Array<{ kind: string; path: string; content_hash?: string }>;
   warnings: Array<{ path: string; message: string }>;
+};
+
+type SearchFilters = {
+  keyword?: string;
+  folder?: string;
+  date_from_unix_ms?: number;
+  date_to_unix_ms?: number;
+  resolution?: string;
+  frame_rate?: string;
+  min_duration_ms?: number;
+  max_duration_ms?: number;
+  codec?: string;
+};
+
+type SearchResult = {
+  path: string;
+  content_hash: string;
+  size_bytes: number;
+  modified_unix_ms: number | null;
+  status: "ACTIVE" | "MISSING";
+  available: boolean;
+  metadata: {
+    duration_ms: number | null;
+    container: string | null;
+    video_codec: string | null;
+    audio_codec: string | null;
+    width: number | null;
+    height: number | null;
+    frame_rate: string | null;
+  } | null;
 };
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -41,9 +72,17 @@ app.innerHTML = `
           </div>
         </div>
         <p class="section-label">Filters</p>
-        <div class="filter-placeholder">
-          <span>Metadata filters arrive with the local scanner.</span>
-        </div>
+        <form class="filter-form" id="filter-form">
+          <label>Folder<input id="filter-folder" name="folder" placeholder="day-one" /></label>
+          <label>Date from<input id="filter-date-from" name="date-from" type="date" /></label>
+          <label>Date to<input id="filter-date-to" name="date-to" type="date" /></label>
+          <label>Resolution<input id="filter-resolution" name="resolution" placeholder="1920x1080" /></label>
+          <label>FPS<input id="filter-frame-rate" name="frame-rate" placeholder="29.97" /></label>
+          <label>Duration min (s)<input id="filter-duration-min" name="duration-min" min="0" type="number" /></label>
+          <label>Duration max (s)<input id="filter-duration-max" name="duration-max" min="0" type="number" /></label>
+          <label>Codec<input id="filter-codec" name="codec" placeholder="h264" /></label>
+          <button class="secondary-button" type="submit">Apply filters</button>
+        </form>
       </aside>
 
       <section class="content-panel">
@@ -54,7 +93,11 @@ app.innerHTML = `
           </div>
           <span class="count-badge" id="clip-count">0 clips</span>
         </div>
-        <div class="empty-state">
+        <form class="search-form" id="search-form">
+          <input id="search-input" name="keyword" placeholder="Search file names and technical metadata" />
+          <button class="secondary-button" type="submit">Search</button>
+        </form>
+        <div class="empty-state" id="empty-state">
           <div class="empty-icon" aria-hidden="true">⌁</div>
           <h3>Your footage stays on your machine</h3>
           <p>
@@ -65,6 +108,7 @@ app.innerHTML = `
             View the MVP plan
           </button>
         </div>
+        <div class="result-list" id="result-list" hidden></div>
       </section>
     </section>
   </main>
@@ -74,6 +118,88 @@ const selectFolderButton = document.querySelector<HTMLButtonElement>("#select-fo
 const libraryStatus = document.querySelector<HTMLElement>("#library-status");
 const libraryPath = document.querySelector<HTMLElement>("#library-path");
 const clipCount = document.querySelector<HTMLElement>("#clip-count");
+const emptyState = document.querySelector<HTMLElement>("#empty-state");
+const resultList = document.querySelector<HTMLElement>("#result-list");
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>'"]/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "'": "&#39;",
+    '"': "&quot;",
+  })[character] ?? character);
+}
+
+function dateToUnixMs(value: string): number | undefined {
+  if (!value) return undefined;
+  const timestamp = Date.parse(`${value}T00:00:00Z`);
+  return Number.isNaN(timestamp) ? undefined : timestamp;
+}
+
+function numberToMs(value: string): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds >= 0 ? Math.round(seconds * 1000) : undefined;
+}
+
+function readFilters(): SearchFilters {
+  const value = (id: string) => document.querySelector<HTMLInputElement>(id)?.value.trim() ?? "";
+  return {
+    keyword: value("#search-input") || undefined,
+    folder: value("#filter-folder") || undefined,
+    date_from_unix_ms: dateToUnixMs(value("#filter-date-from")),
+    date_to_unix_ms: dateToUnixMs(value("#filter-date-to")),
+    resolution: value("#filter-resolution") || undefined,
+    frame_rate: value("#filter-frame-rate") || undefined,
+    min_duration_ms: numberToMs(value("#filter-duration-min")),
+    max_duration_ms: numberToMs(value("#filter-duration-max")),
+    codec: value("#filter-codec") || undefined,
+  };
+}
+
+function renderResults(results: SearchResult[]): void {
+  if (!resultList || !emptyState) return;
+  if (results.length === 0) {
+    resultList.hidden = true;
+    emptyState.hidden = false;
+    return;
+  }
+  emptyState.hidden = true;
+  resultList.hidden = false;
+  resultList.innerHTML = results.map((result, index) => {
+    const metadata = result.metadata;
+    const details = metadata
+      ? `${metadata.width ?? "?"}×${metadata.height ?? "?"} · ${metadata.frame_rate ?? "?"} fps · ${metadata.video_codec ?? "?"}`
+      : "Technical metadata unavailable";
+    const status = result.available ? "Available" : "Unavailable — rescan or restore this path";
+    return `<article class="result-card ${result.available ? "" : "result-card-unavailable"}">
+      <div>
+        <p class="result-index">${String(index + 1).padStart(2, "0")}</p>
+        <h3>${escapeHtml(result.path.split(/[\\/]/).pop() ?? result.path)}</h3>
+        <p>${escapeHtml(result.path)}</p>
+        <span>${escapeHtml(details)} · ${escapeHtml(status)}</span>
+      </div>
+      <button class="secondary-button open-result" data-path="${escapeHtml(result.path)}" ${result.available ? "" : "disabled"}>Open</button>
+    </article>`;
+  }).join("");
+  resultList.querySelectorAll<HTMLButtonElement>(".open-result").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await openPath(button.dataset.path ?? "");
+    });
+  });
+}
+
+async function searchLibrary(): Promise<void> {
+  try {
+    const results = await invoke<SearchResult[]>("search_media", { query: readFilters() });
+    renderResults(results);
+    if (libraryStatus) libraryStatus.textContent = `${results.length} matching clips`;
+  } catch (error) {
+    if (libraryStatus) libraryStatus.textContent = "Search failed";
+    if (libraryPath) libraryPath.textContent = String(error);
+  }
+}
 
 selectFolderButton?.addEventListener("click", async () => {
   const selected = await open({
@@ -96,12 +222,23 @@ selectFolderButton?.addEventListener("click", async () => {
       libraryStatus.textContent = report.warnings.length === 0 ? "Folder indexed" : "Folder indexed with warnings";
     }
     if (clipCount) clipCount.textContent = `${report.active_file_count} clips`;
+    await searchLibrary();
   } catch (error) {
     if (libraryStatus) libraryStatus.textContent = "Scan failed";
     if (libraryPath) libraryPath.textContent = String(error);
   } finally {
     selectFolderButton.disabled = false;
   }
+});
+
+document.querySelector<HTMLFormElement>("#search-form")?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void searchLibrary();
+});
+
+document.querySelector<HTMLFormElement>("#filter-form")?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void searchLibrary();
 });
 
 document.querySelector<HTMLButtonElement>("#learn-more")?.addEventListener(
