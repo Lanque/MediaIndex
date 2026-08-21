@@ -1,4 +1,5 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
@@ -47,6 +48,13 @@ type AiIndexReport = {
   analyzed_file_count: number;
   annotation_count: number;
   warnings: Array<{ path: string; message: string }>;
+};
+
+type AiProgress = {
+  completed_files: number;
+  total_files: number;
+  current_file: string;
+  provider: string;
 };
 
 type AiProvider = "local" | "openai" | "gemini";
@@ -121,7 +129,7 @@ app.innerHTML = `
         <details class="ai-settings" open>
           <summary>AI connection</summary>
           <p class="settings-help">
-            Choose local Ollama, OpenAI (ChatGPT API), or Gemini. Settings stay on this computer.
+            Choose local Ollama, OpenAI (ChatGPT API), or Gemini. Settings stay on this computer. For short kill-feed events, use Every (s) = 1–2.
           </p>
           <form class="settings-form" id="ai-settings-form">
             <label>Provider
@@ -391,6 +399,16 @@ function saveAiConfig(): AiConfig {
 }
 
 loadAiConfig();
+
+void listen<AiProgress>("ai-progress", ({ payload }) => {
+  const fileName = payload.current_file.split(/[\\/]/).pop() ?? payload.current_file;
+  if (libraryStatus) {
+    libraryStatus.textContent = `AI analysis ${payload.completed_files}/${payload.total_files}`;
+  }
+  if (libraryPath) {
+    libraryPath.textContent = `${fileName} · ${payload.provider}`;
+  }
+});
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>'"]/g, (character) => ({
