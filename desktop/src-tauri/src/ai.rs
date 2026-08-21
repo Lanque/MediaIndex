@@ -794,6 +794,28 @@ mod tests {
     }
 
     #[test]
+    fn request_provider_and_models_override_environment_defaults() {
+        let request: AiRequestConfig = serde_json::from_value(json!({
+            "provider": "openai",
+            "apiKey": "test-key",
+            "visionModel": "vision-test",
+            "embeddingModel": "embedding-test",
+            "baseUrl": "https://example.test/v1"
+        }))
+        .expect("frontend configuration should deserialize");
+        let settings = AiSettings::from_request(Some(request)).expect("request should win");
+
+        assert_eq!(settings.provider, AiProvider::OpenAI);
+        assert_eq!(settings.vision_model, "vision-test");
+        assert_eq!(settings.embedding_model, "embedding-test");
+        assert_eq!(settings.base_url, "https://example.test/v1");
+        assert_eq!(
+            settings.model_namespace(),
+            "openai:vision-test:embedding-test"
+        );
+    }
+
+    #[test]
     fn calculates_timestamp_format_without_float_drift() {
         assert_eq!(format_seconds(12_345), "12.345");
     }
