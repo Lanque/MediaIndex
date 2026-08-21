@@ -41,6 +41,7 @@ The desktop shell now includes the first local scanner slice from issue [#3](htt
 - a versioned SQLite local index where content hashes identify assets and paths identify locations;
 - idempotent re-indexing with duplicate, moved, modified, deleted, and incomplete-scan handling.
 - offline search across file names and technical metadata with folder, date, resolution, FPS, duration, and codec filters;
+- local FFprobe metadata is collected during indexing and results can be sorted by name, duration, file size, modified date, or resolution in either direction;
 - opening available original files from a result while clearly identifying unavailable paths.
 
 See [docs/local-index.md](../docs/local-index.md) for the schema and hashing policy and [docs/local-search.md](../docs/local-search.md) for the supported filters and usage example.

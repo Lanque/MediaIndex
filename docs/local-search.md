@@ -29,3 +29,11 @@ To find a 29.97 FPS H.264 clip from the first shooting day:
 An unavailable result remains visible with an explicit status so a stale path
 is distinguishable from a search miss. The Open button is disabled until a
 future scan confirms that the local file is available again.
+
+## Sorting
+
+The desktop library can sort matching results by name, duration, file size,
+modified date, or resolution, ascending or descending. Sorting happens over
+the local SQLite result set and does not upload footage. Technical sort fields
+are available after FFprobe metadata extraction; files whose metadata cannot be
+read remain searchable by name and path and are shown with a warning.

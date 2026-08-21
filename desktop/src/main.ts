@@ -19,6 +19,8 @@ type SearchFilters = {
   min_duration_ms?: number;
   max_duration_ms?: number;
   codec?: string;
+  sort_by: "name" | "duration" | "size" | "modified" | "resolution";
+  sort_direction: "asc" | "desc";
 };
 
 type SearchResult = {
@@ -95,14 +97,26 @@ app.innerHTML = `
         </div>
         <form class="search-form" id="search-form">
           <input id="search-input" name="keyword" placeholder="Search file names and technical metadata" />
+          <select id="sort-by" aria-label="Sort results">
+            <option value="name">Name</option>
+            <option value="duration">Duration</option>
+            <option value="size">File size</option>
+            <option value="modified">Modified date</option>
+            <option value="resolution">Resolution</option>
+          </select>
+          <select id="sort-direction" aria-label="Sort direction">
+            <option value="asc">Ascending</option>
+            <option value="desc">Descending</option>
+          </select>
           <button class="secondary-button" type="submit">Search</button>
         </form>
         <div class="empty-state" id="empty-state">
           <div class="empty-icon" aria-hidden="true">⌁</div>
           <h3>Your footage stays on your machine</h3>
           <p>
-            The next step is the local scanner: discovery, FFprobe metadata,
-            content hashing, and a searchable SQLite index.
+            Select a folder to scan videos locally. MediaIndex reads technical
+            metadata, stores it in SQLite, and lets you search and sort without
+            uploading the original footage.
           </p>
           <button class="secondary-button" id="learn-more" type="button">
             View the MVP plan
@@ -137,6 +151,30 @@ function dateToUnixMs(value: string): number | undefined {
   return Number.isNaN(timestamp) ? undefined : timestamp;
 }
 
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let amount = value;
+  let unit = "B";
+  for (const nextUnit of units) {
+    amount /= 1024;
+    unit = nextUnit;
+    if (amount < 1024) break;
+  }
+  return `${amount.toFixed(amount >= 10 ? 0 : 1)} ${unit}`;
+}
+
+function formatDuration(durationMs: number | null | undefined): string {
+  if (durationMs == null) return "duration unavailable";
+  const totalSeconds = Math.round(durationMs / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+    : `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
 function numberToMs(value: string): number | undefined {
   if (!value) return undefined;
   const seconds = Number(value);
@@ -145,6 +183,8 @@ function numberToMs(value: string): number | undefined {
 
 function readFilters(): SearchFilters {
   const value = (id: string) => document.querySelector<HTMLInputElement>(id)?.value.trim() ?? "";
+  const sortBy = document.querySelector<HTMLSelectElement>("#sort-by")?.value ?? "name";
+  const sortDirection = document.querySelector<HTMLSelectElement>("#sort-direction")?.value ?? "asc";
   return {
     keyword: value("#search-input") || undefined,
     folder: value("#filter-folder") || undefined,
@@ -155,6 +195,8 @@ function readFilters(): SearchFilters {
     min_duration_ms: numberToMs(value("#filter-duration-min")),
     max_duration_ms: numberToMs(value("#filter-duration-max")),
     codec: value("#filter-codec") || undefined,
+    sort_by: sortBy as SearchFilters["sort_by"],
+    sort_direction: sortDirection as SearchFilters["sort_direction"],
   };
 }
 
@@ -170,7 +212,7 @@ function renderResults(results: SearchResult[]): void {
   resultList.innerHTML = results.map((result, index) => {
     const metadata = result.metadata;
     const details = metadata
-      ? `${metadata.width ?? "?"}×${metadata.height ?? "?"} · ${metadata.frame_rate ?? "?"} fps · ${metadata.video_codec ?? "?"}`
+      ? `${formatDuration(metadata.duration_ms)} · ${formatBytes(result.size_bytes)} · ${metadata.width ?? "?"}×${metadata.height ?? "?"} · ${metadata.frame_rate ?? "?"} fps · ${metadata.video_codec ?? "?"}`
       : "Technical metadata unavailable";
     const status = result.available ? "Available" : "Unavailable — rescan or restore this path";
     return `<article class="result-card ${result.available ? "" : "result-card-unavailable"}">
