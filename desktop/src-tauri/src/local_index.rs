@@ -9,6 +9,8 @@ use std::fmt::{Display, Formatter};
 use std::path::Path;
 
 const AI_RESULT_MERGE_WINDOW_MS: u64 = 3_000;
+const AI_FOCUSED_SCORE_WINDOW: f32 = 0.08;
+const AI_BALANCED_SCORE_WINDOW: f32 = 0.14;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE media_assets (
@@ -178,6 +180,15 @@ pub struct AiSearchResult {
     pub description: String,
     pub labels: Vec<String>,
     pub available: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiSearchFocus {
+    #[default]
+    Focused,
+    Balanced,
+    Broad,
 }
 
 #[derive(Clone, Debug)]
@@ -415,12 +426,44 @@ impl SqliteIndex {
         )?)
     }
 
+    pub fn has_ai_annotations_for_content_model(
+        &self,
+        content_hash: &str,
+        model_namespace: &str,
+    ) -> Result<bool, IndexError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM ai_annotations
+                WHERE content_hash = ?1 AND model = ?2
+            )",
+            params![content_hash, model_namespace],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn search_ai(
         &self,
         query_text: &str,
         query_embedding: &[f32],
         limit: usize,
         model_namespace: Option<&str>,
+    ) -> Result<Vec<AiSearchResult>, IndexError> {
+        self.search_ai_with_focus(
+            query_text,
+            query_embedding,
+            limit,
+            model_namespace,
+            AiSearchFocus::Broad,
+        )
+    }
+
+    pub fn search_ai_with_focus(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        limit: usize,
+        model_namespace: Option<&str>,
+        focus: AiSearchFocus,
     ) -> Result<Vec<AiSearchResult>, IndexError> {
         let mut statement = self.connection.prepare(
             "SELECT ai_annotations.timestamp_ms, ai_annotations.description,
@@ -498,8 +541,31 @@ impl SqliteIndex {
                 .then_with(|| left.timestamp_ms.cmp(&right.timestamp_ms))
         });
 
-        let mut results: Vec<AiSearchResult> = Vec::with_capacity(limit.min(ranked.len()));
+        let Some(top_score) = ranked.first().map(|result| result.score) else {
+            return Ok(Vec::new());
+        };
+        let (score_floor, max_videos, max_moments_per_video, result_limit) = match focus {
+            AiSearchFocus::Focused => (
+                (top_score - AI_FOCUSED_SCORE_WINDOW).max(0.40),
+                8,
+                2,
+                limit.min(16),
+            ),
+            AiSearchFocus::Balanced => (
+                (top_score - AI_BALANCED_SCORE_WINDOW).max(0.32),
+                16,
+                3,
+                limit.min(48),
+            ),
+            AiSearchFocus::Broad => (0.0, usize::MAX, usize::MAX, limit),
+        };
+
+        let mut results: Vec<AiSearchResult> = Vec::with_capacity(result_limit.min(ranked.len()));
+        let mut video_counts = HashMap::<String, usize>::new();
         for candidate in ranked {
+            if candidate.score < score_floor {
+                continue;
+            }
             let repeats_existing_moment = results.iter().any(|existing| {
                 existing.content_hash == candidate.content_hash
                     && existing.timestamp_ms.abs_diff(candidate.timestamp_ms)
@@ -508,8 +574,19 @@ impl SqliteIndex {
             if repeats_existing_moment {
                 continue;
             }
+            let is_new_video = !video_counts.contains_key(&candidate.content_hash);
+            if is_new_video && video_counts.len() == max_videos {
+                continue;
+            }
+            let video_count = video_counts
+                .entry(candidate.content_hash.clone())
+                .or_default();
+            if *video_count == max_moments_per_video {
+                continue;
+            }
+            *video_count += 1;
             results.push(candidate);
-            if results.len() == limit {
+            if results.len() == result_limit {
                 break;
             }
         }
@@ -1151,6 +1228,94 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![4_000, 10_000]
         );
+    }
+
+    #[test]
+    fn focused_ai_search_filters_weak_matches_and_caps_video_count() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        let files = (0..10)
+            .map(|index| {
+                file(
+                    &format!("/library/clip-{index}.mp4"),
+                    &format!("hash-{index}"),
+                )
+            })
+            .collect();
+        index
+            .reconcile(&report(files), &HashMap::new())
+            .expect("fixtures should be indexed");
+        for index_number in 0..10 {
+            index
+                .replace_ai_annotations(
+                    &format!("hash-{index_number}"),
+                    &[AiAnnotation {
+                        timestamp_ms: 1_000,
+                        description: "A person performs a visually similar action".to_owned(),
+                        labels: Vec::new(),
+                        embedding: vec![1.0, 0.0],
+                        confidence: Some(0.8),
+                        model: "fixture".to_owned(),
+                    }],
+                )
+                .expect("annotations should persist");
+        }
+        index
+            .replace_ai_annotations(
+                "hash-9",
+                &[AiAnnotation {
+                    timestamp_ms: 1_000,
+                    description: "An unrelated static title card".to_owned(),
+                    labels: Vec::new(),
+                    embedding: vec![0.0, 1.0],
+                    confidence: Some(0.8),
+                    model: "fixture".to_owned(),
+                }],
+            )
+            .expect("weak annotation should persist");
+
+        let results = index
+            .search_ai_with_focus(
+                "specific action",
+                &[1.0, 0.0],
+                100,
+                Some("fixture"),
+                AiSearchFocus::Focused,
+            )
+            .expect("focused AI search should work");
+
+        assert_eq!(results.len(), 8);
+        assert!(results.iter().all(|result| result.content_hash != "hash-9"));
+    }
+
+    #[test]
+    fn detects_existing_ai_analysis_for_a_content_and_model() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/ready.mp4", "hash-ready")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        index
+            .replace_ai_annotations(
+                "hash-ready",
+                &[AiAnnotation {
+                    timestamp_ms: 0,
+                    description: "Ready".to_owned(),
+                    labels: Vec::new(),
+                    embedding: vec![1.0],
+                    confidence: None,
+                    model: "model-a".to_owned(),
+                }],
+            )
+            .expect("annotation should persist");
+
+        assert!(index
+            .has_ai_annotations_for_content_model("hash-ready", "model-a")
+            .expect("existing analysis should be detected"));
+        assert!(!index
+            .has_ai_annotations_for_content_model("hash-ready", "model-b")
+            .expect("other model should remain absent"));
     }
 
     #[test]

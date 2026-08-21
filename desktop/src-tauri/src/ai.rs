@@ -22,6 +22,7 @@ const DEFAULT_LOCAL_BASE_URL: &str = "http://127.0.0.1:11434";
 const REMOTE_PARALLEL_FILE_LIMIT: usize = 2;
 const REMOTE_VISION_BATCH_SIZE: usize = 8;
 const MAX_EXTRACTED_FRAME_WIDTH: u32 = 1_280;
+const MAX_THUMBNAIL_WIDTH: u32 = 640;
 const AI_CONNECT_TIMEOUT_SECONDS: u64 = 20;
 const AI_REQUEST_TIMEOUT_SECONDS: u64 = 180;
 
@@ -82,6 +83,7 @@ pub struct AiWarning {
 #[derive(Debug, Serialize)]
 pub struct AiIndexReport {
     pub analyzed_file_count: u64,
+    pub skipped_file_count: u64,
     pub annotation_count: u64,
     pub warnings: Vec<AiWarning>,
 }
@@ -206,11 +208,7 @@ impl AiSettings {
             None => environment_u64("MEDIAINDEX_AI_MAX_FRAMES", 120)?,
         } as usize;
 
-        let ffmpeg_executable = non_empty(request.ffmpeg_path)
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("MEDIAINDEX_FFMPEG_PATH").map(PathBuf::from))
-            .filter(|path| path.is_file())
-            .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+        let ffmpeg_executable = resolve_ffmpeg_executable(request.ffmpeg_path);
         let context_hint =
             non_empty(request.context_hint).or_else(|| env_non_empty("MEDIAINDEX_AI_CONTEXT"));
 
@@ -251,6 +249,14 @@ impl AiSettings {
             4
         }
     }
+}
+
+pub fn resolve_ffmpeg_executable(configured_path: Option<String>) -> PathBuf {
+    non_empty(configured_path)
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("MEDIAINDEX_FFMPEG_PATH").map(PathBuf::from))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("ffmpeg"))
 }
 
 pub fn analyze_file(
@@ -574,6 +580,66 @@ fn extract_frames(path: &Path, settings: &AiSettings) -> Result<Vec<(u64, Vec<u8
         return Err(format!("FFmpeg produced no frames for {}", path.display()));
     }
     Ok(frames)
+}
+
+pub fn extract_thumbnail(
+    path: &Path,
+    timestamp_ms: u64,
+    ffmpeg_executable: &Path,
+) -> Result<Vec<u8>, String> {
+    let filter = format!("scale=w='min({MAX_THUMBNAIL_WIDTH},iw)':h=-2");
+    let mut command = Command::new(ffmpeg_executable);
+    configure_hidden_process(&mut command);
+    let output = command
+        .args(["-hide_banner", "-loglevel", "error", "-ss"])
+        .arg(format!("{:.3}", timestamp_ms as f64 / 1_000.0))
+        .arg("-i")
+        .arg(path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-vf",
+            &filter,
+            "-q:v",
+            "4",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        ])
+        .output()
+        .map_err(|error| {
+            format!(
+                "FFmpeg could not create a thumbnail for {}: {error}",
+                path.display()
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!(
+                "FFmpeg thumbnail extraction failed for {} with status {}",
+                path.display(),
+                output.status
+            )
+        } else {
+            format!(
+                "FFmpeg thumbnail extraction failed for {}: {stderr}",
+                path.display()
+            )
+        });
+    }
+    if output.stdout.is_empty() {
+        return Err(format!(
+            "FFmpeg produced no thumbnail for {} at {timestamp_ms} ms",
+            path.display()
+        ));
+    }
+    Ok(output.stdout)
 }
 
 fn configure_hidden_process(command: &mut Command) {
@@ -1449,9 +1515,13 @@ mod tests {
         })
         .expect("real video should complete the OpenAI response pipeline");
         server.join().expect("analysis stub should finish cleanly");
+        let thumbnail = extract_thumbnail(&video, 1_000, &settings.ffmpeg_executable)
+            .expect("real video should produce a local thumbnail");
+        assert!(thumbnail.starts_with(&[0xff, 0xd8]));
         println!(
-            "analyzed {} sampled frames across bounded cloud vision requests",
-            annotations.len()
+            "analyzed {} sampled frames and extracted a {} byte local thumbnail",
+            annotations.len(),
+            thumbnail.len()
         );
         assert!(!annotations.is_empty());
         assert!(annotations.len() <= 24);

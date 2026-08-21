@@ -22,6 +22,11 @@ local secret store. Production credentials belong in AWS Secrets Manager and
 are injected at runtime through least-privilege roles; they must not be placed
 in the desktop bundle, repository, logs, or fixtures.
 
+The desktop AI connection persists non-secret settings only. Cloud API keys
+are held in the current WebView session and legacy keys are removed from
+persistent local storage on startup. The backend never returns a key to search
+or thumbnail results.
+
 ## Observability and failure behavior
 
 Structured events carry operation and job identifiers, while token-like fields
@@ -39,3 +44,18 @@ delivery, stale cursors, authorization failures, and worker crashes.
 - Cap queue batch size, retry count, and per-job processing time.
 - Require an explicit processing request before transcription, embeddings, or
   previews are created.
+
+## Desktop AI cost safeguards
+
+- GPT-5.6 Luna is the cost-sensitive OpenAI default; the substantially more
+  expensive Terra preset is labeled as an explicit detailed-analysis choice.
+- New OpenAI settings cap analysis at 60 sampled frames per video by default.
+- **Analyze with AI** skips content that already has annotations in the active
+  provider/model namespace. Reanalysis is a one-run checkbox that is never
+  persisted and resets after the run.
+- Focused search limits low-ranking results, videos, and moments without making
+  another vision request. Query embeddings remain the only AI call during
+  search.
+- Best-moment thumbnails are extracted and cached locally with FFmpeg. The
+  thumbnail command accepts only active paths already present in the SQLite
+  index and never uploads the source frame.

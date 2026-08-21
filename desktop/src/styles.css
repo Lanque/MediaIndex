@@ -14,7 +14,6 @@
 
 body {
   margin: 0;
-  min-width: 960px;
   min-height: 100vh;
   background:
     radial-gradient(circle at 80% -20%, rgba(72, 104, 180, 0.3), transparent 42rem),
@@ -271,6 +270,21 @@ button:disabled {
   font-size: 0.74rem;
 }
 
+.settings-form .checkbox-field {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 1px;
+  line-height: 1.35;
+}
+
+.settings-form .checkbox-field input {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  accent-color: #73a7ff;
+}
+
 .optional-label {
   color: #7285ac;
   font-weight: 400;
@@ -382,6 +396,16 @@ button:disabled {
   font-size: 0.82rem;
 }
 
+.ai-search-form select {
+  border: 1px solid #354a76;
+  border-radius: 8px;
+  padding: 0 10px;
+  color: #dce8ff;
+  background: #111d3b;
+  font: inherit;
+  font-size: 0.76rem;
+}
+
 .search-status {
   min-height: 20px;
   margin: 8px 0 0;
@@ -412,55 +436,132 @@ button:disabled {
   margin-top: 24px;
 }
 
-.video-result-group {
+.result-list.ai-result-grid {
+  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+  align-items: start;
+  gap: 16px;
+}
+
+.video-result-card {
   overflow: hidden;
   border: 1px solid #2b3b63;
   border-radius: 16px;
-  background: #10192f;
+  background: #121c34;
+  box-shadow: 0 12px 30px rgba(3, 7, 18, 0.18);
 }
 
-.video-result-group[open] {
+.video-result-card:hover {
   border-color: #3d5688;
 }
 
-.video-result-group summary {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 16px 18px;
-  cursor: pointer;
-  list-style: none;
-  background: #141e39;
-}
-
-.video-result-group summary::-webkit-details-marker {
-  display: none;
-}
-
-.video-result-group summary:hover {
-  background: #182543;
-}
-
-.video-folder-icon::before {
-  content: "📁";
-  font-size: 1.25rem;
-}
-
-.video-result-group[open] .video-folder-icon::before {
-  content: "📂";
-}
-
-.video-group-heading {
-  min-width: 0;
-  flex: 1;
-}
-
-.video-group-heading strong,
-.video-group-heading small {
+.video-thumbnail {
+  position: relative;
   display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  color: #d8e6ff;
+  cursor: pointer;
+  background: linear-gradient(135deg, #16274b, #0c1429);
 }
 
-.video-group-heading strong {
+.video-thumbnail img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.video-thumbnail.thumbnail-loaded img {
+  opacity: 1;
+}
+
+.thumbnail-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #8398c1;
+  font-size: 0.72rem;
+}
+
+.thumbnail-loaded .thumbnail-placeholder {
+  opacity: 0;
+}
+
+.thumbnail-play {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  width: 48px;
+  height: 48px;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.38);
+  border-radius: 50%;
+  color: white;
+  background: rgba(4, 9, 20, 0.68);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.32);
+  transform: translate(-50%, -50%);
+}
+
+.video-thumbnail:hover .thumbnail-play {
+  background: rgba(42, 89, 173, 0.88);
+}
+
+.thumbnail-time,
+.relevance-badge {
+  position: absolute;
+  z-index: 1;
+  padding: 5px 8px;
+  border-radius: 999px;
+  color: #f4f7ff;
+  font-size: 0.66rem;
+  font-weight: 800;
+  background: rgba(5, 10, 22, 0.78);
+  backdrop-filter: blur(5px);
+}
+
+.thumbnail-time {
+  right: 10px;
+  bottom: 10px;
+}
+
+.relevance-badge {
+  top: 10px;
+  left: 10px;
+  color: #d7e7ff;
+  background: rgba(22, 48, 91, 0.9);
+}
+
+.video-card-body {
+  padding: 15px 16px 14px;
+}
+
+.video-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.video-card-heading > div {
+  min-width: 0;
+}
+
+.video-card-heading h3,
+.video-card-heading p,
+.video-best-description {
+  margin: 0;
+}
+
+.video-card-heading h3 {
   overflow: hidden;
   color: #eef3ff;
   font-size: 0.92rem;
@@ -468,28 +569,86 @@ button:disabled {
   white-space: nowrap;
 }
 
-.video-group-heading small {
-  overflow: hidden;
+.video-card-heading p {
   margin-top: 4px;
-  color: #8295bc;
+  color: #7f91b8;
+  font-size: 0.68rem;
+}
+
+.icon-button {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid #34486f;
+  border-radius: 8px;
+  color: #bcd0f5;
+  cursor: pointer;
+  background: #17233e;
+}
+
+.video-best-description {
+  display: -webkit-box;
+  min-height: 2.7em;
+  margin-top: 12px;
+  overflow: hidden;
+  color: #a6b5d2;
+  font-size: 0.74rem;
+  line-height: 1.4;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.video-moments {
+  margin-top: 13px;
+  border-top: 1px solid #27395e;
+}
+
+.video-moments summary {
+  padding-top: 11px;
+  color: #9fb7df;
+  cursor: pointer;
   font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.moment-list {
+  display: grid;
+  gap: 5px;
+  margin-top: 9px;
+}
+
+.moment-row {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) 12px;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  border-radius: 7px;
+  padding: 7px 8px;
+  color: #aabada;
+  text-align: left;
+  cursor: pointer;
+  background: #0e172c;
+}
+
+.moment-row:hover {
+  color: #e8f0ff;
+  background: #182745;
+}
+
+.moment-row strong {
+  color: #c7d9f8;
+  font-size: 0.67rem;
+}
+
+.moment-row span {
+  overflow: hidden;
+  font-size: 0.66rem;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.video-group-count {
-  flex: 0 0 auto;
-  padding: 6px 9px;
-  border: 1px solid #354a76;
-  border-radius: 999px;
-  color: #b5c8ec;
-  font-size: 0.7rem;
-}
-
-.video-group-results {
-  display: grid;
-  gap: 8px;
-  padding: 10px;
 }
 
 .result-card {
@@ -501,13 +660,6 @@ button:disabled {
   border: 1px solid #2b3b63;
   border-radius: 14px;
   background: #141e39;
-}
-
-.result-card-grouped {
-  padding: 14px 16px;
-  border-color: #26385d;
-  border-radius: 10px;
-  background: #111b33;
 }
 
 .result-card h3,
@@ -564,14 +716,17 @@ button:disabled {
 }
 
 @media (max-width: 760px) {
-  .video-result-group summary,
   .result-card {
     align-items: flex-start;
     flex-wrap: wrap;
   }
 
-  .video-group-count {
-    margin-left: 38px;
+  .ai-search-form {
+    flex-wrap: wrap;
+  }
+
+  .ai-search-form input {
+    min-width: 100%;
   }
 }
 
