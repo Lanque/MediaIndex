@@ -1,6 +1,5 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { openPath } from "@tauri-apps/plugin-opener";
 import "./styles.css";
 
 type IndexReport = {
@@ -333,7 +332,7 @@ function renderResults(results: SearchResult[]): void {
   resultList.querySelectorAll<HTMLButtonElement>(".open-result").forEach((button) => {
     button.addEventListener("click", async () => {
       try {
-        await openPath(button.dataset.path ?? "");
+        await invoke("open_indexed_media_path", { path: button.dataset.path ?? "" });
       } catch (error) {
         if (libraryStatus) libraryStatus.textContent = "Could not open clip";
         if (libraryPath) libraryPath.textContent = String(error);

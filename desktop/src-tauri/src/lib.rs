@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::Manager;
+use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command]
 fn scan_media_folder(path: String) -> Result<scanner::ScanReport, String> {
@@ -136,6 +137,26 @@ fn search_ai(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn open_indexed_media_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let index = open_local_index(&app)?;
+    let indexed_file = index
+        .get_file(&path)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "The selected clip is not in the active local index".to_owned())?;
+
+    if indexed_file.status != local_index::LocalFileStatus::Active {
+        return Err("The selected clip is no longer active in the local index".to_owned());
+    }
+    if !Path::new(&path).is_file() {
+        return Err("The selected clip is no longer available at this path".to_owned());
+    }
+
+    app.opener()
+        .open_path(path, None::<String>)
+        .map_err(|error| error.to_string())
+}
+
 fn open_local_index(app: &tauri::AppHandle) -> Result<local_index::SqliteIndex, String> {
     let database_directory = app
         .path()
@@ -158,7 +179,8 @@ pub fn run() {
             index_media_folder,
             search_media,
             analyze_media_folder,
-            search_ai
+            search_ai,
+            open_indexed_media_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running MediaIndex");
