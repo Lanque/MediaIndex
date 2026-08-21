@@ -244,12 +244,16 @@ impl AiSettings {
         }
     }
 
-    fn vision_batch_size(&self) -> usize {
+    pub(crate) fn vision_batch_size(&self) -> usize {
         if self.provider.is_remote() {
             REMOTE_VISION_BATCH_SIZE
         } else {
             4
         }
+    }
+
+    pub(crate) fn max_frames_per_file(&self) -> usize {
+        self.max_frames_per_file
     }
 }
 
