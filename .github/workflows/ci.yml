@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  repository:
+    name: Repository checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check whitespace errors
+        shell: bash
+        run: |
+          if [ -n "${GITHUB_BASE_REF}" ]; then
+            git diff --check "origin/${GITHUB_BASE_REF}...HEAD"
+          else
+            git diff --check HEAD^
+          fi
+
+      - name: Validate repository documentation
+        run: python scripts/check_repository.py
+
+      - name: Run repository tests
+        run: python -m unittest discover -s tests -p "test_*.py"
