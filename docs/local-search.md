@@ -49,8 +49,9 @@ the embedded WebView show an actionable fallback message.
 
 AI search is a separate, explicit workflow:
 
-1. Configure `MEDIAINDEX_OPENAI_API_KEY` (or `OPENAI_API_KEY`) and make sure
-   FFmpeg is available through `MEDIAINDEX_FFMPEG_PATH` or `PATH`.
+1. Open **AI connection** and choose **Local (Ollama)**, **OpenAI (ChatGPT API)**,
+   or **Google Gemini API**. Add the cloud API key when needed, verify the
+   models/base URL, press **Test connection**, and save the settings.
 2. Select a footage folder and wait for deterministic indexing to finish.
 3. Press **Analyze with AI**. MediaIndex samples frames, stores descriptions
    and embeddings locally, and reports any per-file failures.
@@ -60,6 +61,12 @@ AI search is a separate, explicit workflow:
 AI results are ranked by embedding similarity and include the matching clip
 timestamp. Press **Preview** to open the clip at that timestamp. The default
 sampling interval is five seconds with a maximum of 120 frames per file; use
-`MEDIAINDEX_AI_SAMPLE_SECONDS` and `MEDIAINDEX_AI_MAX_FRAMES` to adjust the
-cost/coverage trade-off. The full original video is never uploaded as one
-file, but sampled frames are sent to the configured provider.
+the values in **AI connection** to adjust the cost/coverage trade-off. The full
+original video is never uploaded as one file, but sampled frames are sent to the
+configured provider. The provider and model name are stored with each
+annotation, so embeddings from incompatible models are not mixed in one search.
+
+For **Local (Ollama)**, Ollama must be running at the configured base URL and
+the selected models must already be installed. For cloud providers, the app
+uses the API directly; a ChatGPT web subscription is not an API key. The API
+key is kept in local app storage and is not written to the repository.

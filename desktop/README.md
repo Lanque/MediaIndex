@@ -56,21 +56,32 @@ original media is not uploaded.
 ### AI search
 
 AI analysis is explicit because it sends sampled JPEG frames to the configured
-AI provider and can consume time and API credits. Set the variables below in
-PowerShell before starting the desktop app:
+AI provider and can consume time or API credits. Configure it in the app:
 
-```powershell
-$env:MEDIAINDEX_OPENAI_API_KEY = "your-api-key"
-$env:MEDIAINDEX_FFMPEG_PATH = "C:\path\to\ffmpeg.exe"
-& ".\src-tauri\target\release\mediaindex.exe"
-```
+1. Open **AI connection** in the left sidebar.
+2. Choose **Local (Ollama)**, **OpenAI (ChatGPT API)**, or **Google Gemini API**.
+3. Enter the API key for a cloud provider, check the model names and base URL,
+   then press **Test connection** and **Save settings**.
+4. Select and index a folder, press **Analyze with AI**, and search with queries
+   such as `Fortnite kill`, `enemy elimination`, or `victory`.
 
-The app also accepts `OPENAI_API_KEY` and `ffmpeg` from `PATH`. Select and index
-a folder first, click **Analyze with AI**, then use queries such as `Fortnite
-kill`, `enemy elimination`, or `victory`. AI results include a timestamp and
-the **Preview** action starts at that moment. Sampling defaults to one frame per
-five seconds and at most 120 frames per file; tune these with
-`MEDIAINDEX_AI_SAMPLE_SECONDS` and `MEDIAINDEX_AI_MAX_FRAMES`.
+Settings, including a cloud API key, are stored in this computer's local app
+storage and are not committed to the repository. **OpenAI (ChatGPT API)** means
+the OpenAI developer API, not the ChatGPT website subscription.
+
+For the local option, install and run [Ollama](https://ollama.com/), then make
+the selected vision and embedding models available (for example `gemma4` and
+`embeddinggemma`). The default endpoint is `http://127.0.0.1:11434`.
+
+FFmpeg is resolved from the optional path in **AI connection**, then from the
+`MEDIAINDEX_FFMPEG_PATH` environment variable, then from `PATH`. Sampling
+defaults to one frame per five seconds and at most 120 frames per file; the
+interval and limit can be changed directly in the same panel.
+
+The environment variables remain available for automation and older launch
+scripts (`MEDIAINDEX_AI_PROVIDER`, provider-specific API keys, model names,
+base URLs, `MEDIAINDEX_FFMPEG_PATH`, `MEDIAINDEX_AI_SAMPLE_SECONDS`, and
+`MEDIAINDEX_AI_MAX_FRAMES`). The in-app configuration takes precedence.
 
 Only sampled frames and their text/embedding results are sent for analysis; the
 original video is not uploaded as a whole. Deterministic local search remains
