@@ -42,10 +42,14 @@ The desktop shell now includes the first local scanner slice from issue [#3](htt
 - idempotent re-indexing with duplicate, moved, modified, deleted, and incomplete-scan handling.
 - offline search across file names and technical metadata with folder, date, resolution, FPS, duration, and codec filters;
 - local FFprobe metadata is collected during indexing and results can be sorted by name, duration, file size, modified date, or resolution in either direction;
-- opening available original files from a result while clearly identifying unavailable paths.
+- opening available original files from a result while clearly identifying unavailable paths;
+- an embedded video preview for available clips, with a system-player fallback when the WebView cannot decode a codec;
+- cached hashes and FFprobe metadata on repeat scans when path, size, and modification time are unchanged;
+- a 500-result render cap so a large search result cannot freeze the desktop window.
 
 The first scan hashes each discovered video locally so moved and modified files
 can be detected reliably. Large footage folders can therefore take time during
-the initial scan; the original media is not uploaded.
+the initial scan; later scans reuse unchanged hashes and cached metadata. The
+original media is not uploaded.
 
 See [docs/local-index.md](../docs/local-index.md) for the schema and hashing policy and [docs/local-search.md](../docs/local-search.md) for the supported filters and usage example.

@@ -2,6 +2,7 @@ pub mod local_index;
 pub mod metadata;
 pub mod scanner;
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::Manager;
@@ -22,12 +23,49 @@ fn index_media_folder(
     app: tauri::AppHandle,
     path: String,
 ) -> Result<local_index::IndexReport, String> {
-    let mut scan = scanner::scan_folder(Path::new(&path), &scanner::ScanOptions::default())
-        .map_err(|error| error.to_string())?;
-    let (metadata_by_path, metadata_warnings) =
-        metadata::collect_metadata(&scan.files, &metadata::FfprobeMetadataProbe::default());
-    scan.warnings.extend(metadata_warnings);
     let mut index = open_local_index(&app)?;
+    let known_files = index
+        .known_files()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|file| {
+            let path = file.path.clone();
+            (
+                path,
+                scanner::LocalFileRecord {
+                    path: file.path,
+                    size_bytes: file.size_bytes,
+                    modified_unix_ms: file.modified_unix_ms,
+                    content_hash: file.content_hash,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut scan = scanner::scan_folder_with_known_files(
+        Path::new(&path),
+        &scanner::ScanOptions::default(),
+        &known_files,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut cached_metadata = HashMap::new();
+    for file in &scan.files {
+        if cached_metadata.contains_key(&file.content_hash) {
+            continue;
+        }
+        if let Some(metadata) = index
+            .get_asset_metadata(&file.content_hash)
+            .map_err(|error| error.to_string())?
+        {
+            cached_metadata.insert(file.content_hash.clone(), metadata);
+        }
+    }
+    let (metadata_by_path, metadata_warnings) = metadata::collect_metadata_with_cache(
+        &scan.files,
+        &metadata::FfprobeMetadataProbe::default(),
+        &cached_metadata,
+    );
+    scan.warnings.extend(metadata_warnings);
     index
         .reconcile(&scan, &metadata_by_path)
         .map_err(|error| error.to_string())

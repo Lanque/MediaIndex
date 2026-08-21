@@ -174,10 +174,23 @@ pub fn collect_metadata<P: MetadataProbe>(
     files: &[DiscoveredFile],
     probe: &P,
 ) -> (HashMap<String, MediaMetadata>, Vec<ScanWarning>) {
+    collect_metadata_with_cache(files, probe, &HashMap::new())
+}
+
+pub fn collect_metadata_with_cache<P: MetadataProbe>(
+    files: &[DiscoveredFile],
+    probe: &P,
+    cached_by_hash: &HashMap<String, MediaMetadata>,
+) -> (HashMap<String, MediaMetadata>, Vec<ScanWarning>) {
     let mut metadata_by_path = HashMap::new();
     let mut warnings = Vec::new();
 
     for file in files {
+        if let Some(metadata) = cached_by_hash.get(&file.content_hash) {
+            metadata_by_path.insert(file.path.clone(), metadata.clone());
+            continue;
+        }
+
         let extraction = probe.extract(Path::new(&file.path));
         match (extraction.metadata, extraction.error) {
             (Some(metadata), _) => {
@@ -443,5 +456,43 @@ mod tests {
         assert_eq!(metadata["good.mp4"].duration_ms, Some(1_000));
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].message.contains("fixture failure"));
+    }
+
+    #[test]
+    fn collection_reuses_cached_metadata_without_running_probe() {
+        struct FailingProbe;
+
+        impl MetadataProbe for FailingProbe {
+            fn extract(&self, _path: &Path) -> MetadataExtraction {
+                panic!("cached metadata should avoid probing");
+            }
+        }
+
+        let files = vec![DiscoveredFile {
+            path: "cached.mp4".to_owned(),
+            size_bytes: 42,
+            modified_unix_ms: None,
+            content_hash: "hash-cached".to_owned(),
+        }];
+        let cached = MediaMetadata {
+            duration_ms: Some(2_000),
+            size_bytes: Some(42),
+            container: Some("mp4".to_owned()),
+            video_codec: Some("h264".to_owned()),
+            audio_codec: None,
+            width: Some(1280),
+            height: Some(720),
+            frame_rate: None,
+            start_time: None,
+            creation_time: None,
+        };
+        let mut cached_by_hash = HashMap::new();
+        cached_by_hash.insert("hash-cached".to_owned(), cached.clone());
+
+        let (metadata, warnings) =
+            collect_metadata_with_cache(&files, &FailingProbe, &cached_by_hash);
+
+        assert_eq!(metadata.get("cached.mp4"), Some(&cached));
+        assert!(warnings.is_empty());
     }
 }

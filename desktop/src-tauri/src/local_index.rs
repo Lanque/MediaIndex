@@ -285,6 +285,26 @@ impl SqliteIndex {
             .optional()?)
     }
 
+    pub fn known_files(&self) -> Result<Vec<IndexedFile>, IndexError> {
+        let mut statement = self.connection.prepare(
+            "SELECT path, content_hash, size_bytes, modified_unix_ms, status
+             FROM local_files
+             WHERE status = 'ACTIVE'
+             ORDER BY path",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let status: String = row.get(4)?;
+            Ok(IndexedFile {
+                path: row.get(0)?,
+                content_hash: row.get(1)?,
+                size_bytes: row.get(2)?,
+                modified_unix_ms: row.get(3)?,
+                status: parse_status(&status),
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn asset_count(&self) -> Result<u64, IndexError> {
         Ok(self
             .connection
