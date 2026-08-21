@@ -11,6 +11,8 @@ use std::path::Path;
 const AI_RESULT_MERGE_WINDOW_MS: u64 = 3_000;
 const AI_FOCUSED_SCORE_WINDOW: f32 = 0.08;
 const AI_BALANCED_SCORE_WINDOW: f32 = 0.14;
+const AI_FOCUSED_SCORE_FLOOR: f32 = 0.46;
+const AI_BALANCED_SCORE_FLOOR: f32 = 0.36;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE media_assets (
@@ -523,7 +525,7 @@ impl SqliteIndex {
                     let keyword_score = lexical_relevance(query_text, &description, &labels);
                     Some(AiSearchResult {
                         timestamp_ms,
-                        score: (semantic_score * 0.75 + keyword_score * 0.25).max(0.0),
+                        score: (semantic_score * 0.70 + keyword_score * 0.30).max(0.0),
                         description,
                         labels,
                         available: status == "ACTIVE" && Path::new(&path).is_file(),
@@ -546,13 +548,13 @@ impl SqliteIndex {
         };
         let (score_floor, max_videos, max_moments_per_video, result_limit) = match focus {
             AiSearchFocus::Focused => (
-                (top_score - AI_FOCUSED_SCORE_WINDOW).max(0.40),
+                (top_score - AI_FOCUSED_SCORE_WINDOW).max(AI_FOCUSED_SCORE_FLOOR),
                 8,
                 2,
                 limit.min(16),
             ),
             AiSearchFocus::Balanced => (
-                (top_score - AI_BALANCED_SCORE_WINDOW).max(0.32),
+                (top_score - AI_BALANCED_SCORE_WINDOW).max(AI_BALANCED_SCORE_FLOOR),
                 16,
                 3,
                 limit.min(48),
@@ -1285,6 +1287,69 @@ mod tests {
 
         assert_eq!(results.len(), 8);
         assert!(results.iter().all(|result| result.content_hash != "hash-9"));
+    }
+
+    #[test]
+    fn focused_ai_search_keeps_keyword_evidence_and_rejects_generic_similarity() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![
+                    file("/library/exact.mp4", "hash-exact"),
+                    file("/library/noise.mp4", "hash-noise"),
+                ]),
+                &HashMap::new(),
+            )
+            .expect("fixtures should be indexed");
+        index
+            .replace_ai_annotations(
+                "hash-exact",
+                &[AiAnnotation {
+                    timestamp_ms: 2_000,
+                    description: "The HUD reads eliminated after a player fires".to_owned(),
+                    labels: vec!["on-screen text: eliminated".to_owned()],
+                    embedding: vec![0.3, 0.953_939],
+                    confidence: Some(0.9),
+                    model: "fixture".to_owned(),
+                }],
+            )
+            .expect("exact annotation should persist");
+        index
+            .replace_ai_annotations(
+                "hash-noise",
+                &[AiAnnotation {
+                    timestamp_ms: 3_000,
+                    description: "A generic scene with no matching event".to_owned(),
+                    labels: Vec::new(),
+                    embedding: vec![0.6, 0.8],
+                    confidence: Some(0.8),
+                    model: "fixture".to_owned(),
+                }],
+            )
+            .expect("noise annotation should persist");
+
+        let focused = index
+            .search_ai_with_focus(
+                "eliminated",
+                &[1.0, 0.0],
+                100,
+                Some("fixture"),
+                AiSearchFocus::Focused,
+            )
+            .expect("focused search should work");
+        let balanced = index
+            .search_ai_with_focus(
+                "eliminated",
+                &[1.0, 0.0],
+                100,
+                Some("fixture"),
+                AiSearchFocus::Balanced,
+            )
+            .expect("balanced search should work");
+
+        assert_eq!(focused.len(), 1);
+        assert_eq!(focused[0].content_hash, "hash-exact");
+        assert_eq!(balanced.len(), 2);
     }
 
     #[test]
