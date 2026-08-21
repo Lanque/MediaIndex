@@ -86,6 +86,27 @@ fn search_media(
 }
 
 #[tauri::command]
+fn get_indexed_library_path(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let files = open_local_index(&app)?
+        .known_files()
+        .map_err(|error| error.to_string())?;
+    Ok(common_library_root(&files).map(|path| path.to_string_lossy().into_owned()))
+}
+
+fn common_library_root(files: &[local_index::IndexedFile]) -> Option<PathBuf> {
+    let mut root = Path::new(&files.first()?.path).parent()?.to_path_buf();
+    while !files
+        .iter()
+        .all(|file| Path::new(&file.path).starts_with(&root))
+    {
+        if !root.pop() {
+            return None;
+        }
+    }
+    Some(root)
+}
+
+#[tauri::command]
 async fn analyze_media_folder(
     app: tauri::AppHandle,
     path: String,
@@ -345,6 +366,7 @@ pub fn run() {
             extract_media_metadata,
             index_media_folder,
             search_media,
+            get_indexed_library_path,
             analyze_media_folder,
             search_ai,
             test_ai_connection,
@@ -369,5 +391,31 @@ mod tests {
         assert_eq!(update_overall_progress(&progress, 3, 100), 65);
         assert_eq!(update_overall_progress(&progress, 0, 100), 87);
         assert_eq!(update_overall_progress(&progress, 1, 100), 100);
+    }
+
+    #[test]
+    fn derives_the_common_active_library_root() {
+        let files = vec![
+            local_index::IndexedFile {
+                path: "/library/fortnite/clip-a.mp4".to_owned(),
+                content_hash: "hash-a".to_owned(),
+                size_bytes: 10,
+                modified_unix_ms: None,
+                status: local_index::LocalFileStatus::Active,
+            },
+            local_index::IndexedFile {
+                path: "/library/fortnite/day-two/clip-b.mp4".to_owned(),
+                content_hash: "hash-b".to_owned(),
+                size_bytes: 20,
+                modified_unix_ms: None,
+                status: local_index::LocalFileStatus::Active,
+            },
+        ];
+
+        assert_eq!(
+            common_library_root(&files),
+            Some(PathBuf::from("/library/fortnite"))
+        );
+        assert_eq!(common_library_root(&[]), None);
     }
 }
