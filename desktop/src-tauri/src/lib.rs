@@ -407,22 +407,37 @@ fn test_ai_connection(
 
 #[tauri::command]
 fn open_indexed_media_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let path = active_indexed_media_path(&app, &path)?;
+
+    app.opener()
+        .open_path(path.to_string_lossy().into_owned(), None::<String>)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn prepare_indexed_media_preview(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    let path = active_indexed_media_path(&app, &path)?;
+    app.asset_protocol_scope()
+        .allow_file(&path)
+        .map_err(|error| format!("cannot authorize the indexed clip for preview: {error}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn active_indexed_media_path(app: &tauri::AppHandle, path: &str) -> Result<PathBuf, String> {
     let index = open_local_index(&app)?;
     let indexed_file = index
-        .get_file(&path)
+        .get_file(path)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "The selected clip is not in the active local index".to_owned())?;
 
     if indexed_file.status != local_index::LocalFileStatus::Active {
         return Err("The selected clip is no longer active in the local index".to_owned());
     }
-    if !Path::new(&path).is_file() {
+    let indexed_path = PathBuf::from(indexed_file.path);
+    if !indexed_path.is_file() {
         return Err("The selected clip is no longer available at this path".to_owned());
     }
-
-    app.opener()
-        .open_path(path, None::<String>)
-        .map_err(|error| error.to_string())
+    Ok(indexed_path)
 }
 
 fn open_local_index(app: &tauri::AppHandle) -> Result<local_index::SqliteIndex, String> {
@@ -451,7 +466,8 @@ pub fn run() {
             search_ai,
             get_ai_thumbnail,
             test_ai_connection,
-            open_indexed_media_path
+            open_indexed_media_path,
+            prepare_indexed_media_preview
         ])
         .run(tauri::generate_context!())
         .expect("error while running MediaIndex");

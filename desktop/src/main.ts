@@ -332,6 +332,7 @@ const previewVideo = document.querySelector<HTMLVideoElement>("#preview-video");
 const closePreviewButton = document.querySelector<HTMLButtonElement>("#close-preview");
 let selectedLibraryPath = "";
 let pendingPreviewTimestamp = 0;
+let previewGeneration = 0;
 let lastAiProgressPercent = 0;
 let thumbnailGeneration = 0;
 const thumbnailCache = new Map<string, string>();
@@ -618,6 +619,7 @@ function readFilters(): SearchFilters {
 }
 
 function closePreview(): void {
+  previewGeneration += 1;
   if (previewVideo) {
     previewVideo.pause();
     previewVideo.removeAttribute("src");
@@ -626,8 +628,9 @@ function closePreview(): void {
   if (previewDialog) previewDialog.hidden = true;
 }
 
-function openPreview(path: string, name: string, timestampMs = 0): void {
+async function openPreview(path: string, name: string, timestampMs = 0): Promise<void> {
   if (!previewDialog || !previewVideo) return;
+  const generation = ++previewGeneration;
   pendingPreviewTimestamp = timestampMs;
   if (previewTitle) previewTitle.textContent = name;
   if (previewPath) previewPath.textContent = path;
@@ -635,9 +638,19 @@ function openPreview(path: string, name: string, timestampMs = 0): void {
     previewMessage.textContent = "Loading preview…";
     previewMessage.hidden = false;
   }
-  previewVideo.src = convertFileSrc(path);
-  previewVideo.load();
   previewDialog.hidden = false;
+  try {
+    const allowedPath = "__TAURI_INTERNALS__" in window
+      ? await invoke<string>("prepare_indexed_media_preview", { path })
+      : path;
+    if (generation !== previewGeneration) return;
+    previewVideo.src = convertFileSrc(allowedPath);
+    previewVideo.load();
+  } catch (error) {
+    if (generation !== previewGeneration || !previewMessage) return;
+    previewMessage.textContent = `Could not preview clip: ${String(error)}`;
+    previewMessage.hidden = false;
+  }
 }
 
 function renderResultCard(result: SearchResult, index: number): string {
@@ -778,7 +791,7 @@ function renderResults(results: SearchResult[], groupByVideo = false): void {
     : visibleResults.map((result, index) => renderResultCard(result, index)).join("");
   resultList.querySelectorAll<HTMLButtonElement>(".preview-result").forEach((button) => {
     button.addEventListener("click", () => {
-      openPreview(
+      void openPreview(
         button.dataset.path ?? "",
         button.dataset.name ?? "Preview",
         Number(button.dataset.timestampMs ?? "0"),
