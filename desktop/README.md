@@ -25,6 +25,23 @@ npm run build
 
 The desktop release build is available with `npm run tauri build` after the platform-specific Tauri prerequisites are installed.
 
+## Verification
+
+Run the deterministic Rust suite with:
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml
+```
+
+An opt-in smoke test exercises real FFmpeg extraction plus the complete OpenAI
+response, embedding, and annotation pipeline without sending the clip to an
+external service. It uses a local HTTP stub and requires an existing video:
+
+```powershell
+$env:MEDIAINDEX_SMOKE_VIDEO = "C:\path\to\clip.mp4"
+cargo test --manifest-path src-tauri/Cargo.toml analyzes_real_video_through_openai_response_pipeline -- --ignored
+```
+
 ## Current scope
 
 The desktop shell now includes the first local scanner slice from issue [#3](https://github.com/Lanque/MediaIndex/issues/3):
