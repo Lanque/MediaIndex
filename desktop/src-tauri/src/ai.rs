@@ -227,7 +227,7 @@ impl AiSettings {
 
     pub fn parallel_file_limit(&self) -> usize {
         if self.provider.is_remote() {
-            3
+            4
         } else {
             1
         }
@@ -235,7 +235,7 @@ impl AiSettings {
 
     fn vision_batch_size(&self) -> usize {
         if self.provider.is_remote() {
-            8
+            24
         } else {
             4
         }
@@ -549,7 +549,7 @@ fn describe_frames(
         .collect::<Vec<_>>()
         .join(", ");
     let prompt = format!(
-        "Analyze these video frames in order for a searchable local video library. The frame timestamps, in order, are: {timestamps}. Return only a JSON array with exactly one object per frame, in the same order. Each object must have description (short factual sentence), labels (lowercase array of useful visual/event labels), visible_text (array of exact readable words or short phrases from HUD, kill feed, subtitles, menus, or score overlays), and confidence (number from 0 to 1). Inspect the whole frame carefully, especially small UI text. Include gameplay context and visible events such as elimination, eliminated, kill, killed, enemy defeated, player knocked, fight, building, item pickup, or victory only when supported by the frame. Add useful synonyms when the frame supports them, but never invent an event or text that is not visible. If no text is readable in a frame, return an empty visible_text array for that frame."
+        "Analyze these video frames in order for a searchable local video library. The frame timestamps, in order, are: {timestamps}. Return only a JSON object with a frames array containing exactly one object per input frame, in the same order. Each frame object must have description (short factual sentence), labels (lowercase array of useful visual/event labels), visible_text (array of exact readable words or short phrases from HUD, kill feed, subtitles, menus, or score overlays), and confidence (number from 0 to 1). Inspect the whole frame carefully, especially small UI text. Include gameplay context and visible events such as elimination, eliminated, kill, killed, enemy defeated, player knocked, fight, building, item pickup, or victory only when supported by the frame. Add useful synonyms when the frame supports them, but never invent an event or text that is not visible. If no text is readable in a frame, return an empty visible_text array for that frame."
     );
     let text = match settings.provider {
         AiProvider::OpenAI => describe_openai(client, &encoded_frames, &prompt, settings)?,
@@ -573,11 +573,60 @@ fn describe_openai(
             "detail": "high"
         })
     }));
+    let frame_count = encoded_frames.len();
+    let output_token_limit = (frame_count * 256).clamp(1_024, 8_192);
     let response = client
         .post(format!("{}/responses", settings.base_url))
         .bearer_auth(&settings.api_key)
         .json(&json!({
             "model": settings.vision_model,
+            "store": false,
+            "max_output_tokens": output_token_limit,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "mediaindex_frame_analyses",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "frames": {
+                                "type": "array",
+                                "minItems": frame_count,
+                                "maxItems": frame_count,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "description": {"type": "string"},
+                                        "labels": {
+                                            "type": "array",
+                                            "items": {"type": "string"}
+                                        },
+                                        "visible_text": {
+                                            "type": "array",
+                                            "items": {"type": "string"}
+                                        },
+                                        "confidence": {
+                                            "type": "number",
+                                            "minimum": 0,
+                                            "maximum": 1
+                                        }
+                                    },
+                                    "required": [
+                                        "description",
+                                        "labels",
+                                        "visible_text",
+                                        "confidence"
+                                    ],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "required": ["frames"],
+                        "additionalProperties": false
+                    }
+                }
+            },
             "input": [{
                 "role": "user",
                 "content": content
@@ -1035,6 +1084,17 @@ mod tests {
                         })
                         .count();
                     assert!(image_count > 0, "vision request should contain images");
+                    assert_eq!(request.get("store"), Some(&Value::Bool(false)));
+                    assert_eq!(
+                        request.pointer("/text/format/type").and_then(Value::as_str),
+                        Some("json_schema")
+                    );
+                    assert_eq!(
+                        request
+                            .pointer("/text/format/schema/properties/frames/maxItems")
+                            .and_then(Value::as_u64),
+                        Some(image_count as u64)
+                    );
                     let analyses = (0..image_count)
                         .map(|_| {
                             json!({
@@ -1053,7 +1113,7 @@ mod tests {
                             "output": [{
                                 "content": [{
                                     "type": "output_text",
-                                    "text": serde_json::to_string(&analyses).unwrap()
+                                    "text": serde_json::to_string(&json!({"frames": analyses})).unwrap()
                                 }]
                             }]
                         }),
@@ -1190,6 +1250,8 @@ mod tests {
         assert_eq!(settings.vision_model, "vision-test");
         assert_eq!(settings.embedding_model, "embedding-test");
         assert_eq!(settings.base_url, "https://example.test/v1");
+        assert_eq!(settings.parallel_file_limit(), 4);
+        assert_eq!(settings.vision_batch_size(), 24);
         assert_eq!(
             settings.model_namespace(),
             "openai:vision-test:embedding-test"
@@ -1209,8 +1271,8 @@ mod tests {
             vision_model: Some("vision-stub".to_owned()),
             embedding_model: Some("embedding-stub".to_owned()),
             base_url: Some(base_url),
-            sample_interval_seconds: Some(5),
-            max_frames: Some(2),
+            sample_interval_seconds: Some(1),
+            max_frames: Some(24),
             ..Default::default()
         }))
         .expect("stub settings should be valid");
@@ -1222,7 +1284,12 @@ mod tests {
         .expect("real video should complete the OpenAI response pipeline");
         server.join().expect("stub should finish cleanly");
 
-        assert_eq!(annotations.len(), 2);
+        println!(
+            "analyzed {} sampled frames in one cloud vision request",
+            annotations.len()
+        );
+        assert!(!annotations.is_empty());
+        assert!(annotations.len() <= 24);
         assert!(annotations.iter().all(|annotation| {
             annotation
                 .description
