@@ -1322,8 +1322,7 @@ mod tests {
             progress.borrow_mut().push(event.percent);
         })
         .expect("real video should complete the OpenAI response pipeline");
-        server.join().expect("stub should finish cleanly");
-
+        server.join().expect("analysis stub should finish cleanly");
         println!(
             "analyzed {} sampled frames across bounded cloud vision requests",
             annotations.len()
@@ -1343,5 +1342,50 @@ mod tests {
         assert_eq!(progress.first(), Some(&1));
         assert_eq!(progress.last(), Some(&100));
         assert!(progress.windows(2).all(|values| values[0] <= values[1]));
+
+        let path = video.to_string_lossy().into_owned();
+        let mut index =
+            crate::local_index::SqliteIndex::open_in_memory().expect("smoke index should open");
+        index
+            .reconcile(
+                &crate::scanner::ScanReport {
+                    files: vec![crate::scanner::DiscoveredFile {
+                        path: path.clone(),
+                        size_bytes: fs::metadata(&video)
+                            .expect("smoke video metadata should be readable")
+                            .len(),
+                        modified_unix_ms: None,
+                        content_hash: "smoke-video".to_owned(),
+                    }],
+                    warnings: Vec::new(),
+                },
+                &std::collections::HashMap::new(),
+            )
+            .expect("smoke video should be indexed");
+        index
+            .replace_ai_annotations("smoke-video", &annotations)
+            .expect("AI annotations should persist");
+        let (query_base_url, query_server) = spawn_openai_stub();
+        let mut query_settings = settings.clone();
+        query_settings.base_url = query_base_url;
+        let query_embedding =
+            embed_query("kill", &query_settings).expect("AI query embedding should be created");
+        let results = index
+            .search_ai(
+                "kill",
+                &query_embedding,
+                10,
+                Some(&settings.model_namespace()),
+            )
+            .expect("AI search should complete");
+        query_server
+            .join()
+            .expect("query stub should finish cleanly");
+
+        assert!(!results.is_empty());
+        assert_eq!(results[0].path, path);
+        assert!(results[0].available);
+        assert!(results[0].description.contains("Fortnite player"));
+        assert!(results[0].labels.contains(&"kill".to_owned()));
     }
 }

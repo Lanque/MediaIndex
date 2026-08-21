@@ -34,8 +34,9 @@ cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 An opt-in smoke test exercises real FFmpeg extraction plus the complete OpenAI
-response, embedding, and annotation pipeline without sending the clip to an
-external service. It uses a local HTTP stub and requires an existing video:
+response, embedding, SQLite persistence, and AI search pipeline without sending
+the clip to an external service. It uses a local HTTP stub and requires an
+existing video:
 
 ```powershell
 $env:MEDIAINDEX_SMOKE_VIDEO = "C:\path\to\clip.mp4"
