@@ -93,7 +93,7 @@ the selected vision and embedding models available (for example `gemma4` and
 FFmpeg is resolved from the optional path in **AI connection**, then from the
 `MEDIAINDEX_FFMPEG_PATH` environment variable, then from `PATH`. Frame
 extraction runs once per clip and embeddings are sent in batches. Cloud vision
-requests contain up to eight sampled frames and MediaIndex analyzes up to three
+requests contain up to 24 sampled frames and MediaIndex analyzes up to four
 clips concurrently; local Ollama analysis stays sequential to avoid exhausting
 the computer's local model resources.
 Sampling defaults to one frame per five seconds and at most 120 frames per file;
