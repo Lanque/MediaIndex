@@ -27,6 +27,20 @@ are held in the current WebView session and legacy keys are removed from
 persistent local storage on startup. The backend never returns a key to search
 or thumbnail results.
 
+The production desktop WebView enforces a Content Security Policy that permits
+only bundled application resources, Tauri IPC, local asset-protocol video, and
+in-memory thumbnail images. The asset protocol starts with an empty filesystem
+scope. Before Preview receives a local URL, a Rust command confirms that the
+path is an active SQLite-indexed file, confirms it still exists, and authorizes
+only that file for the current process. System-player opening applies the same
+index and availability checks.
+
+Windows installers built locally or in pull-request CI are intentionally
+unsigned until the release owner provides an Authenticode certificate through
+the release environment. Certificate material and passwords must never be
+committed. Public distribution is gated on signing and verifying the final
+installer; unsigned artifacts remain test builds.
+
 ## Observability and failure behavior
 
 Structured events carry operation and job identifiers, while token-like fields

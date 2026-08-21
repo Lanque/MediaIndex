@@ -20,10 +20,20 @@ The shell starts a Vite development server on `http://localhost:5173` and opens 
 
 ```bash
 cd desktop
-npm run build
+npm run tauri build
 ```
 
-The desktop release build is available with `npm run tauri build` after the platform-specific Tauri prerequisites are installed.
+On Windows this creates the release executable and a current-user NSIS installer
+under `src-tauri/target/release/bundle/nsis/`. The installer does not require
+administrator privileges. Pull-request CI builds the same installer and keeps
+it as the `mediaindex-windows-installer` workflow artifact for 14 days.
+
+Local and pull-request installers are unsigned unless a Windows Authenticode
+certificate is configured for the release environment. They are suitable for
+local testing, but a public download should be code-signed before release to
+give Windows a verifiable publisher identity. Follow the
+[official Tauri Windows signing guide](https://v2.tauri.app/distribute/sign/windows/)
+without committing certificate material or passwords.
 
 ## Verification
 
@@ -62,6 +72,7 @@ The desktop shell now includes the first local scanner slice from issue [#3](htt
 - local FFprobe metadata is collected during indexing and results can be sorted by name, duration, file size, modified date, or resolution in either direction;
 - opening available original files from a result while clearly identifying unavailable paths;
 - an embedded video preview for available clips, with a system-player fallback when the WebView cannot decode a codec;
+- per-file preview authorization: the WebView can load only an active video that the Rust backend has verified in the local SQLite index;
 - cached hashes and FFprobe metadata on repeat scans when path, size, and modification time are unchanged;
 - a 500-result render cap so a large search result cannot freeze the desktop window;
 - explicit AI analysis of sampled frames with timestamped descriptions and embeddings for natural-language search.
@@ -140,6 +151,11 @@ annotations are intentionally kept separate.
 
 AI analysis runs in a background worker, so the desktop window remains
 responsive while FFmpeg and network requests are in progress.
+
+The production WebView uses a restrictive Content Security Policy. Local video
+paths are not exposed through a whole-disk asset scope: clicking Preview asks
+the backend to validate and authorize that one indexed file for the current app
+run.
 
 The environment variables remain available for automation and older launch
 scripts (`MEDIAINDEX_AI_PROVIDER`, provider-specific API keys, model names,

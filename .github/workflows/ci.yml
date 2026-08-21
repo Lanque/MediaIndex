@@ -84,3 +84,15 @@ jobs:
       - name: Run Rust tests
         working-directory: desktop
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build Windows installer
+        working-directory: desktop
+        run: npm run tauri build
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: mediaindex-windows-installer
+          path: desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
