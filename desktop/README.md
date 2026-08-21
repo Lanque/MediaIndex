@@ -44,4 +44,8 @@ The desktop shell now includes the first local scanner slice from issue [#3](htt
 - local FFprobe metadata is collected during indexing and results can be sorted by name, duration, file size, modified date, or resolution in either direction;
 - opening available original files from a result while clearly identifying unavailable paths.
 
+The first scan hashes each discovered video locally so moved and modified files
+can be detected reliably. Large footage folders can therefore take time during
+the initial scan; the original media is not uploaded.
+
 See [docs/local-index.md](../docs/local-index.md) for the schema and hashing policy and [docs/local-search.md](../docs/local-search.md) for the supported filters and usage example.

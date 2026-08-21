@@ -323,7 +323,7 @@ fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
 fn hash_file(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; HASH_BUFFER_SIZE];
+    let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
 
     loop {
         let read = file.read(&mut buffer)?;
