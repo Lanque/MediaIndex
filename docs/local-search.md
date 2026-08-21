@@ -44,3 +44,22 @@ matches more than that, refine the keyword or filters instead of trying to
 render the whole library in one window. Preview uses Tauri's local asset
 protocol and never copies or uploads the original clip; codecs unsupported by
 the embedded WebView show an actionable fallback message.
+
+## AI search
+
+AI search is a separate, explicit workflow:
+
+1. Configure `MEDIAINDEX_OPENAI_API_KEY` (or `OPENAI_API_KEY`) and make sure
+   FFmpeg is available through `MEDIAINDEX_FFMPEG_PATH` or `PATH`.
+2. Select a footage folder and wait for deterministic indexing to finish.
+3. Press **Analyze with AI**. MediaIndex samples frames, stores descriptions
+   and embeddings locally, and reports any per-file failures.
+4. Enter a natural-language query in the **AI Search** field, for example
+   `Fortnite kill`, `enemy elimination`, or `player victory`.
+
+AI results are ranked by embedding similarity and include the matching clip
+timestamp. Press **Preview** to open the clip at that timestamp. The default
+sampling interval is five seconds with a maximum of 120 frames per file; use
+`MEDIAINDEX_AI_SAMPLE_SECONDS` and `MEDIAINDEX_AI_MAX_FRAMES` to adjust the
+cost/coverage trade-off. The full original video is never uploaded as one
+file, but sampled frames are sent to the configured provider.

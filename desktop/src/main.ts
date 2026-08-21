@@ -30,6 +30,9 @@ type SearchResult = {
   modified_unix_ms: number | null;
   status: "ACTIVE" | "MISSING";
   available: boolean;
+  timestamp_ms?: number;
+  ai_description?: string;
+  match_score?: number;
   metadata: {
     duration_ms: number | null;
     container: string | null;
@@ -39,6 +42,22 @@ type SearchResult = {
     height: number | null;
     frame_rate: string | null;
   } | null;
+};
+
+type AiIndexReport = {
+  analyzed_file_count: number;
+  annotation_count: number;
+  warnings: Array<{ path: string; message: string }>;
+};
+
+type AiSearchResult = {
+  path: string;
+  content_hash: string;
+  timestamp_ms: number;
+  score: number;
+  description: string;
+  labels: string[];
+  available: boolean;
 };
 
 const MAX_RENDERED_RESULTS = 500;
@@ -60,9 +79,14 @@ app.innerHTML = `
           where it already lives.
         </p>
       </div>
-      <button class="primary-button" id="select-folder" type="button">
-        Select footage folder
-      </button>
+      <div class="topbar-actions">
+        <button class="primary-button" id="select-folder" type="button">
+          Select footage folder
+        </button>
+        <button class="secondary-button" id="analyze-ai" type="button" disabled>
+          Analyze with AI
+        </button>
+      </div>
     </header>
 
     <section class="workspace" aria-label="Media library">
@@ -85,7 +109,7 @@ app.innerHTML = `
           <label>Duration min (s)<input id="filter-duration-min" name="duration-min" min="0" type="number" /></label>
           <label>Duration max (s)<input id="filter-duration-max" name="duration-max" min="0" type="number" /></label>
           <label>Codec<input id="filter-codec" name="codec" placeholder="h264" /></label>
-          <button class="secondary-button" type="submit">Apply filters</button>
+          <button class="secondary-button" id="filter-submit" type="submit">Apply filters</button>
         </form>
       </aside>
 
@@ -110,8 +134,13 @@ app.innerHTML = `
             <option value="asc">Ascending</option>
             <option value="desc">Descending</option>
           </select>
-          <button class="secondary-button" type="submit">Search</button>
+          <button class="secondary-button" id="search-submit" type="submit">Search</button>
         </form>
+        <form class="ai-search-form" id="ai-search-form">
+          <input id="ai-search-input" name="ai-query" placeholder="AI search: Fortnite kill, enemy elimination, victory" />
+          <button class="secondary-button" id="ai-search-submit" type="submit">AI Search</button>
+        </form>
+        <p class="search-status" id="ai-search-status" role="status"></p>
         <div class="empty-state" id="empty-state">
           <div class="empty-icon" aria-hidden="true">⌁</div>
           <h3>Your footage stays on your machine</h3>
@@ -147,8 +176,13 @@ app.innerHTML = `
 `;
 
 const selectFolderButton = document.querySelector<HTMLButtonElement>("#select-folder");
+const analyzeAiButton = document.querySelector<HTMLButtonElement>("#analyze-ai");
+const searchButton = document.querySelector<HTMLButtonElement>("#search-submit");
+const filterButton = document.querySelector<HTMLButtonElement>("#filter-submit");
+const aiSearchButton = document.querySelector<HTMLButtonElement>("#ai-search-submit");
 const libraryStatus = document.querySelector<HTMLElement>("#library-status");
 const libraryPath = document.querySelector<HTMLElement>("#library-path");
+const aiSearchStatus = document.querySelector<HTMLElement>("#ai-search-status");
 const clipCount = document.querySelector<HTMLElement>("#clip-count");
 const emptyState = document.querySelector<HTMLElement>("#empty-state");
 const resultList = document.querySelector<HTMLElement>("#result-list");
@@ -159,6 +193,8 @@ const previewPath = document.querySelector<HTMLElement>("#preview-path");
 const previewMessage = document.querySelector<HTMLElement>("#preview-message");
 const previewVideo = document.querySelector<HTMLVideoElement>("#preview-video");
 const closePreviewButton = document.querySelector<HTMLButtonElement>("#close-preview");
+let selectedLibraryPath = "";
+let pendingPreviewTimestamp = 0;
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>'"]/g, (character) => ({
@@ -234,8 +270,9 @@ function closePreview(): void {
   if (previewDialog) previewDialog.hidden = true;
 }
 
-function openPreview(path: string, name: string): void {
+function openPreview(path: string, name: string, timestampMs = 0): void {
   if (!previewDialog || !previewVideo) return;
+  pendingPreviewTimestamp = timestampMs;
   if (previewTitle) previewTitle.textContent = name;
   if (previewPath) previewPath.textContent = path;
   if (previewMessage) {
@@ -264,10 +301,13 @@ function renderResults(results: SearchResult[]): void {
   }
   resultList.innerHTML = visibleResults.map((result, index) => {
     const metadata = result.metadata;
-    const details = metadata
-      ? `${formatDuration(metadata.duration_ms)} · ${formatBytes(result.size_bytes)} · ${metadata.width ?? "?"}×${metadata.height ?? "?"} · ${metadata.frame_rate ?? "?"} fps · ${metadata.video_codec ?? "?"}`
-      : "Technical metadata unavailable";
+    const details = result.ai_description
+      ? `AI match ${Math.round((result.match_score ?? 0) * 100)}% · ${result.ai_description}`
+      : metadata
+        ? `${formatDuration(metadata.duration_ms)} · ${formatBytes(result.size_bytes)} · ${metadata.width ?? "?"}×${metadata.height ?? "?"} · ${metadata.frame_rate ?? "?"} fps · ${metadata.video_codec ?? "?"}`
+        : "Technical metadata unavailable";
     const status = result.available ? "Available" : "Unavailable — rescan or restore this path";
+    const previewLabel = result.timestamp_ms ? `Preview @ ${formatDuration(result.timestamp_ms)}` : "Preview";
     return `<article class="result-card ${result.available ? "" : "result-card-unavailable"}">
       <div>
         <p class="result-index">${String(index + 1).padStart(2, "0")}</p>
@@ -276,14 +316,18 @@ function renderResults(results: SearchResult[]): void {
         <span>${escapeHtml(details)} · ${escapeHtml(status)}</span>
       </div>
       <div class="result-actions">
-        <button class="secondary-button preview-result" data-name="${escapeHtml(result.path.split(/[\\/]/).pop() ?? result.path)}" data-path="${escapeHtml(result.path)}" ${result.available ? "" : "disabled"}>Preview</button>
+        <button class="secondary-button preview-result" data-name="${escapeHtml(result.path.split(/[\\/]/).pop() ?? result.path)}" data-path="${escapeHtml(result.path)}" data-timestamp-ms="${result.timestamp_ms ?? 0}" ${result.available ? "" : "disabled"}>${escapeHtml(previewLabel)}</button>
         <button class="secondary-button open-result" data-path="${escapeHtml(result.path)}" ${result.available ? "" : "disabled"}>Open</button>
       </div>
     </article>`;
   }).join("");
   resultList.querySelectorAll<HTMLButtonElement>(".preview-result").forEach((button) => {
     button.addEventListener("click", () => {
-      openPreview(button.dataset.path ?? "", button.dataset.name ?? "Preview");
+      openPreview(
+        button.dataset.path ?? "",
+        button.dataset.name ?? "Preview",
+        Number(button.dataset.timestampMs ?? "0"),
+      );
     });
   });
   resultList.querySelectorAll<HTMLButtonElement>(".open-result").forEach((button) => {
@@ -298,7 +342,14 @@ function renderResults(results: SearchResult[]): void {
   });
 }
 
-async function searchLibrary(): Promise<void> {
+async function searchLibrary(trigger?: HTMLButtonElement): Promise<void> {
+  const originalLabel = trigger?.textContent ?? "Search";
+  if (trigger) {
+    trigger.disabled = true;
+    trigger.textContent = "Searching…";
+  }
+  if (libraryStatus) libraryStatus.textContent = "Searching local index…";
+  if (libraryPath) libraryPath.textContent = "Applying filters and sorting";
   try {
     const results = await invoke<SearchResult[]>("search_media", { query: readFilters() });
     renderResults(results);
@@ -307,6 +358,77 @@ async function searchLibrary(): Promise<void> {
   } catch (error) {
     if (libraryStatus) libraryStatus.textContent = "Search failed";
     if (libraryPath) libraryPath.textContent = String(error);
+  } finally {
+    if (trigger) {
+      trigger.disabled = false;
+      trigger.textContent = originalLabel;
+    }
+  }
+}
+
+async function searchAiLibrary(): Promise<void> {
+  const query = document.querySelector<HTMLInputElement>("#ai-search-input")?.value.trim() ?? "";
+  if (!query) {
+    if (aiSearchStatus) aiSearchStatus.textContent = "Enter a natural-language AI query first.";
+    return;
+  }
+
+  const originalLabel = aiSearchButton?.textContent ?? "AI Search";
+  if (aiSearchButton) {
+    aiSearchButton.disabled = true;
+    aiSearchButton.textContent = "AI searching…";
+  }
+  if (aiSearchStatus) aiSearchStatus.textContent = "Comparing your query with indexed visual moments…";
+  if (libraryStatus) libraryStatus.textContent = "AI search in progress…";
+  try {
+    const matches = await invoke<AiSearchResult[]>("search_ai", { query });
+    renderResults(matches.map((match) => ({
+      path: match.path,
+      content_hash: match.content_hash,
+      size_bytes: 0,
+      modified_unix_ms: null,
+      status: "ACTIVE",
+      available: match.available,
+      timestamp_ms: match.timestamp_ms,
+      ai_description: `${match.description} · ${match.labels.join(", ")}`,
+      match_score: match.score,
+      metadata: null,
+    })));
+    if (clipCount) clipCount.textContent = `${matches.length} AI matches`;
+    if (libraryStatus) libraryStatus.textContent = `${matches.length} AI matches for “${query}”`;
+    if (aiSearchStatus) aiSearchStatus.textContent = matches.length
+      ? "AI matches are timestamped; Preview opens at the matching moment."
+      : "No AI matches. Analyze the selected folder first or try another description.";
+  } catch (error) {
+    if (aiSearchStatus) aiSearchStatus.textContent = String(error);
+    if (libraryStatus) libraryStatus.textContent = "AI search failed";
+  } finally {
+    if (aiSearchButton) {
+      aiSearchButton.disabled = false;
+      aiSearchButton.textContent = originalLabel;
+    }
+  }
+}
+
+async function analyzeLibraryWithAi(): Promise<void> {
+  if (!selectedLibraryPath || !analyzeAiButton) return;
+  analyzeAiButton.disabled = true;
+  const originalLabel = analyzeAiButton.textContent ?? "Analyze with AI";
+  analyzeAiButton.textContent = "Analyzing…";
+  if (libraryStatus) libraryStatus.textContent = "AI analysis in progress…";
+  if (libraryPath) libraryPath.textContent = "Sampling frames and creating searchable descriptions";
+  try {
+    const report = await invoke<AiIndexReport>("analyze_media_folder", { path: selectedLibraryPath });
+    const warningSuffix = report.warnings.length ? ` · ${report.warnings.length} warnings` : "";
+    if (libraryStatus) libraryStatus.textContent = `AI indexed ${report.analyzed_file_count} clips${warningSuffix}`;
+    if (libraryPath) libraryPath.textContent = `${report.annotation_count} timestamped visual moments stored locally`;
+    if (aiSearchStatus) aiSearchStatus.textContent = "AI index ready. Try “Fortnite kill” or “enemy elimination”.";
+  } catch (error) {
+    if (libraryStatus) libraryStatus.textContent = "AI analysis failed";
+    if (libraryPath) libraryPath.textContent = String(error);
+  } finally {
+    analyzeAiButton.disabled = false;
+    analyzeAiButton.textContent = originalLabel;
   }
 }
 
@@ -322,6 +444,8 @@ selectFolderButton?.addEventListener("click", async () => {
   }
 
   selectFolderButton.disabled = true;
+  selectedLibraryPath = selected;
+  if (analyzeAiButton) analyzeAiButton.disabled = false;
   if (libraryStatus) libraryStatus.textContent = "Scanning folder…";
   if (libraryPath) libraryPath.textContent = selected;
 
@@ -342,12 +466,21 @@ selectFolderButton?.addEventListener("click", async () => {
 
 document.querySelector<HTMLFormElement>("#search-form")?.addEventListener("submit", (event) => {
   event.preventDefault();
-  void searchLibrary();
+  void searchLibrary(searchButton ?? undefined);
 });
 
 document.querySelector<HTMLFormElement>("#filter-form")?.addEventListener("submit", (event) => {
   event.preventDefault();
-  void searchLibrary();
+  void searchLibrary(filterButton ?? undefined);
+});
+
+document.querySelector<HTMLFormElement>("#ai-search-form")?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void searchAiLibrary();
+});
+
+analyzeAiButton?.addEventListener("click", () => {
+  void analyzeLibraryWithAi();
 });
 
 document.querySelector<HTMLButtonElement>("#learn-more")?.addEventListener(
@@ -362,6 +495,12 @@ previewDialog?.addEventListener("click", (event) => {
   if (event.target === previewDialog) closePreview();
 });
 previewVideo?.addEventListener("loadedmetadata", () => {
+  if (pendingPreviewTimestamp > 0 && Number.isFinite(previewVideo.duration)) {
+    previewVideo.currentTime = Math.min(
+      pendingPreviewTimestamp / 1_000,
+      Math.max(previewVideo.duration - 0.1, 0),
+    );
+  }
   if (previewMessage) previewMessage.hidden = true;
 });
 previewVideo?.addEventListener("error", () => {

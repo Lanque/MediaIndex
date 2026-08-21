@@ -1,3 +1,4 @@
+use crate::ai::AiAnnotation;
 use crate::metadata::MediaMetadata;
 use crate::scanner::{DiscoveredFile, ScanReport, ScanWarning};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -6,8 +7,6 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::path::Path;
-
-const SCHEMA_VERSION: i64 = 1;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE media_assets (
@@ -30,6 +29,22 @@ CREATE TABLE local_files (
 
 CREATE INDEX local_files_content_hash_idx ON local_files(content_hash);
 CREATE INDEX local_files_status_idx ON local_files(status);
+"#;
+
+const MIGRATION_2: &str = r#"
+CREATE TABLE ai_annotations (
+    content_hash TEXT NOT NULL REFERENCES media_assets(content_hash),
+    timestamp_ms INTEGER NOT NULL,
+    description TEXT NOT NULL,
+    labels_json TEXT NOT NULL,
+    embedding_json TEXT NOT NULL,
+    confidence REAL,
+    model TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (content_hash, timestamp_ms, model)
+);
+
+CREATE INDEX ai_annotations_content_hash_idx ON ai_annotations(content_hash);
 "#;
 
 #[derive(Debug)]
@@ -150,6 +165,17 @@ pub struct SearchResult {
     pub status: LocalFileStatus,
     pub available: bool,
     pub metadata: Option<MediaMetadata>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AiSearchResult {
+    pub path: String,
+    pub content_hash: String,
+    pub timestamp_ms: u64,
+    pub score: f32,
+    pub description: String,
+    pub labels: Vec<String>,
+    pub available: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -342,6 +368,124 @@ impl SqliteIndex {
             .map_err(Into::into)
     }
 
+    pub fn replace_ai_annotations(
+        &mut self,
+        content_hash: &str,
+        annotations: &[AiAnnotation],
+    ) -> Result<(), IndexError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM ai_annotations WHERE content_hash = ?1",
+            params![content_hash],
+        )?;
+        for annotation in annotations {
+            transaction.execute(
+                "INSERT INTO ai_annotations(
+                    content_hash, timestamp_ms, description, labels_json,
+                    embedding_json, confidence, model
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    content_hash,
+                    annotation.timestamp_ms,
+                    annotation.description,
+                    serde_json::to_string(&annotation.labels)?,
+                    serde_json::to_string(&annotation.embedding)?,
+                    annotation.confidence,
+                    annotation.model,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn ai_annotation_count(&self) -> Result<u64, IndexError> {
+        Ok(self
+            .connection
+            .query_row("SELECT COUNT(*) FROM ai_annotations", [], |row| row.get(0))?)
+    }
+
+    pub fn search_ai(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<AiSearchResult>, IndexError> {
+        let mut statement = self.connection.prepare(
+            "SELECT ai_annotations.timestamp_ms, ai_annotations.description,
+                    ai_annotations.labels_json, ai_annotations.embedding_json,
+                    local_files.path, local_files.content_hash, local_files.status
+             FROM ai_annotations
+             JOIN local_files ON local_files.content_hash = ai_annotations.content_hash
+             WHERE local_files.status = 'ACTIVE'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let timestamp_ms: u64 = row.get(0)?;
+            let description: String = row.get(1)?;
+            let labels: Vec<String> =
+                serde_json::from_str(&row.get::<_, String>(2)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            let embedding: Vec<f32> =
+                serde_json::from_str(&row.get::<_, String>(3)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            let path: String = row.get(4)?;
+            let content_hash: String = row.get(5)?;
+            let status: String = row.get(6)?;
+            Ok((
+                timestamp_ms,
+                description,
+                labels,
+                embedding,
+                path,
+                content_hash,
+                status,
+            ))
+        })?;
+
+        let mut results = rows
+            .filter_map(Result::ok)
+            .filter_map(
+                |(
+                    timestamp_ms,
+                    description,
+                    labels,
+                    stored_embedding,
+                    path,
+                    content_hash,
+                    status,
+                )| {
+                    Some(AiSearchResult {
+                        timestamp_ms,
+                        score: cosine_similarity(query_embedding, &stored_embedding)?,
+                        description,
+                        labels,
+                        available: status == "ACTIVE" && Path::new(&path).is_file(),
+                        path,
+                        content_hash,
+                    })
+                },
+            )
+            .collect::<Vec<_>>();
+        results.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| path_key(&left.path).cmp(&path_key(&right.path)))
+                .then_with(|| left.timestamp_ms.cmp(&right.timestamp_ms))
+        });
+        results.truncate(limit);
+        Ok(results)
+    }
+
     pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>, IndexError> {
         let mut statement = self.connection.prepare(
             "SELECT local_files.path, local_files.content_hash, local_files.size_bytes,
@@ -392,22 +536,24 @@ impl SqliteIndex {
             );",
         )?;
 
-        let applied: Option<i64> = connection
-            .query_row(
-                "SELECT version FROM schema_migrations WHERE version = ?1",
-                params![SCHEMA_VERSION],
-                |row| row.get(0),
-            )
-            .optional()?;
+        for (version, migration) in [(1_i64, MIGRATION_1), (2_i64, MIGRATION_2)] {
+            let applied: Option<i64> = connection
+                .query_row(
+                    "SELECT version FROM schema_migrations WHERE version = ?1",
+                    params![version],
+                    |row| row.get(0),
+                )
+                .optional()?;
 
-        if applied.is_none() {
-            let transaction = connection.unchecked_transaction()?;
-            transaction.execute_batch(MIGRATION_1)?;
-            transaction.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                params![SCHEMA_VERSION],
-            )?;
-            transaction.commit()?;
+            if applied.is_none() {
+                let transaction = connection.unchecked_transaction()?;
+                transaction.execute_batch(migration)?;
+                transaction.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (?1)",
+                    params![version],
+                )?;
+                transaction.commit()?;
+            }
         }
 
         Ok(Self { connection })
@@ -466,6 +612,22 @@ fn parse_status(status: &str) -> LocalFileStatus {
         "MISSING" => LocalFileStatus::Missing,
         _ => LocalFileStatus::Active,
     }
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
+    if left.is_empty() || left.len() != right.len() {
+        return None;
+    }
+    let mut dot = 0.0;
+    let mut left_norm = 0.0;
+    let mut right_norm = 0.0;
+    for (left_value, right_value) in left.iter().zip(right) {
+        dot += left_value * right_value;
+        left_norm += left_value * left_value;
+        right_norm += right_value * right_value;
+    }
+    let denominator = left_norm.sqrt() * right_norm.sqrt();
+    (denominator > 0.0).then_some(dot / denominator)
 }
 
 fn matches_query(result: &SearchResult, query: &SearchQuery) -> bool {
@@ -708,7 +870,7 @@ mod tests {
         let mut index = SqliteIndex::open_in_memory().expect("index should open");
         assert_eq!(
             index.schema_version().expect("version should be readable"),
-            1
+            2
         );
 
         let first = index
@@ -790,6 +952,38 @@ mod tests {
                 .expect("metadata should be readable"),
             Some(metadata)
         );
+    }
+
+    #[test]
+    fn searches_ai_annotations_by_cosine_similarity() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/fortnite.mp4", "hash-fortnite")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        index
+            .replace_ai_annotations(
+                "hash-fortnite",
+                &[AiAnnotation {
+                    timestamp_ms: 12_000,
+                    description: "A player eliminates an enemy in a Fortnite fight".to_owned(),
+                    labels: vec!["fortnite".to_owned(), "kill".to_owned()],
+                    embedding: vec![1.0, 0.0],
+                    confidence: Some(0.9),
+                    model: "fixture".to_owned(),
+                }],
+            )
+            .expect("annotation should persist");
+
+        let results = index
+            .search_ai(&[0.9, 0.1], 10)
+            .expect("AI search should work");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].timestamp_ms, 12_000);
+        assert!(results[0].score > 0.9);
     }
 
     #[test]
