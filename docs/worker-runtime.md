@@ -30,3 +30,6 @@ records always include `job_id`, `request_id`, state, message ID, and attempt.
 
 The in-memory queue is a test seam. The production SQS adapter must preserve
 the same visibility, acknowledgement, retry, and dead-letter semantics.
+
+The first explicit operation using this runtime is the selected-media preview
+job documented in [docs/preview-job.md](preview-job.md).
