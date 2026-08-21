@@ -45,6 +45,11 @@ render the whole library in one window. Preview uses Tauri's local asset
 protocol and never copies or uploads the original clip; codecs unsupported by
 the embedded WebView show an actionable fallback message.
 
+Initial hashing/FFprobe indexing, local database search, AI query embedding,
+and AI connection tests run on background workers rather than the Tauri UI
+thread. Selecting a new folder keeps **Analyze with AI** disabled until that
+folder has been indexed successfully.
+
 ## AI search
 
 AI search is a separate, explicit workflow:

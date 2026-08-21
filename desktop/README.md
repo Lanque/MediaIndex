@@ -74,6 +74,7 @@ The desktop shell now includes the first local scanner slice from issue [#3](htt
 - an embedded video preview for available clips, with a system-player fallback when the WebView cannot decode a codec;
 - per-file preview authorization: the WebView can load only an active video that the Rust backend has verified in the local SQLite index;
 - cached hashes and FFprobe metadata on repeat scans when path, size, and modification time are unchanged;
+- folder hashing/metadata work and local or AI searches run off the Tauri UI thread, so long scans and provider requests do not freeze the window;
 - a 500-result render cap so a large search result cannot freeze the desktop window;
 - explicit AI analysis of sampled frames with timestamped descriptions and embeddings for natural-language search.
 - restoration of the last successfully indexed library after an app restart, so existing clips and AI analysis remain immediately available.

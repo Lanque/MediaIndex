@@ -73,18 +73,33 @@ impl Drop for AiAnalysisRunGuard {
 }
 
 #[tauri::command]
-fn scan_media_folder(path: String) -> Result<scanner::ScanReport, String> {
-    scanner::scan_folder(Path::new(&path), &scanner::ScanOptions::default())
-        .map_err(|error| error.to_string())
+async fn scan_media_folder(path: String) -> Result<scanner::ScanReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scanner::scan_folder(Path::new(&path), &scanner::ScanOptions::default())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("folder scan worker failed: {error}"))?
 }
 
 #[tauri::command]
-fn extract_media_metadata(path: String) -> metadata::MetadataExtraction {
-    metadata::extract_media_metadata(Path::new(&path))
+async fn extract_media_metadata(path: String) -> Result<metadata::MetadataExtraction, String> {
+    tauri::async_runtime::spawn_blocking(move || metadata::extract_media_metadata(Path::new(&path)))
+        .await
+        .map_err(|error| format!("metadata worker failed: {error}"))
 }
 
 #[tauri::command]
-fn index_media_folder(
+async fn index_media_folder(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<local_index::IndexReport, String> {
+    tauri::async_runtime::spawn_blocking(move || index_media_folder_blocking(app, path))
+        .await
+        .map_err(|error| format!("folder indexing worker failed: {error}"))?
+}
+
+fn index_media_folder_blocking(
     app: tauri::AppHandle,
     path: String,
 ) -> Result<local_index::IndexReport, String> {
@@ -137,7 +152,16 @@ fn index_media_folder(
 }
 
 #[tauri::command]
-fn search_media(
+async fn search_media(
+    app: tauri::AppHandle,
+    query: local_index::SearchQuery,
+) -> Result<Vec<local_index::SearchResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || search_media_blocking(app, query))
+        .await
+        .map_err(|error| format!("local search worker failed: {error}"))?
+}
+
+fn search_media_blocking(
     app: tauri::AppHandle,
     query: local_index::SearchQuery,
 ) -> Result<Vec<local_index::SearchResult>, String> {
@@ -456,7 +480,18 @@ fn emit_ai_progress(
 }
 
 #[tauri::command]
-fn search_ai(
+async fn search_ai(
+    app: tauri::AppHandle,
+    query: String,
+    config: Option<ai::AiRequestConfig>,
+    focus: Option<local_index::AiSearchFocus>,
+) -> Result<Vec<local_index::AiSearchResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || search_ai_blocking(app, query, config, focus))
+        .await
+        .map_err(|error| format!("AI search worker failed: {error}"))?
+}
+
+fn search_ai_blocking(
     app: tauri::AppHandle,
     query: String,
     config: Option<ai::AiRequestConfig>,
@@ -540,7 +575,15 @@ fn get_ai_thumbnail_blocking(
 }
 
 #[tauri::command]
-fn test_ai_connection(
+async fn test_ai_connection(
+    config: Option<ai::AiRequestConfig>,
+) -> Result<ai::AiConnectionReport, String> {
+    tauri::async_runtime::spawn_blocking(move || test_ai_connection_blocking(config))
+        .await
+        .map_err(|error| format!("AI connection worker failed: {error}"))?
+}
+
+fn test_ai_connection_blocking(
     config: Option<ai::AiRequestConfig>,
 ) -> Result<ai::AiConnectionReport, String> {
     let settings = ai::AiSettings::from_request(config)?;
