@@ -75,8 +75,10 @@ Results are displayed as visual cards ordered by the best match for each video.
 FFmpeg generates and caches a local thumbnail for the best matching timestamp;
 clicking it opens Preview at that moment. Extra moments are kept in a compact
 chronological list. **Focused** mode is the default and applies an adaptive
-score window plus an eight-video/two-moment-per-video cap. **Balanced** and
-**Broad** intentionally show more exploratory matches. The default sampling
+score window, an absolute relevance floor, and an eight-video/two-moment-per-video
+cap. Exact or inflected on-screen text and labels receive enough ranking weight
+to survive that floor, while generic embedding similarity alone is filtered.
+**Balanced** and **Broad** intentionally show more exploratory matches. The default sampling
 interval is five seconds. New OpenAI settings use a maximum of 60 frames per
 file; other provider defaults remain 120. Use
 the values in **AI connection** to adjust the cost/coverage trade-off. The full
