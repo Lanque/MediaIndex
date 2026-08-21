@@ -1,0 +1,40 @@
+# Node / TypeScript
+node_modules/
+dist/
+build/
+.tauri/
+
+# Rust
+target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Databases and local indexes
+*.db
+*.sqlite
+*.sqlite3
+
+# Media and generated artifacts
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.wav
+*.tmp
+coverage/
+reports/
