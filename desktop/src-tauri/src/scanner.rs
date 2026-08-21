@@ -129,7 +129,7 @@ pub fn scan_folder(root: &Path, options: &ScanOptions) -> Result<ScanReport, Sca
         message: error.to_string(),
     })?;
 
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.is_dir() || is_link_or_reparse_point(&metadata) {
         return Err(ScanError::RootNotDirectory {
             path: root.to_path_buf(),
         });
@@ -231,64 +231,92 @@ fn visit_directory(
     files: &mut Vec<DiscoveredFile>,
     warnings: &mut Vec<ScanWarning>,
 ) {
-    let mut entries: Vec<_> = match fs::read_dir(directory) {
-        Ok(entries) => entries.filter_map(Result::ok).collect(),
-        Err(error) => {
-            warnings.push(ScanWarning {
-                path: display_path(directory),
-                message: format!("cannot read directory: {error}"),
-            });
-            return;
-        }
-    };
+    let mut pending_directories = vec![directory.to_path_buf()];
 
-    entries.sort_by(|left, right| {
-        path_key(&display_path(&left.path())).cmp(&path_key(&display_path(&right.path())))
-    });
-
-    for entry in entries {
-        let path = entry.path();
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
+    while let Some(directory) = pending_directories.pop() {
+        let mut entries: Vec<_> = match fs::read_dir(&directory) {
+            Ok(entries) => entries.filter_map(Result::ok).collect(),
             Err(error) => {
                 warnings.push(ScanWarning {
-                    path: display_path(&path),
-                    message: format!("cannot inspect entry: {error}"),
+                    path: display_path(&directory),
+                    message: format!("cannot read directory: {error}"),
                 });
                 continue;
             }
         };
 
-        if metadata.file_type().is_symlink() {
-            continue;
-        }
-
-        if metadata.is_dir() {
-            visit_directory(&path, options, files, warnings);
-            continue;
-        }
-
-        if !metadata.is_file() || !options.accepts(&path) {
-            continue;
-        }
-
-        let content_hash = match hash_file(&path) {
-            Ok(hash) => hash,
-            Err(error) => {
-                warnings.push(ScanWarning {
-                    path: display_path(&path),
-                    message: format!("cannot hash file: {error}"),
-                });
-                continue;
-            }
-        };
-
-        files.push(DiscoveredFile {
-            path: display_path(&path),
-            size_bytes: metadata.len(),
-            modified_unix_ms: modified_unix_ms(&metadata),
-            content_hash,
+        entries.sort_by(|left, right| {
+            path_key(&display_path(&left.path())).cmp(&path_key(&display_path(&right.path())))
         });
+
+        let mut child_directories = Vec::new();
+        for entry in entries {
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    warnings.push(ScanWarning {
+                        path: display_path(&path),
+                        message: format!("cannot inspect entry: {error}"),
+                    });
+                    continue;
+                }
+            };
+
+            if is_link_or_reparse_point(&metadata) {
+                continue;
+            }
+
+            if metadata.is_dir() {
+                child_directories.push(path);
+                continue;
+            }
+
+            if !metadata.is_file() || !options.accepts(&path) {
+                continue;
+            }
+
+            let content_hash = match hash_file(&path) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    warnings.push(ScanWarning {
+                        path: display_path(&path),
+                        message: format!("cannot hash file: {error}"),
+                    });
+                    continue;
+                }
+            };
+
+            files.push(DiscoveredFile {
+                path: display_path(&path),
+                size_bytes: metadata.len(),
+                modified_unix_ms: modified_unix_ms(&metadata),
+                content_hash,
+            });
+        }
+
+        for child_directory in child_directories.into_iter().rev() {
+            pending_directories.push(child_directory);
+        }
+    }
+}
+
+fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
