@@ -55,6 +55,8 @@ type AiProgress = {
   total_files: number;
   current_file: string;
   provider: string;
+  percent: number;
+  phase: string;
 };
 
 type AiProvider = "local" | "openai" | "gemini";
@@ -121,9 +123,26 @@ app.innerHTML = `
         <p class="section-label">Library</p>
         <div class="library-card">
           <span class="status-dot" aria-hidden="true"></span>
-          <div>
+          <div class="library-card-copy">
             <strong id="library-status">No folder indexed</strong>
             <span id="library-path">Choose a local folder to begin</span>
+            <div class="analysis-progress" id="analysis-progress" hidden>
+              <div class="analysis-progress-heading">
+                <span id="analysis-progress-label">Preparing clips</span>
+                <strong id="analysis-progress-percent">0%</strong>
+              </div>
+              <div
+                class="analysis-progress-track"
+                id="analysis-progress-track"
+                role="progressbar"
+                aria-label="AI analysis progress"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow="0"
+              >
+                <span id="analysis-progress-fill"></span>
+              </div>
+            </div>
           </div>
         </div>
         <details class="ai-settings" open>
@@ -265,6 +284,11 @@ const filterButton = document.querySelector<HTMLButtonElement>("#filter-submit")
 const aiSearchButton = document.querySelector<HTMLButtonElement>("#ai-search-submit");
 const libraryStatus = document.querySelector<HTMLElement>("#library-status");
 const libraryPath = document.querySelector<HTMLElement>("#library-path");
+const analysisProgress = document.querySelector<HTMLElement>("#analysis-progress");
+const analysisProgressLabel = document.querySelector<HTMLElement>("#analysis-progress-label");
+const analysisProgressPercent = document.querySelector<HTMLElement>("#analysis-progress-percent");
+const analysisProgressTrack = document.querySelector<HTMLElement>("#analysis-progress-track");
+const analysisProgressFill = document.querySelector<HTMLElement>("#analysis-progress-fill");
 const aiSearchStatus = document.querySelector<HTMLElement>("#ai-search-status");
 const clipCount = document.querySelector<HTMLElement>("#clip-count");
 const emptyState = document.querySelector<HTMLElement>("#empty-state");
@@ -278,6 +302,7 @@ const previewVideo = document.querySelector<HTMLVideoElement>("#preview-video");
 const closePreviewButton = document.querySelector<HTMLButtonElement>("#close-preview");
 let selectedLibraryPath = "";
 let pendingPreviewTimestamp = 0;
+let lastAiProgressPercent = 0;
 
 const AI_SETTINGS_STORAGE_KEY = "mediaindex.ai.settings.v1";
 
@@ -400,15 +425,44 @@ function saveAiConfig(): AiConfig {
 
 loadAiConfig();
 
+function showAiProgress(percent: number, label: string, isError = false): void {
+  const safePercent = Math.max(0, Math.min(100, Math.round(percent)));
+  lastAiProgressPercent = safePercent;
+  if (analysisProgress) {
+    analysisProgress.hidden = false;
+    analysisProgress.classList.toggle("is-error", isError);
+  }
+  if (analysisProgressLabel) analysisProgressLabel.textContent = label;
+  if (analysisProgressPercent) analysisProgressPercent.textContent = `${safePercent}%`;
+  if (analysisProgressTrack) analysisProgressTrack.setAttribute("aria-valuenow", String(safePercent));
+  if (analysisProgressFill) analysisProgressFill.style.width = `${safePercent}%`;
+}
+
 void listen<AiProgress>("ai-progress", ({ payload }) => {
   const fileName = payload.current_file.split(/[\\/]/).pop() ?? payload.current_file;
+  showAiProgress(payload.percent, payload.phase);
   if (libraryStatus) {
-    libraryStatus.textContent = `AI analysis ${payload.completed_files}/${payload.total_files}`;
+    libraryStatus.textContent = `AI analysis ${payload.percent}% · ${payload.completed_files}/${payload.total_files} clips`;
   }
   if (libraryPath) {
-    libraryPath.textContent = `${fileName} · ${payload.provider}`;
+    libraryPath.textContent = `${payload.phase} · ${fileName} · ${payload.provider}`;
   }
 });
+
+function conciseMessage(value: unknown, maxLength = 240): string {
+  let message = String(value).replace(/\s+/g, " ").trim();
+  const rawJsonStart = message.search(/[\[{]\s*"(?:id|error|object|status)"/);
+  if (rawJsonStart > 0) message = message.slice(0, rawJsonStart).trimEnd();
+  return message.length > maxLength ? `${message.slice(0, maxLength - 1).trimEnd()}…` : message;
+}
+
+function summarizeAiWarnings(warnings: AiIndexReport["warnings"]): string {
+  if (warnings.length === 0) return "";
+  const first = warnings[0];
+  const fileName = first.path.split(/[\\/]/).pop() ?? first.path;
+  const remaining = warnings.length > 1 ? ` · ${warnings.length - 1} more` : "";
+  return `${fileName}: ${conciseMessage(first.message)}${remaining}`;
+}
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>'"]/g, (character) => ({
@@ -635,6 +689,7 @@ async function analyzeLibraryWithAi(): Promise<void> {
   const originalLabel = analyzeAiButton.textContent ?? "Analyze with AI";
   analyzeAiButton.textContent = "Analyzing…";
   const config = saveAiConfig();
+  showAiProgress(0, "Preparing clips");
   if (libraryStatus) libraryStatus.textContent = "AI analysis in progress…";
   if (libraryPath) libraryPath.textContent = `Using ${aiProviderLabel(config.provider)} · ${config.visionModel} / ${config.embeddingModel}`;
   try {
@@ -643,9 +698,8 @@ async function analyzeLibraryWithAi(): Promise<void> {
       config,
     });
     const warningSuffix = report.warnings.length ? ` · ${report.warnings.length} warnings` : "";
-    const warningDetails = report.warnings
-      .map((warning) => `${warning.path.split(/[\\/]/).pop() ?? warning.path}: ${warning.message}`)
-      .join(" | ");
+    const warningDetails = summarizeAiWarnings(report.warnings);
+    showAiProgress(100, report.warnings.length ? "Analysis complete with warnings" : "Analysis complete");
     if (libraryStatus) libraryStatus.textContent = `AI indexed ${report.analyzed_file_count} clips${warningSuffix}`;
     if (libraryPath) {
       libraryPath.textContent = warningDetails
@@ -659,7 +713,8 @@ async function analyzeLibraryWithAi(): Promise<void> {
     }
   } catch (error) {
     if (libraryStatus) libraryStatus.textContent = "AI analysis failed";
-    if (libraryPath) libraryPath.textContent = String(error);
+    if (libraryPath) libraryPath.textContent = conciseMessage(error);
+    showAiProgress(lastAiProgressPercent, "Analysis stopped", true);
   } finally {
     analyzeAiButton.disabled = false;
     analyzeAiButton.textContent = originalLabel;

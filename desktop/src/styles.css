@@ -145,6 +145,11 @@ button:disabled {
   margin-bottom: 34px;
 }
 
+.library-card-copy {
+  min-width: 0;
+  flex: 1;
+}
+
 .library-card strong,
 .library-card span {
   display: block;
@@ -160,6 +165,62 @@ button:disabled {
   color: #8998b8;
   font-size: 0.78rem;
   line-height: 1.45;
+}
+
+.analysis-progress {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+}
+
+.analysis-progress[hidden] {
+  display: none;
+}
+
+.analysis-progress-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.analysis-progress-heading span,
+.analysis-progress-heading strong {
+  margin: 0;
+  color: #b9d4ff;
+  font-size: 0.68rem;
+  line-height: 1.2;
+}
+
+.analysis-progress-heading span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.analysis-progress-track {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #263555;
+}
+
+.analysis-progress-track span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #73a7ff, #b9d4ff);
+  transition: width 220ms ease;
+}
+
+.analysis-progress.is-error .analysis-progress-heading span,
+.analysis-progress.is-error .analysis-progress-heading strong {
+  color: #f0c4a8;
+}
+
+.analysis-progress.is-error .analysis-progress-track span {
+  background: #df8d70;
 }
 
 .ai-settings {

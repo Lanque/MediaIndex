@@ -3,9 +3,11 @@ pub mod local_index;
 pub mod metadata;
 pub mod scanner;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
@@ -119,21 +121,92 @@ fn analyze_media_folder_blocking(
     };
     let total_files = files.len() as u64;
     let provider = settings.model_namespace();
+    emit_ai_progress(
+        &app,
+        0,
+        total_files,
+        path.clone(),
+        provider.clone(),
+        0,
+        "Preparing clips",
+    );
+
+    let mut tasks = VecDeque::with_capacity(files.len());
     for (file_index, file) in files.into_iter().enumerate() {
-        let current_file = file.path.clone();
-        let _ = app.emit(
-            "ai-progress",
-            ai::AiProgress {
-                completed_files: file_index as u64,
-                total_files,
-                current_file: current_file.clone(),
-                provider: provider.clone(),
-            },
-        );
         let metadata = index
             .get_asset_metadata(&file.content_hash)
             .map_err(|error| error.to_string())?;
-        match ai::analyze_file(Path::new(&file.path), metadata.as_ref(), &settings) {
+        tasks.push_back((file_index, file, metadata));
+    }
+
+    let worker_count = settings.parallel_file_limit().min(tasks.len());
+    let tasks = Arc::new(Mutex::new(tasks));
+    let file_progress = Arc::new(Mutex::new(vec![0u8; total_files as usize]));
+    let completed_files = Arc::new(AtomicU64::new(0));
+    let (sender, receiver) = mpsc::channel();
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let worker_tasks = Arc::clone(&tasks);
+            let worker_progress = Arc::clone(&file_progress);
+            let worker_completed = Arc::clone(&completed_files);
+            let worker_sender = sender.clone();
+            let worker_settings = settings.clone();
+            let worker_provider = provider.clone();
+            let worker_app = app.clone();
+
+            scope.spawn(move || loop {
+                let task = lock_unpoisoned(&worker_tasks).pop_front();
+                let Some((file_index, file, metadata)) = task else {
+                    break;
+                };
+                let current_file = file.path.clone();
+                let result = ai::analyze_file_with_progress(
+                    Path::new(&current_file),
+                    metadata.as_ref(),
+                    &worker_settings,
+                    |progress| {
+                        let percent =
+                            update_overall_progress(&worker_progress, file_index, progress.percent);
+                        emit_ai_progress(
+                            &worker_app,
+                            worker_completed.load(Ordering::Relaxed),
+                            total_files,
+                            current_file.clone(),
+                            worker_provider.clone(),
+                            percent,
+                            progress.phase,
+                        );
+                    },
+                );
+                let percent = update_overall_progress(&worker_progress, file_index, 100);
+                let completed = worker_completed.fetch_add(1, Ordering::Relaxed) + 1;
+                let phase = if result.is_ok() {
+                    "Clip finished"
+                } else {
+                    "Clip finished with a warning"
+                };
+                emit_ai_progress(
+                    &worker_app,
+                    completed,
+                    total_files,
+                    current_file,
+                    worker_provider.clone(),
+                    percent,
+                    phase,
+                );
+                if worker_sender.send((file_index, file, result)).is_err() {
+                    break;
+                }
+            });
+        }
+    });
+    drop(sender);
+
+    let mut results = receiver.into_iter().collect::<Vec<_>>();
+    results.sort_by_key(|(file_index, _, _)| *file_index);
+    for (_, file, result) in results {
+        match result {
             Ok(annotations) => {
                 report.analyzed_file_count += 1;
                 report.annotation_count += annotations.len() as u64;
@@ -146,18 +219,57 @@ fn analyze_media_folder_blocking(
                 message: error,
             }),
         }
-        let _ = app.emit(
-            "ai-progress",
-            ai::AiProgress {
-                completed_files: (file_index + 1) as u64,
-                total_files,
-                current_file,
-                provider: provider.clone(),
-            },
-        );
     }
 
+    emit_ai_progress(
+        &app,
+        total_files,
+        total_files,
+        path,
+        provider,
+        100,
+        "Analysis complete",
+    );
+
     Ok(report)
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn update_overall_progress(progress: &Mutex<Vec<u8>>, file_index: usize, percent: u8) -> u8 {
+    let mut file_progress = lock_unpoisoned(progress);
+    file_progress[file_index] = file_progress[file_index].max(percent.min(100));
+    let total = file_progress
+        .iter()
+        .map(|value| u64::from(*value))
+        .sum::<u64>();
+    (total / file_progress.len() as u64) as u8
+}
+
+fn emit_ai_progress(
+    app: &tauri::AppHandle,
+    completed_files: u64,
+    total_files: u64,
+    current_file: String,
+    provider: String,
+    percent: u8,
+    phase: &str,
+) {
+    let _ = app.emit(
+        "ai-progress",
+        ai::AiProgress {
+            completed_files,
+            total_files,
+            current_file,
+            provider,
+            percent: percent.min(100),
+            phase: phase.to_owned(),
+        },
+    );
 }
 
 #[tauri::command]
@@ -240,4 +352,22 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running MediaIndex");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overall_ai_progress_is_averaged_and_monotonic() {
+        let progress = Mutex::new(vec![0, 0, 0, 0]);
+
+        assert_eq!(update_overall_progress(&progress, 0, 10), 2);
+        assert_eq!(update_overall_progress(&progress, 1, 50), 15);
+        assert_eq!(update_overall_progress(&progress, 1, 40), 15);
+        assert_eq!(update_overall_progress(&progress, 2, 100), 40);
+        assert_eq!(update_overall_progress(&progress, 3, 100), 65);
+        assert_eq!(update_overall_progress(&progress, 0, 100), 87);
+        assert_eq!(update_overall_progress(&progress, 1, 100), 100);
+    }
 }

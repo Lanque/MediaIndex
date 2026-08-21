@@ -85,6 +85,14 @@ pub struct AiProgress {
     pub total_files: u64,
     pub current_file: String,
     pub provider: String,
+    pub percent: u8,
+    pub phase: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AiFileProgress {
+    pub percent: u8,
+    pub phase: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,6 +224,22 @@ impl AiSettings {
             self.embedding_model
         )
     }
+
+    pub fn parallel_file_limit(&self) -> usize {
+        if self.provider.is_remote() {
+            3
+        } else {
+            1
+        }
+    }
+
+    fn vision_batch_size(&self) -> usize {
+        if self.provider.is_remote() {
+            8
+        } else {
+            4
+        }
+    }
 }
 
 pub fn analyze_file(
@@ -223,13 +247,34 @@ pub fn analyze_file(
     _metadata: Option<&MediaMetadata>,
     settings: &AiSettings,
 ) -> Result<Vec<AiAnnotation>, String> {
+    analyze_file_with_progress(path, _metadata, settings, |_| {})
+}
+
+pub fn analyze_file_with_progress<F>(
+    path: &Path,
+    _metadata: Option<&MediaMetadata>,
+    settings: &AiSettings,
+    progress: F,
+) -> Result<Vec<AiAnnotation>, String>
+where
+    F: Fn(AiFileProgress),
+{
     let client = Client::builder()
         .build()
         .map_err(|error| format!("cannot create AI HTTP client: {error}"))?;
+    progress(AiFileProgress {
+        percent: 1,
+        phase: "Extracting frames",
+    });
     let frames = extract_frames(path, settings)?;
+    progress(AiFileProgress {
+        percent: 10,
+        phase: "Analyzing frames",
+    });
     let mut analyses = Vec::with_capacity(frames.len());
     let mut frame_errors = Vec::new();
-    for frame_batch in frames.chunks(4) {
+    let mut processed_frames = 0usize;
+    for frame_batch in frames.chunks(settings.vision_batch_size()) {
         match describe_frames(&client, frame_batch, settings) {
             Ok(batch) if batch.len() == frame_batch.len() => {
                 analyses.extend(
@@ -250,6 +295,12 @@ pub fn analyze_file(
                 frame_batch.last().map(|frame| frame.0).unwrap_or_default()
             )),
         }
+        processed_frames += frame_batch.len();
+        let vision_percent = 10 + ((processed_frames * 80) / frames.len()) as u8;
+        progress(AiFileProgress {
+            percent: vision_percent.min(90),
+            phase: "Analyzing frames",
+        });
     }
     if analyses.is_empty() {
         return Err(format!(
@@ -273,6 +324,10 @@ pub fn analyze_file(
             )
         })
         .collect::<Vec<_>>();
+    progress(AiFileProgress {
+        percent: 92,
+        phase: "Creating search index",
+    });
     let embeddings =
         create_embeddings(&client, &embedding_texts, settings, EmbeddingKind::Document)?;
     if embeddings.len() != analyses.len() {
@@ -313,6 +368,10 @@ pub fn analyze_file(
         });
     }
 
+    progress(AiFileProgress {
+        percent: 100,
+        phase: "Finished",
+    });
     Ok(annotations)
 }
 
@@ -765,13 +824,21 @@ fn read_json_response(response: Response, operation: &str) -> Result<Value, Stri
             api_error_detail(&body)
         ));
     }
-    if body.get("error").is_some() || body.get("status").and_then(Value::as_str) == Some("failed") {
+    if response_body_reports_error(&body) {
         return Err(format!(
             "{operation} failed (HTTP {status}): {}",
             api_error_detail(&body)
         ));
     }
     Ok(body)
+}
+
+fn response_body_reports_error(body: &Value) -> bool {
+    body.get("error").is_some_and(|error| !error.is_null())
+        || body
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
 }
 
 fn api_error_detail(body: &Value) -> String {
@@ -907,6 +974,31 @@ mod tests {
             response_text(&body).as_deref(),
             Some("{\"description\":\"A player wins\"}")
         );
+    }
+
+    #[test]
+    fn accepts_successful_responses_payload_with_null_error() {
+        let body = json!({
+            "status": "completed",
+            "error": null,
+            "output": [{
+                "content": [{"type": "output_text", "text": "[{\"description\":\"Eliminated opponent\"}]"}]
+            }]
+        });
+
+        assert!(!response_body_reports_error(&body));
+        assert!(response_text(&body).is_some());
+    }
+
+    #[test]
+    fn detects_non_null_api_errors_and_failed_statuses() {
+        assert!(response_body_reports_error(&json!({
+            "error": {"message": "quota exceeded"}
+        })));
+        assert!(response_body_reports_error(&json!({
+            "error": null,
+            "status": "FAILED"
+        })));
     }
 
     #[test]
