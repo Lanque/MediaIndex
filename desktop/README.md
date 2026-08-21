@@ -38,5 +38,7 @@ The desktop shell now includes the first local scanner slice from issue [#3](htt
 - local FFprobe metadata extraction through a replaceable Rust interface;
 - deterministic duration, size, container, codec, resolution, frame-rate, and timestamp fields;
 - actionable metadata error state when FFprobe is unavailable, fails, or returns invalid JSON.
+- a versioned SQLite local index where content hashes identify assets and paths identify locations;
+- idempotent re-indexing with duplicate, moved, modified, deleted, and incomplete-scan handling.
 
-SQLite persistence and a searchable result list remain separate work in issues [#5](https://github.com/Lanque/MediaIndex/issues/5) and [#6](https://github.com/Lanque/MediaIndex/issues/6). The scanner and metadata interfaces are intentionally kept independent of persistence so they can be tested before the local schema is introduced.
+The searchable result list remains separate work in issue [#6](https://github.com/Lanque/MediaIndex/issues/6). See [docs/local-index.md](../docs/local-index.md) for the schema and hashing policy.

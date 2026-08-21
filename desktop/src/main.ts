@@ -2,8 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
-type ScanReport = {
-  files: Array<{ path: string; content_hash: string }>;
+type IndexReport = {
+  active_file_count: number;
+  changes: Array<{ kind: string; path: string; content_hash?: string }>;
   warnings: Array<{ path: string; message: string }>;
 };
 
@@ -90,11 +91,11 @@ selectFolderButton?.addEventListener("click", async () => {
   if (libraryPath) libraryPath.textContent = selected;
 
   try {
-    const report = await invoke<ScanReport>("scan_media_folder", { path: selected });
+    const report = await invoke<IndexReport>("index_media_folder", { path: selected });
     if (libraryStatus) {
       libraryStatus.textContent = report.warnings.length === 0 ? "Folder indexed" : "Folder indexed with warnings";
     }
-    if (clipCount) clipCount.textContent = `${report.files.length} clips`;
+    if (clipCount) clipCount.textContent = `${report.active_file_count} clips`;
   } catch (error) {
     if (libraryStatus) libraryStatus.textContent = "Scan failed";
     if (libraryPath) libraryPath.textContent = String(error);

@@ -62,7 +62,7 @@ pub struct ScanWarning {
     pub message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ScanReport {
     pub files: Vec<DiscoveredFile>,
     pub warnings: Vec<ScanWarning>,
