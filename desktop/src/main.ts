@@ -1088,13 +1088,14 @@ selectFolderButton?.addEventListener("click", async () => {
   }
 
   selectFolderButton.disabled = true;
-  selectedLibraryPath = selected;
-  if (analyzeAiButton) analyzeAiButton.disabled = false;
+  if (analyzeAiButton) analyzeAiButton.disabled = true;
   if (libraryStatus) libraryStatus.textContent = "Scanning folder…";
   if (libraryPath) libraryPath.textContent = selected;
 
   try {
     const report = await invoke<IndexReport>("index_media_folder", { path: selected });
+    selectedLibraryPath = selected;
+    if (analyzeAiButton) analyzeAiButton.disabled = false;
     if (libraryStatus) {
       libraryStatus.textContent = report.warnings.length === 0 ? "Folder indexed" : "Folder indexed with warnings";
     }
@@ -1107,9 +1108,10 @@ selectFolderButton?.addEventListener("click", async () => {
     await searchLibrary();
   } catch (error) {
     if (libraryStatus) libraryStatus.textContent = "Scan failed";
-    if (libraryPath) libraryPath.textContent = String(error);
+    if (libraryPath) libraryPath.textContent = conciseMessage(error);
   } finally {
     selectFolderButton.disabled = false;
+    if (analyzeAiButton) analyzeAiButton.disabled = aiAnalysisRunning || !selectedLibraryPath;
   }
 });
 
