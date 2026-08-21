@@ -84,7 +84,17 @@ fn search_media(
 }
 
 #[tauri::command]
-fn analyze_media_folder(
+async fn analyze_media_folder(
+    app: tauri::AppHandle,
+    path: String,
+    config: Option<ai::AiRequestConfig>,
+) -> Result<ai::AiIndexReport, String> {
+    tauri::async_runtime::spawn_blocking(move || analyze_media_folder_blocking(app, path, config))
+        .await
+        .map_err(|error| format!("AI analysis worker failed: {error}"))?
+}
+
+fn analyze_media_folder_blocking(
     app: tauri::AppHandle,
     path: String,
     config: Option<ai::AiRequestConfig>,

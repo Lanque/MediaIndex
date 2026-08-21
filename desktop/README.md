@@ -88,6 +88,9 @@ the same indexed moment when the text or event was captured. If the provider or
 embedding model changes, run **Analyze with AI** again; incompatible provider
 annotations are intentionally kept separate.
 
+AI analysis runs in a background worker, so the desktop window remains
+responsive while FFmpeg and network requests are in progress.
+
 The environment variables remain available for automation and older launch
 scripts (`MEDIAINDEX_AI_PROVIDER`, provider-specific API keys, model names,
 base URLs, `MEDIAINDEX_FFMPEG_PATH`, `MEDIAINDEX_AI_SAMPLE_SECONDS`, and
