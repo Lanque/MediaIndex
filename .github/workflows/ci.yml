@@ -43,6 +43,9 @@ jobs:
       - name: Validate PostgreSQL migrations
         run: python scripts/check_migrations.py
 
+      - name: Validate infrastructure scaffold
+        run: python scripts/check_infra.py
+
   desktop:
     name: Desktop checks
     runs-on: windows-latest
