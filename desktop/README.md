@@ -132,7 +132,10 @@ running.
 provider and models, preventing repeated button presses from spending credits
 again. Enable **Reanalyze existing clips** only for an intentional one-time
 refresh after changing sampling or library context; the checkbox resets after
-the run.
+the run. Before OpenAI or Gemini starts, a no-network preflight shows the number
+of unique videos plus the configured maximum sampled frames and vision batches,
+and requires confirmation. Duplicate paths with the same content hash are
+analyzed only once.
 
 The vision result stores entities, actions, setting, situation, readable
 on-screen text, and a general scene description. It covers ordinary footage,
@@ -143,7 +146,7 @@ three seconds are presented as one best-scoring moment, so one event does not
 appear separately at seconds 4, 5, and 6. AI search results are shown in
 visual video cards with a locally generated best-moment thumbnail. Clicking the
 thumbnail starts Preview at that timestamp; additional moments remain in a
-compact chronological list. **Focused** relevance is the default and limits
+compact chronological list without repeating the featured moment. **Focused** relevance is the default and limits
 weak results and repeated moments with both an adaptive window and an absolute
 floor. Exact visible text or labels can retain a result while generic semantic
 similarity alone is rejected. **Balanced** and **Broad** progressively expand

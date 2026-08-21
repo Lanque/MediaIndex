@@ -73,8 +73,8 @@ timestamp. Adjacent annotations from the same video within three seconds are
 coalesced after ranking, retaining the best-scoring timestamp for that event.
 Results are displayed as visual cards ordered by the best match for each video.
 FFmpeg generates and caches a local thumbnail for the best matching timestamp;
-clicking it opens Preview at that moment. Extra moments are kept in a compact
-chronological list. **Focused** mode is the default and applies an adaptive
+clicking it opens Preview at that moment. Other moments are kept in a compact
+chronological list without repeating the featured timestamp. **Focused** mode is the default and applies an adaptive
 score window, an absolute relevance floor, and an eight-video/two-moment-per-video
 cap. Exact or inflected on-screen text and labels receive enough ranking weight
 to survive that floor, while generic embedding similarity alone is filtered.
@@ -91,6 +91,11 @@ oversized parallel uploads while retaining high-detail HUD analysis; local
 Ollama analysis remains sequential. The provider and model name are stored with
 each annotation, so embeddings from incompatible models are not mixed in one
 search.
+
+Before a cloud analysis, MediaIndex performs a local preflight and asks for
+confirmation with the unique-video count, maximum sampled-frame count, and
+maximum vision-batch count. Identical content found at multiple paths is counted
+and analyzed once. Cancelling this confirmation sends no API request.
 
 The vision prompt requests recognizable fictional characters and franchises,
 other visible entities, actions and interactions, the setting, the broader

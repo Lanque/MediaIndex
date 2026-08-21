@@ -4,7 +4,7 @@ pub mod metadata;
 pub mod scanner;
 
 use base64::Engine;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,6 +52,16 @@ impl AiAnalysisControl {
 
 struct AiAnalysisRunGuard {
     control: AiAnalysisControl,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AiAnalysisPlan {
+    analyze_file_count: u64,
+    skipped_file_count: u64,
+    max_frames_per_file: u64,
+    max_sampled_frames: u64,
+    max_vision_requests: u64,
+    model: String,
 }
 
 impl Drop for AiAnalysisRunGuard {
@@ -176,6 +186,41 @@ async fn analyze_media_folder(
 }
 
 #[tauri::command]
+fn plan_ai_analysis(
+    app: tauri::AppHandle,
+    path: String,
+    config: Option<ai::AiRequestConfig>,
+    force: Option<bool>,
+) -> Result<AiAnalysisPlan, String> {
+    let settings = ai::AiSettings::from_request(config)?;
+    let index = open_local_index(&app)?;
+    let indexed_files = unique_indexed_files_under_root(
+        index.known_files().map_err(|error| error.to_string())?,
+        Path::new(&path),
+    );
+    if indexed_files.is_empty() {
+        return Err("No indexed active clips were found in the selected folder".to_owned());
+    }
+    let model = settings.model_namespace();
+    let (files, skipped_file_count) =
+        select_ai_files(&index, indexed_files, &model, force.unwrap_or(false))?;
+    let analyze_file_count = files.len() as u64;
+    let max_frames_per_file = settings.max_frames_per_file() as u64;
+    let requests_per_file = settings
+        .max_frames_per_file()
+        .div_ceil(settings.vision_batch_size()) as u64;
+
+    Ok(AiAnalysisPlan {
+        analyze_file_count,
+        skipped_file_count,
+        max_frames_per_file,
+        max_sampled_frames: analyze_file_count.saturating_mul(max_frames_per_file),
+        max_vision_requests: analyze_file_count.saturating_mul(requests_per_file),
+        model,
+    })
+}
+
+#[tauri::command]
 fn cancel_ai_analysis(control: tauri::State<'_, AiAnalysisControl>) -> bool {
     control.request_cancel()
 }
@@ -190,30 +235,16 @@ fn analyze_media_folder_blocking(
     let settings = ai::AiSettings::from_request(config)?;
     let mut index = open_local_index(&app)?;
     let root = Path::new(&path);
-    let indexed_files = index
-        .known_files()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|file| Path::new(&file.path).starts_with(root))
-        .collect::<Vec<_>>();
+    let indexed_files = unique_indexed_files_under_root(
+        index.known_files().map_err(|error| error.to_string())?,
+        root,
+    );
     if indexed_files.is_empty() {
         return Err("No indexed active clips were found in the selected folder".to_owned());
     }
 
     let provider = settings.model_namespace();
-    let mut files = Vec::with_capacity(indexed_files.len());
-    let mut skipped_file_count = 0u64;
-    for file in indexed_files {
-        let already_analyzed = !force
-            && index
-                .has_ai_annotations_for_content_model(&file.content_hash, &provider)
-                .map_err(|error| error.to_string())?;
-        if already_analyzed {
-            skipped_file_count += 1;
-        } else {
-            files.push(file);
-        }
-    }
+    let (files, skipped_file_count) = select_ai_files(&index, indexed_files, &provider, force)?;
 
     let mut report = ai::AiIndexReport {
         analyzed_file_count: 0,
@@ -350,6 +381,40 @@ fn analyze_media_folder_blocking(
     }
 
     Ok(report)
+}
+
+fn unique_indexed_files_under_root(
+    files: Vec<local_index::IndexedFile>,
+    root: &Path,
+) -> Vec<local_index::IndexedFile> {
+    let mut content_hashes = HashSet::new();
+    files
+        .into_iter()
+        .filter(|file| Path::new(&file.path).starts_with(root))
+        .filter(|file| content_hashes.insert(file.content_hash.clone()))
+        .collect()
+}
+
+fn select_ai_files(
+    index: &local_index::SqliteIndex,
+    indexed_files: Vec<local_index::IndexedFile>,
+    model: &str,
+    force: bool,
+) -> Result<(Vec<local_index::IndexedFile>, u64), String> {
+    let mut files = Vec::with_capacity(indexed_files.len());
+    let mut skipped_file_count = 0u64;
+    for file in indexed_files {
+        let already_analyzed = !force
+            && index
+                .has_ai_annotations_for_content_model(&file.content_hash, model)
+                .map_err(|error| error.to_string())?;
+        if already_analyzed {
+            skipped_file_count += 1;
+        } else {
+            files.push(file);
+        }
+    }
+    Ok((files, skipped_file_count))
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -540,6 +605,7 @@ pub fn run() {
             index_media_folder,
             search_media,
             get_indexed_library_path,
+            plan_ai_analysis,
             analyze_media_folder,
             cancel_ai_analysis,
             search_ai,
@@ -582,6 +648,46 @@ mod tests {
         assert!(!control.request_cancel());
         assert!(!control.is_cancelled());
         assert!(control.begin().is_ok());
+    }
+
+    #[test]
+    fn ai_analysis_deduplicates_content_inside_the_selected_root() {
+        let files = vec![
+            local_index::IndexedFile {
+                path: "/library/a/clip.mp4".to_owned(),
+                content_hash: "same-content".to_owned(),
+                size_bytes: 10,
+                modified_unix_ms: None,
+                status: local_index::LocalFileStatus::Active,
+            },
+            local_index::IndexedFile {
+                path: "/library/b/copy.mp4".to_owned(),
+                content_hash: "same-content".to_owned(),
+                size_bytes: 10,
+                modified_unix_ms: None,
+                status: local_index::LocalFileStatus::Active,
+            },
+            local_index::IndexedFile {
+                path: "/library/b/unique.mp4".to_owned(),
+                content_hash: "unique-content".to_owned(),
+                size_bytes: 20,
+                modified_unix_ms: None,
+                status: local_index::LocalFileStatus::Active,
+            },
+            local_index::IndexedFile {
+                path: "/outside/other.mp4".to_owned(),
+                content_hash: "outside-content".to_owned(),
+                size_bytes: 30,
+                modified_unix_ms: None,
+                status: local_index::LocalFileStatus::Active,
+            },
+        ];
+
+        let selected = unique_indexed_files_under_root(files, Path::new("/library"));
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].path, "/library/a/clip.mp4");
+        assert_eq!(selected[1].path, "/library/b/unique.mp4");
     }
 
     #[test]

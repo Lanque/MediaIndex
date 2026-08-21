@@ -52,6 +52,15 @@ type AiIndexReport = {
   warnings: Array<{ path: string; message: string }>;
 };
 
+type AiAnalysisPlan = {
+  analyze_file_count: number;
+  skipped_file_count: number;
+  max_frames_per_file: number;
+  max_sampled_frames: number;
+  max_vision_requests: number;
+  model: string;
+};
+
 type AiProgress = {
   completed_files: number;
   total_files: number;
@@ -706,11 +715,12 @@ function renderGroupedAiResults(results: SearchResult[]): string {
     const relevance = groupIndex === 0 ? "Top match" : bestScore >= topScore - 0.04 ? "Strong" : "Related";
     const timestamp = bestMatch.timestamp_ms ?? 0;
     const thumbnailKey = `${bestMatch.content_hash}:${timestamp}`;
-    const extraMoments = moments.length > 1
+    const otherMoments = moments.filter((moment) => moment !== bestMatch);
+    const extraMoments = otherMoments.length
       ? `<details class="video-moments">
-          <summary>${moments.length} matching moments</summary>
+          <summary>${otherMoments.length} more ${otherMoments.length === 1 ? "moment" : "moments"}</summary>
           <div class="moment-list">
-            ${moments.map((moment) => `<button class="moment-row preview-result" type="button" data-name="${escapeHtml(fileName)}" data-path="${escapeHtml(moment.path)}" data-timestamp-ms="${moment.timestamp_ms ?? 0}" ${moment.available ? "" : "disabled"}>
+            ${otherMoments.map((moment) => `<button class="moment-row preview-result" type="button" data-name="${escapeHtml(fileName)}" data-path="${escapeHtml(moment.path)}" data-timestamp-ms="${moment.timestamp_ms ?? 0}" ${moment.available ? "" : "disabled"}>
               <strong>${escapeHtml(formatDuration(moment.timestamp_ms))}</strong>
               <span>${escapeHtml(moment.ai_description ?? "Matching scene")}</span>
               <span aria-hidden="true">▶</span>
@@ -900,16 +910,43 @@ async function analyzeLibraryWithAi(): Promise<void> {
   aiAnalysisRunning = true;
   aiCancellationPending = false;
   aiStopRequested = false;
-  analyzeAiButton.disabled = false;
-  analyzeAiButton.textContent = "Stop analysis";
-  analyzeAiButton.classList.add("is-stop");
-  analyzeAiButton.setAttribute("aria-pressed", "true");
+  analyzeAiButton.disabled = true;
+  analyzeAiButton.textContent = "Checking cost…";
   if (selectFolderButton) selectFolderButton.disabled = true;
   const config = saveAiConfig();
-  showAiProgress(0, "Preparing clips");
-  if (libraryStatus) libraryStatus.textContent = "AI analysis in progress…";
-  if (libraryPath) libraryPath.textContent = `Using ${aiProviderLabel(config.provider)} · ${config.visionModel} / ${config.embeddingModel}`;
+  let analysisStarted = false;
   try {
+    const plan = await invoke<AiAnalysisPlan>("plan_ai_analysis", {
+      path: selectedLibraryPath,
+      config,
+      force: config.reanalyzeExisting,
+    });
+    if (config.provider !== "local" && plan.analyze_file_count > 0) {
+      const action = config.reanalyzeExisting ? "reanalyze" : "analyze";
+      const skipped = plan.skipped_file_count
+        ? `\n${plan.skipped_file_count} already indexed clips will be skipped.`
+        : "";
+      const confirmed = window.confirm(
+        `${aiProviderLabel(config.provider)} will ${action} ${plan.analyze_file_count} unique videos.\n\n` +
+        `Maximum configured upload: ${plan.max_sampled_frames} sampled frame images in up to ${plan.max_vision_requests} vision batches ` +
+        `(${plan.max_frames_per_file} frames per video). Short clips may use less.${skipped}\n\nContinue?`,
+      );
+      if (!confirmed) {
+        if (libraryStatus) libraryStatus.textContent = "AI analysis not started";
+        if (libraryPath) libraryPath.textContent = "No API requests were sent and no credits were used.";
+        if (aiSearchStatus) aiSearchStatus.textContent = "Analysis cancelled before upload.";
+        return;
+      }
+    }
+
+    analysisStarted = true;
+    analyzeAiButton.disabled = false;
+    analyzeAiButton.textContent = "Stop analysis";
+    analyzeAiButton.classList.add("is-stop");
+    analyzeAiButton.setAttribute("aria-pressed", "true");
+    showAiProgress(0, "Preparing clips");
+    if (libraryStatus) libraryStatus.textContent = "AI analysis in progress…";
+    if (libraryPath) libraryPath.textContent = `Using ${aiProviderLabel(config.provider)} · ${config.visionModel} / ${config.embeddingModel}`;
     const report = await invoke<AiIndexReport>("analyze_media_folder", {
       path: selectedLibraryPath,
       config,
@@ -942,11 +979,11 @@ async function analyzeLibraryWithAi(): Promise<void> {
       }
     }
   } catch (error) {
-    if (libraryStatus) libraryStatus.textContent = "AI analysis failed";
+    if (libraryStatus) libraryStatus.textContent = analysisStarted ? "AI analysis failed" : "Could not prepare AI analysis";
     if (libraryPath) libraryPath.textContent = conciseMessage(error);
-    showAiProgress(lastAiProgressPercent, "Analysis stopped", true);
+    if (analysisStarted) showAiProgress(lastAiProgressPercent, "Analysis stopped", true);
   } finally {
-    if (config.reanalyzeExisting && aiReanalyzeExisting) {
+    if (analysisStarted && config.reanalyzeExisting && aiReanalyzeExisting) {
       aiReanalyzeExisting.checked = false;
       saveAiConfig();
     }

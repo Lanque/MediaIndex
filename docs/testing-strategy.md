@@ -40,7 +40,9 @@ private footage and generated thumbnails must not be committed.
 
 Deterministic cancellation tests verify that concurrent AI runs are rejected,
 a stop request is observed before frame/API work begins, and the run lock is
-released after cancellation.
+released after cancellation. Content-selection tests verify that duplicate paths
+with the same hash are analyzed once and files outside the selected root are
+excluded from the cloud preflight and run.
 
 ## Planned component checks
 
