@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod local_index;
 pub mod metadata;
 pub mod scanner;
@@ -81,6 +82,60 @@ fn search_media(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn analyze_media_folder(app: tauri::AppHandle, path: String) -> Result<ai::AiIndexReport, String> {
+    let settings = ai::AiSettings::from_environment()?;
+    let mut index = open_local_index(&app)?;
+    let root = Path::new(&path);
+    let files = index
+        .known_files()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|file| Path::new(&file.path).starts_with(root))
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        return Err("No indexed active clips were found in the selected folder".to_owned());
+    }
+
+    let mut report = ai::AiIndexReport {
+        analyzed_file_count: 0,
+        annotation_count: 0,
+        warnings: Vec::new(),
+    };
+    for file in files {
+        let metadata = index
+            .get_asset_metadata(&file.content_hash)
+            .map_err(|error| error.to_string())?;
+        match ai::analyze_file(Path::new(&file.path), metadata.as_ref(), &settings) {
+            Ok(annotations) => {
+                report.analyzed_file_count += 1;
+                report.annotation_count += annotations.len() as u64;
+                index
+                    .replace_ai_annotations(&file.content_hash, &annotations)
+                    .map_err(|error| error.to_string())?;
+            }
+            Err(error) => report.warnings.push(ai::AiWarning {
+                path: file.path,
+                message: error,
+            }),
+        }
+    }
+
+    Ok(report)
+}
+
+#[tauri::command]
+fn search_ai(
+    app: tauri::AppHandle,
+    query: String,
+) -> Result<Vec<local_index::AiSearchResult>, String> {
+    let settings = ai::AiSettings::from_environment()?;
+    let embedding = ai::embed_query(&query, &settings)?;
+    open_local_index(&app)?
+        .search_ai(&embedding, 100)
+        .map_err(|error| error.to_string())
+}
+
 fn open_local_index(app: &tauri::AppHandle) -> Result<local_index::SqliteIndex, String> {
     let database_directory = app
         .path()
@@ -101,7 +156,9 @@ pub fn run() {
             scan_media_folder,
             extract_media_metadata,
             index_media_folder,
-            search_media
+            search_media,
+            analyze_media_folder,
+            search_ai
         ])
         .run(tauri::generate_context!())
         .expect("error while running MediaIndex");

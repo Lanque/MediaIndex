@@ -42,6 +42,13 @@ button {
   padding-bottom: 42px;
 }
 
+.topbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .eyebrow,
 .section-label {
   margin: 0 0 10px;
@@ -99,6 +106,12 @@ h1 {
 .primary-button:hover,
 .secondary-button:hover {
   transform: translateY(-2px);
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.62;
+  transform: none;
 }
 
 .workspace {
@@ -201,6 +214,32 @@ h1 {
   display: flex;
   gap: 10px;
   margin-top: 28px;
+}
+
+.ai-search-form {
+  display: flex;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.ai-search-form input {
+  flex: 1;
+  width: 100%;
+  border: 1px solid #4464a1;
+  border-radius: 8px;
+  padding: 10px 14px;
+  color: #e8edf7;
+  background: #111d3b;
+  font: inherit;
+  font-size: 0.82rem;
+}
+
+.search-status {
+  min-height: 20px;
+  margin: 8px 0 0;
+  color: #9caed2;
+  font-size: 0.76rem;
+  line-height: 1.45;
 }
 
 .search-form input {
