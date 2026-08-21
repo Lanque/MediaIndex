@@ -77,6 +77,7 @@ impl AiSettings {
                 .to_owned(),
             ffmpeg_executable: std::env::var_os("MEDIAINDEX_FFMPEG_PATH")
                 .map(PathBuf::from)
+                .filter(|path| path.is_file())
                 .unwrap_or_else(|| PathBuf::from("ffmpeg")),
             sample_interval_ms: sample_interval_seconds.saturating_mul(1_000),
             max_frames_per_file,

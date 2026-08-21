@@ -421,9 +421,20 @@ async function analyzeLibraryWithAi(): Promise<void> {
   try {
     const report = await invoke<AiIndexReport>("analyze_media_folder", { path: selectedLibraryPath });
     const warningSuffix = report.warnings.length ? ` · ${report.warnings.length} warnings` : "";
+    const warningDetails = report.warnings
+      .map((warning) => `${warning.path.split(/[\\/]/).pop() ?? warning.path}: ${warning.message}`)
+      .join(" | ");
     if (libraryStatus) libraryStatus.textContent = `AI indexed ${report.analyzed_file_count} clips${warningSuffix}`;
-    if (libraryPath) libraryPath.textContent = `${report.annotation_count} timestamped visual moments stored locally`;
-    if (aiSearchStatus) aiSearchStatus.textContent = "AI index ready. Try “Fortnite kill” or “enemy elimination”.";
+    if (libraryPath) {
+      libraryPath.textContent = warningDetails
+        ? `${report.annotation_count} timestamped visual moments stored locally · ${warningDetails}`
+        : `${report.annotation_count} timestamped visual moments stored locally`;
+    }
+    if (aiSearchStatus) {
+      aiSearchStatus.textContent = warningDetails
+        ? `AI warnings: ${warningDetails}`
+        : "AI index ready. Try “Fortnite kill” or “enemy elimination”.";
+    }
   } catch (error) {
     if (libraryStatus) libraryStatus.textContent = "AI analysis failed";
     if (libraryPath) libraryPath.textContent = String(error);
