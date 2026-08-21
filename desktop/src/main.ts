@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import "./styles.css";
@@ -40,6 +40,8 @@ type SearchResult = {
     frame_rate: string | null;
   } | null;
 };
+
+const MAX_RENDERED_RESULTS = 500;
 
 const app = document.querySelector<HTMLDivElement>("#app");
 
@@ -123,9 +125,25 @@ app.innerHTML = `
           </button>
         </div>
         <div class="result-list" id="result-list" hidden></div>
+        <p class="results-note" id="results-note" hidden></p>
       </section>
     </section>
   </main>
+
+  <div class="preview-backdrop" id="preview-dialog" hidden>
+    <section class="preview-modal" role="dialog" aria-modal="true" aria-labelledby="preview-title">
+      <div class="preview-header">
+        <div>
+          <p class="section-label">Clip preview</p>
+          <h2 id="preview-title">Preview</h2>
+        </div>
+        <button class="secondary-button" id="close-preview" type="button">Close</button>
+      </div>
+      <video id="preview-video" controls preload="metadata"></video>
+      <p class="preview-path" id="preview-path"></p>
+      <p class="preview-message" id="preview-message" role="status" hidden></p>
+    </section>
+  </div>
 `;
 
 const selectFolderButton = document.querySelector<HTMLButtonElement>("#select-folder");
@@ -134,6 +152,13 @@ const libraryPath = document.querySelector<HTMLElement>("#library-path");
 const clipCount = document.querySelector<HTMLElement>("#clip-count");
 const emptyState = document.querySelector<HTMLElement>("#empty-state");
 const resultList = document.querySelector<HTMLElement>("#result-list");
+const resultsNote = document.querySelector<HTMLElement>("#results-note");
+const previewDialog = document.querySelector<HTMLElement>("#preview-dialog");
+const previewTitle = document.querySelector<HTMLElement>("#preview-title");
+const previewPath = document.querySelector<HTMLElement>("#preview-path");
+const previewMessage = document.querySelector<HTMLElement>("#preview-message");
+const previewVideo = document.querySelector<HTMLVideoElement>("#preview-video");
+const closePreviewButton = document.querySelector<HTMLButtonElement>("#close-preview");
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>'"]/g, (character) => ({
@@ -200,16 +225,44 @@ function readFilters(): SearchFilters {
   };
 }
 
+function closePreview(): void {
+  if (previewVideo) {
+    previewVideo.pause();
+    previewVideo.removeAttribute("src");
+    previewVideo.load();
+  }
+  if (previewDialog) previewDialog.hidden = true;
+}
+
+function openPreview(path: string, name: string): void {
+  if (!previewDialog || !previewVideo) return;
+  if (previewTitle) previewTitle.textContent = name;
+  if (previewPath) previewPath.textContent = path;
+  if (previewMessage) {
+    previewMessage.textContent = "Loading preview…";
+    previewMessage.hidden = false;
+  }
+  previewVideo.src = convertFileSrc(path);
+  previewVideo.load();
+  previewDialog.hidden = false;
+}
+
 function renderResults(results: SearchResult[]): void {
   if (!resultList || !emptyState) return;
   if (results.length === 0) {
     resultList.hidden = true;
+    if (resultsNote) resultsNote.hidden = true;
     emptyState.hidden = false;
     return;
   }
   emptyState.hidden = true;
   resultList.hidden = false;
-  resultList.innerHTML = results.map((result, index) => {
+  const visibleResults = results.slice(0, MAX_RENDERED_RESULTS);
+  if (resultsNote) {
+    resultsNote.hidden = results.length <= MAX_RENDERED_RESULTS;
+    resultsNote.textContent = `Showing the first ${MAX_RENDERED_RESULTS} of ${results.length} matches. Refine your search to see a smaller set.`;
+  }
+  resultList.innerHTML = visibleResults.map((result, index) => {
     const metadata = result.metadata;
     const details = metadata
       ? `${formatDuration(metadata.duration_ms)} · ${formatBytes(result.size_bytes)} · ${metadata.width ?? "?"}×${metadata.height ?? "?"} · ${metadata.frame_rate ?? "?"} fps · ${metadata.video_codec ?? "?"}`
@@ -222,12 +275,25 @@ function renderResults(results: SearchResult[]): void {
         <p>${escapeHtml(result.path)}</p>
         <span>${escapeHtml(details)} · ${escapeHtml(status)}</span>
       </div>
-      <button class="secondary-button open-result" data-path="${escapeHtml(result.path)}" ${result.available ? "" : "disabled"}>Open</button>
+      <div class="result-actions">
+        <button class="secondary-button preview-result" data-name="${escapeHtml(result.path.split(/[\\/]/).pop() ?? result.path)}" data-path="${escapeHtml(result.path)}" ${result.available ? "" : "disabled"}>Preview</button>
+        <button class="secondary-button open-result" data-path="${escapeHtml(result.path)}" ${result.available ? "" : "disabled"}>Open</button>
+      </div>
     </article>`;
   }).join("");
+  resultList.querySelectorAll<HTMLButtonElement>(".preview-result").forEach((button) => {
+    button.addEventListener("click", () => {
+      openPreview(button.dataset.path ?? "", button.dataset.name ?? "Preview");
+    });
+  });
   resultList.querySelectorAll<HTMLButtonElement>(".open-result").forEach((button) => {
     button.addEventListener("click", async () => {
-      await openPath(button.dataset.path ?? "");
+      try {
+        await openPath(button.dataset.path ?? "");
+      } catch (error) {
+        if (libraryStatus) libraryStatus.textContent = "Could not open clip";
+        if (libraryPath) libraryPath.textContent = String(error);
+      }
     });
   });
 }
@@ -236,6 +302,7 @@ async function searchLibrary(): Promise<void> {
   try {
     const results = await invoke<SearchResult[]>("search_media", { query: readFilters() });
     renderResults(results);
+    if (clipCount) clipCount.textContent = `${results.length} matches`;
     if (libraryStatus) libraryStatus.textContent = `${results.length} matching clips`;
   } catch (error) {
     if (libraryStatus) libraryStatus.textContent = "Search failed";
@@ -289,3 +356,20 @@ document.querySelector<HTMLButtonElement>("#learn-more")?.addEventListener(
     window.alert("See docs/project-plan.md for the current MVP scope.");
   },
 );
+
+closePreviewButton?.addEventListener("click", closePreview);
+previewDialog?.addEventListener("click", (event) => {
+  if (event.target === previewDialog) closePreview();
+});
+previewVideo?.addEventListener("loadedmetadata", () => {
+  if (previewMessage) previewMessage.hidden = true;
+});
+previewVideo?.addEventListener("error", () => {
+  if (previewMessage) {
+    previewMessage.textContent = "This clip cannot be previewed in the embedded player. Use Open to launch it in your system player.";
+    previewMessage.hidden = false;
+  }
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && previewDialog && !previewDialog.hidden) closePreview();
+});

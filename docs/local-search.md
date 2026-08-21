@@ -23,8 +23,9 @@ To find a 29.97 FPS H.264 clip from the first shooting day:
 2. Enter `day-one` in Folder, `1920x1080` in Resolution, `29.97` in FPS,
    and `h264` in Codec.
 3. Press **Apply filters** or use the keyword search.
-4. Press **Open** on an available result to open the original file at its
-   current local path.
+4. Press **Preview** on an available result to play it in the MediaIndex
+   window, or press **Open** to launch the original file with the operating
+   system's associated player.
 
 An unavailable result remains visible with an explicit status so a stale path
 is distinguishable from a search miss. The Open button is disabled until a
@@ -37,3 +38,9 @@ modified date, or resolution, ascending or descending. Sorting happens over
 the local SQLite result set and does not upload footage. Technical sort fields
 are available after FFprobe metadata extraction; files whose metadata cannot be
 read remain searchable by name and path and are shown with a warning.
+
+The desktop UI renders at most 500 matching results at once. When a query
+matches more than that, refine the keyword or filters instead of trying to
+render the whole library in one window. Preview uses Tauri's local asset
+protocol and never copies or uploads the original clip; codecs unsupported by
+the embedded WebView show an actionable fallback message.

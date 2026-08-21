@@ -124,6 +124,14 @@ pub struct FileChange {
 }
 
 pub fn scan_folder(root: &Path, options: &ScanOptions) -> Result<ScanReport, ScanError> {
+    scan_folder_with_known_files(root, options, &HashMap::new())
+}
+
+pub fn scan_folder_with_known_files(
+    root: &Path,
+    options: &ScanOptions,
+    known_files: &HashMap<String, LocalFileRecord>,
+) -> Result<ScanReport, ScanError> {
     let metadata = fs::symlink_metadata(root).map_err(|error| ScanError::RootUnavailable {
         path: root.to_path_buf(),
         message: error.to_string(),
@@ -137,7 +145,7 @@ pub fn scan_folder(root: &Path, options: &ScanOptions) -> Result<ScanReport, Sca
 
     let mut files = Vec::new();
     let mut warnings = Vec::new();
-    visit_directory(root, options, &mut files, &mut warnings);
+    visit_directory(root, options, known_files, &mut files, &mut warnings);
     files.sort_by(|left, right| path_key(&left.path).cmp(&path_key(&right.path)));
 
     Ok(ScanReport { files, warnings })
@@ -228,6 +236,7 @@ pub fn detect_changes(previous: &[LocalFileRecord], current: &[DiscoveredFile]) 
 fn visit_directory(
     directory: &Path,
     options: &ScanOptions,
+    known_files: &HashMap<String, LocalFileRecord>,
     files: &mut Vec<DiscoveredFile>,
     warnings: &mut Vec<ScanWarning>,
 ) {
@@ -276,21 +285,35 @@ fn visit_directory(
                 continue;
             }
 
-            let content_hash = match hash_file(&path) {
-                Ok(hash) => hash,
-                Err(error) => {
-                    warnings.push(ScanWarning {
-                        path: display_path(&path),
-                        message: format!("cannot hash file: {error}"),
-                    });
-                    continue;
-                }
-            };
+            let path_string = display_path(&path);
+            let modified_unix_ms = modified_unix_ms(&metadata);
+            let content_hash = known_files
+                .get(&path_string)
+                .filter(|known| {
+                    known.size_bytes == metadata.len()
+                        && known.modified_unix_ms.is_some()
+                        && known.modified_unix_ms == modified_unix_ms
+                })
+                .map(|known| known.content_hash.clone())
+                .unwrap_or_else(|| match hash_file(&path) {
+                    Ok(hash) => hash,
+                    Err(error) => {
+                        warnings.push(ScanWarning {
+                            path: path_string.clone(),
+                            message: format!("cannot hash file: {error}"),
+                        });
+                        String::new()
+                    }
+                });
+
+            if content_hash.is_empty() {
+                continue;
+            }
 
             files.push(DiscoveredFile {
-                path: display_path(&path),
+                path: path_string,
                 size_bytes: metadata.len(),
-                modified_unix_ms: modified_unix_ms(&metadata),
+                modified_unix_ms,
                 content_hash,
             });
         }
@@ -486,5 +509,30 @@ mod tests {
         let options = ScanOptions::with_extensions([".MP4", "mov"]);
         assert!(options.accepts(Path::new("clip.Mp4")));
         assert!(!options.accepts(Path::new("clip.mkv")));
+    }
+
+    #[test]
+    fn reuses_a_known_hash_when_file_identity_is_unchanged() {
+        let directory = TestDirectory::new("known-hash");
+        let path = directory.0.join("clip.mp4");
+        write(&path, b"content").expect("fixture should be written");
+        let metadata = fs::metadata(&path).expect("fixture metadata should be readable");
+        let path_string = display_path(&path);
+        let mut known_files = HashMap::new();
+        known_files.insert(
+            path_string.clone(),
+            LocalFileRecord {
+                path: path_string,
+                size_bytes: metadata.len(),
+                modified_unix_ms: modified_unix_ms(&metadata),
+                content_hash: "cached-hash".to_owned(),
+            },
+        );
+
+        let report =
+            scan_folder_with_known_files(&directory.0, &ScanOptions::default(), &known_files)
+                .expect("scan should succeed");
+
+        assert_eq!(report.files[0].content_hash, "cached-hash");
     }
 }
