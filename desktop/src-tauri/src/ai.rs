@@ -962,6 +962,120 @@ fn normalize_labels(labels: Vec<String>) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn read_stub_request(stream: &mut std::net::TcpStream) -> (String, Value) {
+        use std::io::Read;
+
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 8_192];
+        let (header_end, content_length) = loop {
+            let read = stream.read(&mut buffer).expect("stub request should read");
+            assert!(read > 0, "stub request closed before its headers arrived");
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_text = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = header_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or_default();
+            break (header_end + 4, content_length);
+        };
+
+        while request.len() < header_end + content_length {
+            let read = stream.read(&mut buffer).expect("stub body should read");
+            assert!(read > 0, "stub request closed before its body arrived");
+            request.extend_from_slice(&buffer[..read]);
+        }
+
+        let request_line = String::from_utf8_lossy(&request[..header_end])
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let body = serde_json::from_slice(&request[header_end..header_end + content_length])
+            .expect("stub request body should be JSON");
+        (request_line, body)
+    }
+
+    fn write_stub_response(stream: &mut std::net::TcpStream, body: &Value) {
+        use std::io::Write;
+
+        let body = serde_json::to_string(body).expect("stub response should serialize");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("stub response should write");
+    }
+
+    fn spawn_openai_stub() -> (String, std::thread::JoinHandle<()>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("stub should accept a request");
+                let (request_line, request) = read_stub_request(&mut stream);
+                if request_line.starts_with("POST /responses ") {
+                    let image_count = request
+                        .pointer("/input/0/content")
+                        .and_then(Value::as_array)
+                        .expect("vision request should contain content")
+                        .iter()
+                        .filter(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("input_image")
+                        })
+                        .count();
+                    assert!(image_count > 0, "vision request should contain images");
+                    let analyses = (0..image_count)
+                        .map(|_| {
+                            json!({
+                                "description": "A Fortnite player eliminates an opponent",
+                                "labels": ["fortnite", "kill", "elimination"],
+                                "visible_text": ["ELIMINATED"],
+                                "confidence": 0.98
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    write_stub_response(
+                        &mut stream,
+                        &json!({
+                            "status": "completed",
+                            "error": null,
+                            "output": [{
+                                "content": [{
+                                    "type": "output_text",
+                                    "text": serde_json::to_string(&analyses).unwrap()
+                                }]
+                            }]
+                        }),
+                    );
+                } else if request_line.starts_with("POST /embeddings ") {
+                    let input_count = request
+                        .get("input")
+                        .and_then(Value::as_array)
+                        .expect("embedding request should contain input")
+                        .len();
+                    let data = (0..input_count)
+                        .map(|index| json!({"index": index, "embedding": [1.0, 0.0, 0.5]}))
+                        .collect::<Vec<_>>();
+                    write_stub_response(&mut stream, &json!({"data": data}));
+                } else {
+                    panic!("unexpected stub request: {request_line}");
+                }
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
     #[test]
     fn extracts_output_text_from_responses_payload() {
         let body = json!({
@@ -1080,5 +1194,47 @@ mod tests {
             settings.model_namespace(),
             "openai:vision-test:embedding-test"
         );
+    }
+
+    #[test]
+    #[ignore = "requires MEDIAINDEX_SMOKE_VIDEO and FFmpeg"]
+    fn analyzes_real_video_through_openai_response_pipeline() {
+        let video = std::env::var_os("MEDIAINDEX_SMOKE_VIDEO")
+            .map(PathBuf::from)
+            .expect("MEDIAINDEX_SMOKE_VIDEO should point to a real video");
+        let (base_url, server) = spawn_openai_stub();
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::OpenAI),
+            api_key: Some("stub-api-key".to_owned()),
+            vision_model: Some("vision-stub".to_owned()),
+            embedding_model: Some("embedding-stub".to_owned()),
+            base_url: Some(base_url),
+            sample_interval_seconds: Some(5),
+            max_frames: Some(2),
+            ..Default::default()
+        }))
+        .expect("stub settings should be valid");
+        let progress = std::cell::RefCell::new(Vec::new());
+
+        let annotations = analyze_file_with_progress(&video, None, &settings, |event| {
+            progress.borrow_mut().push(event.percent);
+        })
+        .expect("real video should complete the OpenAI response pipeline");
+        server.join().expect("stub should finish cleanly");
+
+        assert_eq!(annotations.len(), 2);
+        assert!(annotations.iter().all(|annotation| {
+            annotation
+                .description
+                .contains("On-screen text: eliminated")
+                && annotation
+                    .labels
+                    .contains(&"on-screen text: eliminated".to_owned())
+                && annotation.embedding == vec![1.0, 0.0, 0.5]
+        }));
+        let progress = progress.into_inner();
+        assert_eq!(progress.first(), Some(&1));
+        assert_eq!(progress.last(), Some(&100));
+        assert!(progress.windows(2).all(|values| values[0] <= values[1]));
     }
 }
