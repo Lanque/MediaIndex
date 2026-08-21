@@ -27,4 +27,13 @@ Packaging is intentionally disabled until application icons and the first user w
 
 ## Current scope
 
-The shell is a visual and runtime foundation only. Folder selection, scanning, FFprobe metadata, hashing, SQLite persistence, and local search are tracked in issues [#3](https://github.com/Lanque/MediaIndex/issues/3) through [#6](https://github.com/Lanque/MediaIndex/issues/6).
+The desktop shell now includes the first local scanner slice from issue [#3](https://github.com/Lanque/MediaIndex/issues/3):
+
+- recursive discovery of configured media extensions;
+- deterministic path ordering;
+- SHA-256 content hashes computed locally;
+- symlink skipping so a scan cannot follow a linked folder outside the selected root;
+- warnings for unreadable directories or files instead of aborting the whole scan;
+- pure change classification for new, unchanged, modified, moved, and deleted files.
+
+SQLite persistence, FFprobe metadata, and a searchable result list remain separate work in issues [#4](https://github.com/Lanque/MediaIndex/issues/4) through [#6](https://github.com/Lanque/MediaIndex/issues/6). The change classifier is intentionally kept independent of persistence so it can be tested before the local schema is introduced in issue [#5](https://github.com/Lanque/MediaIndex/issues/5).

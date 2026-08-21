@@ -1,4 +1,11 @@
+import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
+
+type ScanReport = {
+  files: Array<{ path: string; content_hash: string }>;
+  warnings: Array<{ path: string; message: string }>;
+};
 
 const app = document.querySelector<HTMLDivElement>("#app");
 
@@ -28,8 +35,8 @@ app.innerHTML = `
         <div class="library-card">
           <span class="status-dot" aria-hidden="true"></span>
           <div>
-            <strong>No folder indexed</strong>
-            <span>Choose a local folder to begin</span>
+            <strong id="library-status">No folder indexed</strong>
+            <span id="library-path">Choose a local folder to begin</span>
           </div>
         </div>
         <p class="section-label">Filters</p>
@@ -44,7 +51,7 @@ app.innerHTML = `
             <p class="section-label">Local library</p>
             <h2>Ready when you are</h2>
           </div>
-          <span class="count-badge">0 clips</span>
+          <span class="count-badge" id="clip-count">0 clips</span>
         </div>
         <div class="empty-state">
           <div class="empty-icon" aria-hidden="true">⌁</div>
@@ -62,12 +69,39 @@ app.innerHTML = `
   </main>
 `;
 
-document.querySelector<HTMLButtonElement>("#select-folder")?.addEventListener(
-  "click",
-  () => {
-    window.alert("Folder selection will be connected to Tauri in issue #3.");
-  },
-);
+const selectFolderButton = document.querySelector<HTMLButtonElement>("#select-folder");
+const libraryStatus = document.querySelector<HTMLElement>("#library-status");
+const libraryPath = document.querySelector<HTMLElement>("#library-path");
+const clipCount = document.querySelector<HTMLElement>("#clip-count");
+
+selectFolderButton?.addEventListener("click", async () => {
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    title: "Select footage folder",
+  });
+
+  if (typeof selected !== "string") {
+    return;
+  }
+
+  selectFolderButton.disabled = true;
+  if (libraryStatus) libraryStatus.textContent = "Scanning folder…";
+  if (libraryPath) libraryPath.textContent = selected;
+
+  try {
+    const report = await invoke<ScanReport>("scan_media_folder", { path: selected });
+    if (libraryStatus) {
+      libraryStatus.textContent = report.warnings.length === 0 ? "Folder indexed" : "Folder indexed with warnings";
+    }
+    if (clipCount) clipCount.textContent = `${report.files.length} clips`;
+  } catch (error) {
+    if (libraryStatus) libraryStatus.textContent = "Scan failed";
+    if (libraryPath) libraryPath.textContent = String(error);
+  } finally {
+    selectFolderButton.disabled = false;
+  }
+});
 
 document.querySelector<HTMLButtonElement>("#learn-more")?.addEventListener(
   "click",

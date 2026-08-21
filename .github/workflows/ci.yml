@@ -39,3 +39,39 @@ jobs:
 
       - name: Run repository tests
         run: python -m unittest discover -s tests -p "test_*.py"
+
+  desktop:
+    name: Desktop checks
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build TypeScript frontend
+        working-directory: desktop
+        run: npm run build
+
+      - name: Check Rust formatting
+        working-directory: desktop
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Run Rust tests
+        working-directory: desktop
+        run: cargo test --manifest-path src-tauri/Cargo.toml
