@@ -80,7 +80,11 @@ AI provider and can consume time or API credits. Configure it in the app:
 1. Open **AI connection** in the left sidebar.
 2. Choose **Local (Ollama)**, **OpenAI (ChatGPT API)**, or **Google Gemini API**.
 3. Enter the API key for a cloud provider, check the model names and base URL,
-   then press **Test connection** and **Save settings**.
+   then press **Test connection** and **Save settings**. OpenAI users can choose
+   the fast GPT-5.6 Luna preset or the more detailed GPT-5.6 Terra preset.
+   **Library context** can optionally list the project, franchise, setting, or
+   possible fictional characters to help with an unfamiliar collection; it is
+   treated as a hint and not as visual proof.
 4. Select and index a folder, press **Analyze with AI**, and search with queries
    such as `Fortnite kill`, `enemy elimination`, or `victory`.
 
@@ -93,7 +97,9 @@ the selected vision and embedding models available (for example `gemma4` and
 `embeddinggemma`). The default endpoint is `http://127.0.0.1:11434`.
 
 FFmpeg is resolved from the optional path in **AI connection**, then from the
-`MEDIAINDEX_FFMPEG_PATH` environment variable, then from `PATH`. Frame
+`MEDIAINDEX_FFMPEG_PATH` environment variable, then from `PATH`. FFmpeg and
+FFprobe child processes are created without a console window in Windows release
+builds. Frame
 extraction runs once per clip and embeddings are sent in batches. Cloud vision
 requests contain up to eight sampled frames, sampled JPEGs are capped at 1280
 pixels wide, and MediaIndex analyzes up to two clips concurrently. These bounds
@@ -104,10 +110,13 @@ for short, fast events such as a kill feed, set **Every (s)** to `2` or `1`.
 The 0–100% progress bar shows the current phase and clip while analysis is
 running.
 
-The vision result stores readable HUD/kill-feed/subtitle text together with the
-description. AI Search combines embedding similarity with exact/inflected
-keyword matching, so `kill`, `killed`, `elimination`, and `eliminated` can match
-the same indexed moment when the text or event was captured. If the provider or
+The vision result stores entities, actions, setting, situation, readable
+on-screen text, and a general scene description. It covers ordinary footage,
+films, events, tutorials, travel, sports, performances, and gameplay rather than
+depending on game-specific labels. AI Search combines embedding similarity with
+exact/inflected keyword matching. Adjacent hits from the same video within
+three seconds are presented as one best-scoring moment, so one event does not
+appear separately at seconds 4, 5, and 6. If the provider, vision model, or
 embedding model changes, run **Analyze with AI** again; incompatible provider
 annotations are intentionally kept separate.
 
@@ -117,7 +126,8 @@ responsive while FFmpeg and network requests are in progress.
 The environment variables remain available for automation and older launch
 scripts (`MEDIAINDEX_AI_PROVIDER`, provider-specific API keys, model names,
 base URLs, `MEDIAINDEX_FFMPEG_PATH`, `MEDIAINDEX_AI_SAMPLE_SECONDS`, and
-`MEDIAINDEX_AI_MAX_FRAMES`). The in-app configuration takes precedence.
+`MEDIAINDEX_AI_MAX_FRAMES`). Optional collection context can be supplied with
+`MEDIAINDEX_AI_CONTEXT`. The in-app configuration takes precedence.
 
 Only sampled frames and their text/embedding results are sent for analysis; the
 original video is not uploaded as a whole. Deterministic local search remains

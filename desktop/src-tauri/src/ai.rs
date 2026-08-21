@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::metadata::MediaMetadata;
 
-const DEFAULT_OPENAI_VISION_MODEL: &str = "gpt-4.1-mini";
+const DEFAULT_OPENAI_VISION_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_OPENAI_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_GEMINI_VISION_MODEL: &str = "gemini-3.6-flash";
@@ -60,6 +60,7 @@ pub struct AiRequestConfig {
     pub ffmpeg_path: Option<String>,
     pub sample_interval_seconds: Option<u64>,
     pub max_frames: Option<u64>,
+    pub context_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -119,6 +120,7 @@ pub struct AiSettings {
     ffmpeg_executable: PathBuf,
     sample_interval_ms: u64,
     max_frames_per_file: usize,
+    context_hint: Option<String>,
 }
 
 impl AiSettings {
@@ -209,6 +211,8 @@ impl AiSettings {
             .or_else(|| std::env::var_os("MEDIAINDEX_FFMPEG_PATH").map(PathBuf::from))
             .filter(|path| path.is_file())
             .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+        let context_hint =
+            non_empty(request.context_hint).or_else(|| env_non_empty("MEDIAINDEX_AI_CONTEXT"));
 
         Ok(Self {
             provider,
@@ -219,6 +223,7 @@ impl AiSettings {
             ffmpeg_executable,
             sample_interval_ms: sample_interval_seconds.saturating_mul(1_000),
             max_frames_per_file,
+            context_hint,
         })
     }
 
@@ -321,8 +326,12 @@ where
         .iter()
         .map(|(_, analysis)| {
             format!(
-                "{}\nLabels: {}\nOn-screen text: {}",
+                "{}\nEntities: {}\nActions: {}\nSetting: {}\nSituation: {}\nLabels: {}\nOn-screen text: {}",
                 analysis.description,
+                analysis.entities.join(", "),
+                analysis.actions.join(", "),
+                analysis.setting.as_deref().unwrap_or_default(),
+                analysis.situation.as_deref().unwrap_or_default(),
                 analysis.labels.join(", "),
                 analysis.visible_text.join(" | ")
             )
@@ -345,7 +354,19 @@ where
     let mut annotations = Vec::with_capacity(analyses.len());
     for ((timestamp_ms, analysis), embedding) in analyses.into_iter().zip(embeddings) {
         let visible_text = normalize_labels(analysis.visible_text);
+        let entities = normalize_labels(analysis.entities);
+        let actions = normalize_labels(analysis.actions);
+        let setting = normalize_optional_text(analysis.setting);
+        let situation = normalize_optional_text(analysis.situation);
         let mut labels = normalize_labels(analysis.labels);
+        labels.extend(entities.iter().map(|entity| format!("entity: {entity}")));
+        labels.extend(actions.iter().map(|action| format!("action: {action}")));
+        if let Some(setting) = &setting {
+            labels.push(format!("setting: {setting}"));
+        }
+        if let Some(situation) = &situation {
+            labels.push(format!("situation: {situation}"));
+        }
         labels.extend(
             visible_text
                 .iter()
@@ -353,14 +374,26 @@ where
         );
         labels.sort();
         labels.dedup();
-        let description = if visible_text.is_empty() {
+        let mut details = Vec::new();
+        if !entities.is_empty() {
+            details.push(format!("Entities: {}", entities.join(", ")));
+        }
+        if !actions.is_empty() {
+            details.push(format!("Actions: {}", actions.join(", ")));
+        }
+        if let Some(setting) = setting {
+            details.push(format!("Setting: {setting}"));
+        }
+        if let Some(situation) = situation {
+            details.push(format!("Situation: {situation}"));
+        }
+        if !visible_text.is_empty() {
+            details.push(format!("On-screen text: {}", visible_text.join(" | ")));
+        }
+        let description = if details.is_empty() {
             analysis.description
         } else {
-            format!(
-                "{} On-screen text: {}",
-                analysis.description,
-                visible_text.join(" | ")
-            )
+            format!("{} {}", analysis.description, details.join(". "))
         };
         annotations.push(AiAnnotation {
             timestamp_ms,
@@ -559,6 +592,14 @@ struct FrameAnalysis {
     labels: Vec<String>,
     #[serde(default)]
     visible_text: Vec<String>,
+    #[serde(default)]
+    entities: Vec<String>,
+    #[serde(default)]
+    actions: Vec<String>,
+    #[serde(default)]
+    setting: Option<String>,
+    #[serde(default)]
+    situation: Option<String>,
     confidence: Option<f32>,
 }
 
@@ -587,8 +628,16 @@ fn describe_frames(
         .map(|(timestamp_ms, _)| format!("{timestamp_ms} ms"))
         .collect::<Vec<_>>()
         .join(", ");
+    let library_context = settings.context_hint.as_deref().map_or_else(
+        || "No user-provided library context is available.".to_owned(),
+        |context| {
+            format!(
+                "User-provided library context (candidate information, not proof): {context}. Apply a supplied name or circumstance only when the frame is visually consistent with it."
+            )
+        },
+    );
     let prompt = format!(
-        "Analyze these video frames in order for a searchable local video library. The frame timestamps, in order, are: {timestamps}. Return only a JSON object with a frames array containing exactly one object per input frame, in the same order. Each frame object must have description (short factual sentence), labels (lowercase array of useful visual/event labels), visible_text (array of exact readable words or short phrases from HUD, kill feed, subtitles, menus, or score overlays), and confidence (number from 0 to 1). Inspect the whole frame carefully, especially small UI text. Include gameplay context and visible events such as elimination, eliminated, kill, killed, enemy defeated, player knocked, fight, building, item pickup, or victory only when supported by the frame. Add useful synonyms when the frame supports them, but never invent an event or text that is not visible. If no text is readable in a frame, return an empty visible_text array for that frame."
+        "Analyze these ordered video frames for a general-purpose searchable media library. The frame timestamps, in order, are: {timestamps}. {library_context} Use adjacent frames as temporal context so recurring subjects stay consistent and an ongoing action or situation is understood as a sequence. Return only a JSON object with a frames array containing exactly one object per input frame, in the same order. Each frame object must contain: description (one concise factual sentence covering who or what is visible, what is happening, and the important context); entities (lowercase array of confidently recognizable fictional characters, game characters, creatures, teams, franchises, products, vehicles, landmarks, or named objects); actions (lowercase array of concrete actions and interactions); setting (short lowercase location or environment, or an empty string); situation (short lowercase event or circumstance such as conversation, ceremony, chase, battle, tutorial, performance, sports play, accident, travel, gameplay event, or an empty string); labels (lowercase array covering useful subjects, objects, genre, visual style, mood, shot type, and concepts); visible_text (array of exact readable words or short phrases from subtitles, signs, titles, HUD, menus, score overlays, or logos); and confidence (number from 0 to 1). Name a well-known fictional character or franchise only when distinctive visual evidence supports it; otherwise describe appearance and role precisely. Never identify a real person from their face alone—use a real person's name only when readable on-screen text establishes it. Inspect the full frame, including background details and small UI text. Add useful search synonyms only when supported by the image. Do not invent identities, actions, relationships, locations, events, or text. Use empty arrays or strings when evidence is insufficient."
     );
     let text = match settings.provider {
         AiProvider::OpenAI => describe_openai(client, &encoded_frames, &prompt, settings)?,
@@ -613,68 +662,97 @@ fn describe_openai(
         })
     }));
     let frame_count = encoded_frames.len();
-    let output_token_limit = (frame_count * 256).clamp(1_024, 8_192);
+    let output_token_limit = (frame_count * 320).clamp(1_280, 8_192);
+    let mut request = json!({
+        "model": settings.vision_model,
+        "store": false,
+        "max_output_tokens": output_token_limit,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "mediaindex_frame_analyses",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "frames": {
+                            "type": "array",
+                            "minItems": frame_count,
+                            "maxItems": frame_count,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "description": {"type": "string"},
+                                    "labels": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    },
+                                    "visible_text": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    },
+                                    "entities": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    },
+                                    "actions": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    },
+                                    "setting": {"type": "string"},
+                                    "situation": {"type": "string"},
+                                    "confidence": {
+                                        "type": "number",
+                                        "minimum": 0,
+                                        "maximum": 1
+                                    }
+                                },
+                                "required": [
+                                    "description",
+                                    "labels",
+                                    "visible_text",
+                                    "entities",
+                                    "actions",
+                                    "setting",
+                                    "situation",
+                                    "confidence"
+                                ],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["frames"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "input": [{
+            "role": "user",
+            "content": content
+        }]
+    });
+    if let Some(effort) = openai_reasoning_effort(&settings.vision_model) {
+        request["reasoning"] = json!({"effort": effort});
+    }
     let response = client
         .post(format!("{}/responses", settings.base_url))
         .bearer_auth(&settings.api_key)
-        .json(&json!({
-            "model": settings.vision_model,
-            "store": false,
-            "max_output_tokens": output_token_limit,
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "mediaindex_frame_analyses",
-                    "strict": true,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "frames": {
-                                "type": "array",
-                                "minItems": frame_count,
-                                "maxItems": frame_count,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "description": {"type": "string"},
-                                        "labels": {
-                                            "type": "array",
-                                            "items": {"type": "string"}
-                                        },
-                                        "visible_text": {
-                                            "type": "array",
-                                            "items": {"type": "string"}
-                                        },
-                                        "confidence": {
-                                            "type": "number",
-                                            "minimum": 0,
-                                            "maximum": 1
-                                        }
-                                    },
-                                    "required": [
-                                        "description",
-                                        "labels",
-                                        "visible_text",
-                                        "confidence"
-                                    ],
-                                    "additionalProperties": false
-                                }
-                            }
-                        },
-                        "required": ["frames"],
-                        "additionalProperties": false
-                    }
-                }
-            },
-            "input": [{
-                "role": "user",
-                "content": content
-            }]
-        }))
+        .json(&request)
         .send()
         .map_err(|error| request_failure("OpenAI vision", &error))?;
     let body = read_json_response(response, "OpenAI vision")?;
     response_text(&body).ok_or_else(|| "OpenAI vision returned no output text".to_owned())
+}
+
+fn openai_reasoning_effort(model: &str) -> Option<&'static str> {
+    let model = model.to_ascii_lowercase();
+    if model.starts_with("gpt-5.6-terra") {
+        Some("low")
+    } else if model.starts_with("gpt-5.6") {
+        Some("none")
+    } else {
+        None
+    }
 }
 
 fn describe_gemini(
@@ -760,6 +838,10 @@ fn normalize_frame_analysis(parsed: FrameAnalysis) -> Result<FrameAnalysis, Stri
         description: parsed.description.trim().to_owned(),
         labels: normalize_labels(parsed.labels),
         visible_text: normalize_labels(parsed.visible_text),
+        entities: normalize_labels(parsed.entities),
+        actions: normalize_labels(parsed.actions),
+        setting: normalize_optional_text(parsed.setting),
+        situation: normalize_optional_text(parsed.situation),
         confidence: parsed.confidence.map(|value| value.clamp(0.0, 1.0)),
     })
 }
@@ -1046,6 +1128,12 @@ fn normalize_labels(labels: Vec<String>) -> Vec<String> {
     normalized
 }
 
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1135,12 +1223,23 @@ mod tests {
                         .and_then(Value::as_u64),
                     Some(image_count as u64)
                 );
+                let required = request
+                    .pointer("/text/format/schema/properties/frames/items/required")
+                    .and_then(Value::as_array)
+                    .expect("vision schema should require searchable context fields");
+                for field in ["entities", "actions", "setting", "situation"] {
+                    assert!(required.iter().any(|value| value.as_str() == Some(field)));
+                }
                 let analyses = (0..image_count)
                     .map(|_| {
                         json!({
                             "description": "A Fortnite player eliminates an opponent",
                             "labels": ["fortnite", "kill", "elimination"],
                             "visible_text": ["ELIMINATED"],
+                            "entities": ["Fortnite player"],
+                            "actions": ["eliminating opponent"],
+                            "setting": "forest battlefield",
+                            "situation": "battle royale fight",
                             "confidence": 0.98
                         })
                     })
@@ -1250,14 +1349,18 @@ mod tests {
     #[test]
     fn parses_visible_screen_text_for_search() {
         let parsed = parse_frame_analyses(
-            r#"{"description":"A player wins a fight","labels":["Victory"],"visible_text":["ELIMINATED","Victory Royale"],"confidence":0.9}"#,
+            r#"{"description":"A masked hero swings between buildings","labels":["Superhero"],"visible_text":["NEW YORK"],"entities":["Spider-Man"],"actions":["Web swinging"],"setting":"New York skyline","situation":"Superhero chase","confidence":0.9}"#,
         )
         .expect("frame analysis should parse")
         .into_iter()
         .next()
         .expect("one frame should be returned");
 
-        assert_eq!(parsed.visible_text, vec!["eliminated", "victory royale"]);
+        assert_eq!(parsed.visible_text, vec!["new york"]);
+        assert_eq!(parsed.entities, vec!["spider-man"]);
+        assert_eq!(parsed.actions, vec!["web swinging"]);
+        assert_eq!(parsed.setting.as_deref(), Some("new york skyline"));
+        assert_eq!(parsed.situation.as_deref(), Some("superhero chase"));
     }
 
     #[test]
@@ -1275,13 +1378,32 @@ mod tests {
     }
 
     #[test]
+    fn uses_current_fast_openai_vision_defaults_without_hidden_reasoning() {
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::OpenAI),
+            api_key: Some("test-key".to_owned()),
+            ..Default::default()
+        }))
+        .expect("OpenAI settings should be valid");
+
+        assert_eq!(settings.vision_model, "gpt-5.6-luna");
+        assert_eq!(
+            openai_reasoning_effort(&settings.vision_model),
+            Some("none")
+        );
+        assert_eq!(openai_reasoning_effort("gpt-5.6-terra"), Some("low"));
+        assert_eq!(openai_reasoning_effort("gpt-4.1-mini"), None);
+    }
+
+    #[test]
     fn request_provider_and_models_override_environment_defaults() {
         let request: AiRequestConfig = serde_json::from_value(json!({
             "provider": "openai",
             "apiKey": "test-key",
             "visionModel": "vision-test",
             "embeddingModel": "embedding-test",
-            "baseUrl": "https://example.test/v1"
+            "baseUrl": "https://example.test/v1",
+            "contextHint": "Animated series; possible character: Nova"
         }))
         .expect("frontend configuration should deserialize");
         let settings = AiSettings::from_request(Some(request)).expect("request should win");
@@ -1290,6 +1412,10 @@ mod tests {
         assert_eq!(settings.vision_model, "vision-test");
         assert_eq!(settings.embedding_model, "embedding-test");
         assert_eq!(settings.base_url, "https://example.test/v1");
+        assert_eq!(
+            settings.context_hint.as_deref(),
+            Some("Animated series; possible character: Nova")
+        );
         assert_eq!(settings.parallel_file_limit(), 2);
         assert_eq!(settings.vision_batch_size(), 8);
         assert_eq!(
@@ -1333,6 +1459,12 @@ mod tests {
             annotation
                 .description
                 .contains("On-screen text: eliminated")
+                && annotation
+                    .labels
+                    .contains(&"entity: fortnite player".to_owned())
+                && annotation
+                    .labels
+                    .contains(&"action: eliminating opponent".to_owned())
                 && annotation
                     .labels
                     .contains(&"on-screen text: eliminated".to_owned())

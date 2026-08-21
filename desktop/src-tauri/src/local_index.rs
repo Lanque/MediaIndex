@@ -8,6 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
+const AI_RESULT_MERGE_WINDOW_MS: u64 = 3_000;
+
 const MIGRATION_1: &str = r#"
 CREATE TABLE media_assets (
     content_hash TEXT PRIMARY KEY,
@@ -462,7 +464,7 @@ impl SqliteIndex {
             ))
         })?;
 
-        let mut results = rows
+        let mut ranked = rows
             .filter_map(Result::ok)
             .filter_map(
                 |(
@@ -488,14 +490,29 @@ impl SqliteIndex {
                 },
             )
             .collect::<Vec<_>>();
-        results.sort_by(|left, right| {
+        ranked.sort_by(|left, right| {
             right
                 .score
                 .total_cmp(&left.score)
                 .then_with(|| path_key(&left.path).cmp(&path_key(&right.path)))
                 .then_with(|| left.timestamp_ms.cmp(&right.timestamp_ms))
         });
-        results.truncate(limit);
+
+        let mut results: Vec<AiSearchResult> = Vec::with_capacity(limit.min(ranked.len()));
+        for candidate in ranked {
+            let repeats_existing_moment = results.iter().any(|existing| {
+                existing.content_hash == candidate.content_hash
+                    && existing.timestamp_ms.abs_diff(candidate.timestamp_ms)
+                        <= AI_RESULT_MERGE_WINDOW_MS
+            });
+            if repeats_existing_moment {
+                continue;
+            }
+            results.push(candidate);
+            if results.len() == limit {
+                break;
+            }
+        }
         Ok(results)
     }
 
@@ -1092,6 +1109,48 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].score > 0.99);
+    }
+
+    #[test]
+    fn coalesces_adjacent_ai_timestamps_into_one_search_moment() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/scene.mp4", "hash-scene")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        let annotation = |timestamp_ms| AiAnnotation {
+            timestamp_ms,
+            description: "A character opens the same door".to_owned(),
+            labels: vec!["character".to_owned(), "opening door".to_owned()],
+            embedding: vec![1.0, 0.0],
+            confidence: Some(0.9),
+            model: "fixture".to_owned(),
+        };
+        index
+            .replace_ai_annotations(
+                "hash-scene",
+                &[
+                    annotation(4_000),
+                    annotation(5_000),
+                    annotation(6_000),
+                    annotation(10_000),
+                ],
+            )
+            .expect("annotations should persist");
+
+        let results = index
+            .search_ai("opening door", &[1.0, 0.0], 10, Some("fixture"))
+            .expect("AI search should work");
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.timestamp_ms)
+                .collect::<Vec<_>>(),
+            vec![4_000, 10_000]
+        );
     }
 
     #[test]
