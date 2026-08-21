@@ -64,6 +64,7 @@ The desktop shell now includes the first local scanner slice from issue [#3](htt
 - cached hashes and FFprobe metadata on repeat scans when path, size, and modification time are unchanged;
 - a 500-result render cap so a large search result cannot freeze the desktop window;
 - explicit AI analysis of sampled frames with timestamped descriptions and embeddings for natural-language search.
+- restoration of the last successfully indexed library after an app restart, so existing clips and AI analysis remain immediately available.
 
 The first scan hashes each discovered video locally so moved and modified files
 can be detected reliably. Large footage folders can therefore take time during

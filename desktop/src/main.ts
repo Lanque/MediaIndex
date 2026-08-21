@@ -305,6 +305,7 @@ let pendingPreviewTimestamp = 0;
 let lastAiProgressPercent = 0;
 
 const AI_SETTINGS_STORAGE_KEY = "mediaindex.ai.settings.v1";
+const LIBRARY_PATH_STORAGE_KEY = "mediaindex.library.path.v1";
 
 function aiDefaults(provider: AiProvider): AiConfig {
   if (provider === "openai") {
@@ -424,6 +425,26 @@ function saveAiConfig(): AiConfig {
 }
 
 loadAiConfig();
+
+async function restoreSelectedLibrary(): Promise<void> {
+  try {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let savedPath = localStorage.getItem(LIBRARY_PATH_STORAGE_KEY)?.trim() ?? "";
+    if (!savedPath) {
+      savedPath = (await invoke<string | null>("get_indexed_library_path"))?.trim() ?? "";
+      if (savedPath) localStorage.setItem(LIBRARY_PATH_STORAGE_KEY, savedPath);
+    }
+    if (!savedPath) return;
+    selectedLibraryPath = savedPath;
+    if (analyzeAiButton) analyzeAiButton.disabled = false;
+    if (libraryStatus) libraryStatus.textContent = "Restoring saved library…";
+    if (libraryPath) libraryPath.textContent = savedPath;
+    void searchLibrary();
+  } catch (error) {
+    if (libraryStatus) libraryStatus.textContent = "Could not restore saved library";
+    if (libraryPath) libraryPath.textContent = conciseMessage(error);
+  }
+}
 
 function showAiProgress(percent: number, label: string, isError = false): void {
   const safePercent = Math.max(0, Math.min(100, Math.round(percent)));
@@ -623,6 +644,7 @@ async function searchLibrary(trigger?: HTMLButtonElement): Promise<void> {
     renderResults(results);
     if (clipCount) clipCount.textContent = `${results.length} matches`;
     if (libraryStatus) libraryStatus.textContent = `${results.length} matching clips`;
+    if (libraryPath && selectedLibraryPath) libraryPath.textContent = selectedLibraryPath;
   } catch (error) {
     if (libraryStatus) libraryStatus.textContent = "Search failed";
     if (libraryPath) libraryPath.textContent = String(error);
@@ -783,6 +805,11 @@ selectFolderButton?.addEventListener("click", async () => {
       libraryStatus.textContent = report.warnings.length === 0 ? "Folder indexed" : "Folder indexed with warnings";
     }
     if (clipCount) clipCount.textContent = `${report.active_file_count} clips`;
+    try {
+      localStorage.setItem(LIBRARY_PATH_STORAGE_KEY, selected);
+    } catch (error) {
+      if (libraryPath) libraryPath.textContent = `Folder indexed · ${conciseMessage(error)}`;
+    }
     await searchLibrary();
   } catch (error) {
     if (libraryStatus) libraryStatus.textContent = "Scan failed";
@@ -817,6 +844,8 @@ document.querySelector<HTMLButtonElement>("#learn-more")?.addEventListener(
     window.alert("See docs/project-plan.md for the current MVP scope.");
   },
 );
+
+void restoreSelectedLibrary();
 
 closePreviewButton?.addEventListener("click", closePreview);
 previewDialog?.addEventListener("click", (event) => {
