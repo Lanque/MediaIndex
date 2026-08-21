@@ -400,8 +400,10 @@ async function searchAiLibrary(): Promise<void> {
       ? "AI matches are timestamped; Preview opens at the matching moment."
       : "No AI matches. Analyze the selected folder first or try another description.";
   } catch (error) {
-    if (aiSearchStatus) aiSearchStatus.textContent = String(error);
+    const message = String(error);
+    if (aiSearchStatus) aiSearchStatus.textContent = message;
     if (libraryStatus) libraryStatus.textContent = "AI search failed";
+    if (libraryPath) libraryPath.textContent = message;
   } finally {
     if (aiSearchButton) {
       aiSearchButton.disabled = false;
