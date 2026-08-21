@@ -52,24 +52,33 @@ AI search is a separate, explicit workflow:
 1. Open **AI connection** and choose **Local (Ollama)**, **OpenAI (ChatGPT API)**,
    or **Google Gemini API**. Add the cloud API key when needed, verify the
    models/base URL, press **Test connection**, and save the settings. For
-   OpenAI, choose GPT-5.6 Luna for faster high-volume analysis or GPT-5.6 Terra
-   when recognition detail is more important than speed and cost.
+   OpenAI, choose GPT-5.6 Luna as the budget default or GPT-5.6 Terra only when
+   recognition detail is worth roughly ten times Luna's model token price; use
+   the [official model catalog](https://developers.openai.com/api/docs/models)
+   as the source for current pricing.
    **Library context** is optional: use it to list a project/franchise, setting,
    or possible fictional characters for an unfamiliar collection. The model is
    instructed to use this only when it agrees with the visible evidence.
 2. Select a footage folder and wait for deterministic indexing to finish.
 3. Press **Analyze with AI**. MediaIndex samples frames, stores descriptions
-   and embeddings locally, and reports any per-file failures.
+   and embeddings locally, and reports any per-file failures. Clips already
+   analyzed with the selected provider/models are skipped by default so repeat
+   clicks do not spend credits again. **Reanalyze existing clips** is an
+   explicit one-run override.
 4. Enter a natural-language query in the **AI Search** field, for example
    `Fortnite kill`, `enemy elimination`, or `player victory`.
 
 AI results are ranked by embedding similarity and include the matching clip
 timestamp. Adjacent annotations from the same video within three seconds are
 coalesced after ranking, retaining the best-scoring timestamp for that event.
-Results are displayed in collapsible video groups: videos remain ordered by
-their best match, while each video's matching moments are ordered by timestamp.
-Press **Preview** to open the clip at that timestamp. The default
-sampling interval is five seconds with a maximum of 120 frames per file; use
+Results are displayed as visual cards ordered by the best match for each video.
+FFmpeg generates and caches a local thumbnail for the best matching timestamp;
+clicking it opens Preview at that moment. Extra moments are kept in a compact
+chronological list. **Focused** mode is the default and applies an adaptive
+score window plus an eight-video/two-moment-per-video cap. **Balanced** and
+**Broad** intentionally show more exploratory matches. The default sampling
+interval is five seconds. New OpenAI settings use a maximum of 60 frames per
+file; other provider defaults remain 120. Use
 the values in **AI connection** to adjust the cost/coverage trade-off. The full
 original video is never uploaded as one file, but sampled frames are sent to the
 configured provider. MediaIndex extracts all sampled frames for one clip in a
@@ -99,4 +108,5 @@ remains interactive during long analyses.
 For **Local (Ollama)**, Ollama must be running at the configured base URL and
 the selected models must already be installed. For cloud providers, the app
 uses the API directly; a ChatGPT web subscription is not an API key. The API
-key is kept in local app storage and is not written to the repository.
+key is kept only for the current app session and is not written to the
+repository or persistent browser storage.

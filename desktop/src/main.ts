@@ -46,6 +46,7 @@ type SearchResult = {
 
 type AiIndexReport = {
   analyzed_file_count: number;
+  skipped_file_count: number;
   annotation_count: number;
   warnings: Array<{ path: string; message: string }>;
 };
@@ -60,6 +61,7 @@ type AiProgress = {
 };
 
 type AiProvider = "local" | "openai" | "gemini";
+type AiSearchFocus = "focused" | "balanced" | "broad";
 
 type AiConfig = {
   provider: AiProvider;
@@ -71,6 +73,7 @@ type AiConfig = {
   sampleIntervalSeconds: number;
   maxFrames: number;
   contextHint: string;
+  reanalyzeExisting: boolean;
 };
 
 type AiConnectionReport = {
@@ -146,7 +149,7 @@ app.innerHTML = `
             </div>
           </div>
         </div>
-        <details class="ai-settings" open>
+        <details class="ai-settings">
           <summary>AI connection</summary>
           <p class="settings-help">
             Choose local Ollama, OpenAI (ChatGPT API), or Gemini. Settings stay on this computer. Use Every (s) = 1–2 for short actions and fast scene changes.
@@ -168,10 +171,10 @@ app.innerHTML = `
             <label id="ai-openai-preset-label">OpenAI recognition preset
               <select id="ai-openai-preset" name="openai-preset">
                 <option value="custom">Current / custom model</option>
-                <option value="gpt-5.6-luna">Fast broad recognition · GPT-5.6 Luna</option>
-                <option value="gpt-5.6-terra">Detailed recognition · GPT-5.6 Terra</option>
+                <option value="gpt-5.6-luna">Budget default · GPT-5.6 Luna</option>
+                <option value="gpt-5.6-terra">Detailed (~10× token price) · GPT-5.6 Terra</option>
               </select>
-              <span class="field-help">Changing the vision model requires Analyze with AI again. Detailed recognition can cost more.</span>
+              <span class="field-help">Luna is the cost-sensitive default. Use Terra only for difficult footage; changing model requires analysis again.</span>
             </label>
             <label>Embedding model
               <input id="ai-embedding-model" name="embedding-model" placeholder="embeddinggemma" />
@@ -194,6 +197,10 @@ app.innerHTML = `
                 <input id="ai-max-frames" name="max-frames" min="1" type="number" />
               </label>
             </div>
+            <label class="checkbox-field">
+              <input id="ai-reanalyze-existing" name="reanalyze-existing" type="checkbox" />
+              Reanalyze existing clips <span class="optional-label">(uses API credits)</span>
+            </label>
             <div class="settings-actions">
               <button class="secondary-button" id="save-ai-settings" type="submit">Save settings</button>
               <button class="secondary-button" id="test-ai-connection" type="button">Test connection</button>
@@ -240,6 +247,11 @@ app.innerHTML = `
         </form>
         <form class="ai-search-form" id="ai-search-form">
           <input id="ai-search-input" name="ai-query" placeholder="AI search: character, action, setting, event, visible text" />
+          <select id="ai-search-focus" aria-label="AI search relevance">
+            <option value="focused">Focused</option>
+            <option value="balanced">Balanced</option>
+            <option value="broad">Broad</option>
+          </select>
           <button class="secondary-button" id="ai-search-submit" type="submit">AI Search</button>
         </form>
         <p class="search-status" id="ai-search-status" role="status"></p>
@@ -292,12 +304,14 @@ const aiFfmpegPath = document.querySelector<HTMLInputElement>("#ai-ffmpeg-path")
 const aiContextHint = document.querySelector<HTMLInputElement>("#ai-context-hint");
 const aiSampleSeconds = document.querySelector<HTMLInputElement>("#ai-sample-seconds");
 const aiMaxFrames = document.querySelector<HTMLInputElement>("#ai-max-frames");
+const aiReanalyzeExisting = document.querySelector<HTMLInputElement>("#ai-reanalyze-existing");
 const saveAiSettingsButton = document.querySelector<HTMLButtonElement>("#save-ai-settings");
 const testAiConnectionButton = document.querySelector<HTMLButtonElement>("#test-ai-connection");
 const aiConfigStatus = document.querySelector<HTMLElement>("#ai-config-status");
 const searchButton = document.querySelector<HTMLButtonElement>("#search-submit");
 const filterButton = document.querySelector<HTMLButtonElement>("#filter-submit");
 const aiSearchButton = document.querySelector<HTMLButtonElement>("#ai-search-submit");
+const aiSearchFocus = document.querySelector<HTMLSelectElement>("#ai-search-focus");
 const libraryStatus = document.querySelector<HTMLElement>("#library-status");
 const libraryPath = document.querySelector<HTMLElement>("#library-path");
 const analysisProgress = document.querySelector<HTMLElement>("#analysis-progress");
@@ -319,8 +333,11 @@ const closePreviewButton = document.querySelector<HTMLButtonElement>("#close-pre
 let selectedLibraryPath = "";
 let pendingPreviewTimestamp = 0;
 let lastAiProgressPercent = 0;
+let thumbnailGeneration = 0;
+const thumbnailCache = new Map<string, string>();
 
 const AI_SETTINGS_STORAGE_KEY = "mediaindex.ai.settings.v1";
+const AI_API_KEY_SESSION_STORAGE_KEY = "mediaindex.ai.api-key.session.v1";
 const LIBRARY_PATH_STORAGE_KEY = "mediaindex.library.path.v1";
 
 function aiDefaults(provider: AiProvider): AiConfig {
@@ -333,8 +350,9 @@ function aiDefaults(provider: AiProvider): AiConfig {
       baseUrl: "https://api.openai.com/v1",
       ffmpegPath: "",
       sampleIntervalSeconds: 5,
-      maxFrames: 120,
+      maxFrames: 60,
       contextHint: "",
+      reanalyzeExisting: false,
     };
   }
   if (provider === "gemini") {
@@ -348,6 +366,7 @@ function aiDefaults(provider: AiProvider): AiConfig {
       sampleIntervalSeconds: 5,
       maxFrames: 120,
       contextHint: "",
+      reanalyzeExisting: false,
     };
   }
   return {
@@ -360,6 +379,7 @@ function aiDefaults(provider: AiProvider): AiConfig {
     sampleIntervalSeconds: 5,
     maxFrames: 120,
     contextHint: "",
+    reanalyzeExisting: false,
   };
 }
 
@@ -374,8 +394,9 @@ function readAiConfig(): AiConfig {
     baseUrl: aiBaseUrl?.value.trim() || defaults.baseUrl,
     ffmpegPath: aiFfmpegPath?.value.trim() ?? "",
     sampleIntervalSeconds: Math.max(1, Number(aiSampleSeconds?.value ?? 5) || 5),
-    maxFrames: Math.max(1, Number(aiMaxFrames?.value ?? 120) || 120),
+    maxFrames: Math.max(1, Number(aiMaxFrames?.value ?? defaults.maxFrames) || defaults.maxFrames),
     contextHint: aiContextHint?.value.trim() ?? "",
+    reanalyzeExisting: aiReanalyzeExisting?.checked ?? false,
   };
 }
 
@@ -393,6 +414,7 @@ function applyAiConfig(config: AiConfig): void {
   if (aiSampleSeconds) aiSampleSeconds.value = String(config.sampleIntervalSeconds);
   if (aiMaxFrames) aiMaxFrames.value = String(config.maxFrames);
   if (aiContextHint) aiContextHint.value = config.contextHint;
+  if (aiReanalyzeExisting) aiReanalyzeExisting.checked = config.reanalyzeExisting;
   updateAiProviderFields();
 }
 
@@ -409,7 +431,7 @@ function updateAiProviderFields(): void {
   if (aiApiKeyLabel) aiApiKeyLabel.hidden = provider === "local";
   if (aiOpenAiPresetLabel) aiOpenAiPresetLabel.hidden = provider !== "openai";
   if (aiApiKey) {
-    aiApiKey.placeholder = provider === "local" ? "Not needed for Local (Ollama)" : "Stored only in this app";
+    aiApiKey.placeholder = provider === "local" ? "Not needed for Local (Ollama)" : "Kept until this app closes";
   }
   if (aiVisionModel) {
     aiVisionModel.placeholder = provider === "local" ? "gemma4" : provider === "gemini" ? "gemini-3.6-flash" : "gpt-5.6-luna";
@@ -434,10 +456,21 @@ function loadAiConfig(): void {
     const provider = saved?.provider === "openai" || saved?.provider === "gemini" || saved?.provider === "local"
       ? saved.provider
       : fallback.provider;
+    const legacyApiKey = typeof saved?.apiKey === "string" ? saved.apiKey : "";
+    const sessionApiKey = sessionStorage.getItem(AI_API_KEY_SESSION_STORAGE_KEY) ?? legacyApiKey;
+    if (legacyApiKey && !sessionStorage.getItem(AI_API_KEY_SESSION_STORAGE_KEY)) {
+      sessionStorage.setItem(AI_API_KEY_SESSION_STORAGE_KEY, legacyApiKey);
+    }
+    if (saved && "apiKey" in saved) {
+      const { apiKey: _removedApiKey, ...safeSettings } = saved;
+      localStorage.setItem(AI_SETTINGS_STORAGE_KEY, JSON.stringify(safeSettings));
+    }
     applyAiConfig({
       ...aiDefaults(provider),
       ...saved,
       provider,
+      apiKey: sessionApiKey,
+      reanalyzeExisting: false,
     });
   } catch {
     applyAiConfig(fallback);
@@ -447,8 +480,11 @@ function loadAiConfig(): void {
 function saveAiConfig(): AiConfig {
   const config = readAiConfig();
   try {
-    localStorage.setItem(AI_SETTINGS_STORAGE_KEY, JSON.stringify(config));
-    if (aiConfigStatus) aiConfigStatus.textContent = "AI settings saved locally.";
+    const { apiKey, reanalyzeExisting: _oneRunOverride, ...safeSettings } = config;
+    localStorage.setItem(AI_SETTINGS_STORAGE_KEY, JSON.stringify(safeSettings));
+    if (apiKey) sessionStorage.setItem(AI_API_KEY_SESSION_STORAGE_KEY, apiKey);
+    else sessionStorage.removeItem(AI_API_KEY_SESSION_STORAGE_KEY);
+    if (aiConfigStatus) aiConfigStatus.textContent = "Settings saved. API key is kept for this app session only.";
   } catch (error) {
     if (aiConfigStatus) aiConfigStatus.textContent = `Could not save AI settings: ${String(error)}`;
   }
@@ -604,7 +640,7 @@ function openPreview(path: string, name: string, timestampMs = 0): void {
   previewDialog.hidden = false;
 }
 
-function renderResultCard(result: SearchResult, index: number, grouped = false): string {
+function renderResultCard(result: SearchResult, index: number): string {
   const metadata = result.metadata;
   const details = result.ai_description
     ? `AI match ${Math.round((result.match_score ?? 0) * 100)}% · ${result.ai_description}`
@@ -613,14 +649,12 @@ function renderResultCard(result: SearchResult, index: number, grouped = false):
       : "Technical metadata unavailable";
   const status = result.available ? "Available" : "Unavailable — rescan or restore this path";
   const fileName = result.path.split(/[\\/]/).pop() ?? result.path;
-  const momentLabel = result.timestamp_ms == null ? "Matching moment" : `Moment @ ${formatDuration(result.timestamp_ms)}`;
-  const title = grouped ? momentLabel : fileName;
   const previewLabel = result.timestamp_ms ? `Preview @ ${formatDuration(result.timestamp_ms)}` : "Preview";
-  return `<article class="result-card ${grouped ? "result-card-grouped" : ""} ${result.available ? "" : "result-card-unavailable"}">
+  return `<article class="result-card ${result.available ? "" : "result-card-unavailable"}">
     <div>
       <p class="result-index">${String(index + 1).padStart(2, "0")}</p>
-      <h3>${escapeHtml(title)}</h3>
-      ${grouped ? "" : `<p>${escapeHtml(result.path)}</p>`}
+      <h3>${escapeHtml(fileName)}</h3>
+      <p>${escapeHtml(result.path)}</p>
       <span>${escapeHtml(details)} · ${escapeHtml(status)}</span>
     </div>
     <div class="result-actions">
@@ -639,40 +673,101 @@ function renderGroupedAiResults(results: SearchResult[]): string {
     groups.set(key, group);
   }
 
-  return Array.from(groups.values()).map((group, groupIndex) => {
-    const rankedFirst = group[0];
-    const fileName = rankedFirst.path.split(/[\\/]/).pop() ?? rankedFirst.path;
+  const groupedResults = Array.from(groups.values());
+  const topScore = groupedResults[0]?.[0]?.match_score ?? 0;
+  return groupedResults.map((group, groupIndex) => {
+    const bestMatch = group[0];
+    const fileName = bestMatch.path.split(/[\\/]/).pop() ?? bestMatch.path;
+    const parentFolder = bestMatch.path.split(/[\\/]/).slice(0, -1).pop() ?? "Local library";
     const moments = [...group].sort((left, right) =>
       (left.timestamp_ms ?? 0) - (right.timestamp_ms ?? 0)
     );
     const bestScore = Math.max(...group.map((result) => result.match_score ?? 0));
-    const momentCount = `${moments.length} ${moments.length === 1 ? "moment" : "moments"}`;
-    return `<details class="video-result-group" ${groupIndex === 0 ? "open" : ""}>
-      <summary>
-        <span class="video-folder-icon" aria-hidden="true"></span>
-        <span class="video-group-heading">
-          <strong>${escapeHtml(fileName)}</strong>
-          <small>${escapeHtml(rankedFirst.path)}</small>
-        </span>
-        <span class="video-group-count">${escapeHtml(momentCount)} · best ${Math.round(bestScore * 100)}%</span>
-      </summary>
-      <div class="video-group-results">
-        ${moments.map((result, index) => renderResultCard(result, index, true)).join("")}
+    const relevance = groupIndex === 0 ? "Top match" : bestScore >= topScore - 0.04 ? "Strong" : "Related";
+    const timestamp = bestMatch.timestamp_ms ?? 0;
+    const thumbnailKey = `${bestMatch.content_hash}:${timestamp}`;
+    const extraMoments = moments.length > 1
+      ? `<details class="video-moments">
+          <summary>${moments.length} matching moments</summary>
+          <div class="moment-list">
+            ${moments.map((moment) => `<button class="moment-row preview-result" type="button" data-name="${escapeHtml(fileName)}" data-path="${escapeHtml(moment.path)}" data-timestamp-ms="${moment.timestamp_ms ?? 0}" ${moment.available ? "" : "disabled"}>
+              <strong>${escapeHtml(formatDuration(moment.timestamp_ms))}</strong>
+              <span>${escapeHtml(moment.ai_description ?? "Matching scene")}</span>
+              <span aria-hidden="true">▶</span>
+            </button>`).join("")}
+          </div>
+        </details>`
+      : "";
+    return `<article class="video-result-card ${bestMatch.available ? "" : "result-card-unavailable"}">
+      <button class="video-thumbnail preview-result" type="button" data-name="${escapeHtml(fileName)}" data-path="${escapeHtml(bestMatch.path)}" data-timestamp-ms="${timestamp}" data-thumbnail-key="${escapeHtml(thumbnailKey)}" ${bestMatch.available ? "" : "disabled"} aria-label="Preview ${escapeHtml(fileName)} at ${escapeHtml(formatDuration(timestamp))}">
+        <img alt="" />
+        <span class="thumbnail-placeholder">Creating local thumbnail…</span>
+        <span class="thumbnail-play" aria-hidden="true">▶</span>
+        <span class="thumbnail-time">${escapeHtml(formatDuration(timestamp))}</span>
+        <span class="relevance-badge">${escapeHtml(relevance)}</span>
+      </button>
+      <div class="video-card-body">
+        <div class="video-card-heading">
+          <div>
+            <h3 title="${escapeHtml(fileName)}">${escapeHtml(fileName)}</h3>
+            <p>${escapeHtml(parentFolder)}</p>
+          </div>
+          <button class="icon-button open-result" type="button" data-path="${escapeHtml(bestMatch.path)}" ${bestMatch.available ? "" : "disabled"} aria-label="Open original ${escapeHtml(fileName)}">↗</button>
+        </div>
+        <p class="video-best-description">${escapeHtml(bestMatch.ai_description ?? "Matching scene")}</p>
+        ${extraMoments}
       </div>
-    </details>`;
+    </article>`;
   }).join("");
+}
+
+async function loadAiThumbnails(ffmpegPath: string): Promise<void> {
+  if (!resultList) return;
+  const generation = ++thumbnailGeneration;
+  const buttons = Array.from(resultList.querySelectorAll<HTMLButtonElement>(".video-thumbnail"));
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < buttons.length) {
+      const button = buttons[cursor++];
+      const key = button.dataset.thumbnailKey ?? "";
+      const image = button.querySelector<HTMLImageElement>("img");
+      const placeholder = button.querySelector<HTMLElement>(".thumbnail-placeholder");
+      if (!key || !image) continue;
+      try {
+        let dataUrl = thumbnailCache.get(key);
+        if (!dataUrl) {
+          dataUrl = await invoke<string>("get_ai_thumbnail", {
+            path: button.dataset.path ?? "",
+            timestampMs: Number(button.dataset.timestampMs ?? "0"),
+            ffmpegPath: ffmpegPath || null,
+          });
+          thumbnailCache.set(key, dataUrl);
+        }
+        if (generation !== thumbnailGeneration || !button.isConnected) return;
+        image.src = dataUrl;
+        button.classList.add("thumbnail-loaded");
+      } catch {
+        if (generation !== thumbnailGeneration || !button.isConnected) return;
+        button.classList.add("thumbnail-error");
+        if (placeholder) placeholder.textContent = "Preview image unavailable";
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, buttons.length) }, () => worker()));
 }
 
 function renderResults(results: SearchResult[], groupByVideo = false): void {
   if (!resultList || !emptyState) return;
   if (results.length === 0) {
     resultList.hidden = true;
+    resultList.classList.remove("ai-result-grid");
     if (resultsNote) resultsNote.hidden = true;
     emptyState.hidden = false;
     return;
   }
   emptyState.hidden = true;
   resultList.hidden = false;
+  resultList.classList.toggle("ai-result-grid", groupByVideo);
   const visibleResults = results.slice(0, MAX_RENDERED_RESULTS);
   if (resultsNote) {
     resultsNote.hidden = results.length <= MAX_RENDERED_RESULTS;
@@ -740,12 +835,13 @@ async function searchAiLibrary(): Promise<void> {
     aiSearchButton.textContent = "AI searching…";
   }
   const config = saveAiConfig();
+  const focus = (aiSearchFocus?.value as AiSearchFocus) || "focused";
   if (aiSearchStatus) {
     aiSearchStatus.textContent = `Using ${aiProviderLabel(config.provider)} · ${config.embeddingModel}. Comparing indexed visual moments…`;
   }
   if (libraryStatus) libraryStatus.textContent = "AI search in progress…";
   try {
-    const matches = await invoke<AiSearchResult[]>("search_ai", { query, config });
+    const matches = await invoke<AiSearchResult[]>("search_ai", { query, config, focus });
     const displayResults: SearchResult[] = matches.map((match) => ({
       path: match.path,
       content_hash: match.content_hash,
@@ -754,16 +850,17 @@ async function searchAiLibrary(): Promise<void> {
       status: "ACTIVE",
       available: match.available,
       timestamp_ms: match.timestamp_ms,
-      ai_description: `${match.description} · ${match.labels.join(", ")}`,
+      ai_description: match.description,
       match_score: match.score,
       metadata: null,
     }));
     renderResults(displayResults, true);
+    void loadAiThumbnails(config.ffmpegPath);
     const videoCount = new Set(matches.map((match) => match.content_hash)).size;
     if (clipCount) clipCount.textContent = `${videoCount} videos · ${matches.length} moments`;
     if (libraryStatus) libraryStatus.textContent = `${matches.length} AI moments in ${videoCount} videos for “${query}”`;
     if (aiSearchStatus) aiSearchStatus.textContent = matches.length
-      ? "AI moments are grouped by video and sorted by timestamp; Preview opens at the matching moment."
+      ? `${focus === "focused" ? "Focused" : focus === "balanced" ? "Balanced" : "Broad"} results · click a thumbnail to preview.`
       : "No AI matches. Analyze the selected folder first or try another description.";
   } catch (error) {
     const message = String(error);
@@ -791,26 +888,36 @@ async function analyzeLibraryWithAi(): Promise<void> {
     const report = await invoke<AiIndexReport>("analyze_media_folder", {
       path: selectedLibraryPath,
       config,
+      force: config.reanalyzeExisting,
     });
     const warningSuffix = report.warnings.length ? ` · ${report.warnings.length} warnings` : "";
     const warningDetails = summarizeAiWarnings(report.warnings);
     showAiProgress(100, report.warnings.length ? "Analysis complete with warnings" : "Analysis complete");
-    if (libraryStatus) libraryStatus.textContent = `AI indexed ${report.analyzed_file_count} clips${warningSuffix}`;
+    const skippedSuffix = report.skipped_file_count ? ` · ${report.skipped_file_count} already ready` : "";
+    if (libraryStatus) libraryStatus.textContent = `AI indexed ${report.analyzed_file_count} clips${skippedSuffix}${warningSuffix}`;
     if (libraryPath) {
-      libraryPath.textContent = warningDetails
-        ? `${report.annotation_count} timestamped visual moments stored locally · ${warningDetails}`
-        : `${report.annotation_count} timestamped visual moments stored locally`;
+      libraryPath.textContent = report.analyzed_file_count === 0 && report.skipped_file_count > 0
+        ? "Existing AI index kept · no API credits used"
+        : warningDetails
+          ? `${report.annotation_count} new visual moments stored locally · ${warningDetails}`
+          : `${report.annotation_count} new visual moments stored locally`;
     }
     if (aiSearchStatus) {
       aiSearchStatus.textContent = warningDetails
         ? `AI warnings: ${warningDetails}`
-        : "AI index ready. Try “Fortnite kill” or “enemy elimination”.";
+        : report.analyzed_file_count === 0 && report.skipped_file_count > 0
+          ? "No API work needed — every clip is already analyzed with this model."
+          : "AI index ready. Search for a person, action, place, event, or visible text.";
     }
   } catch (error) {
     if (libraryStatus) libraryStatus.textContent = "AI analysis failed";
     if (libraryPath) libraryPath.textContent = conciseMessage(error);
     showAiProgress(lastAiProgressPercent, "Analysis stopped", true);
   } finally {
+    if (config.reanalyzeExisting && aiReanalyzeExisting) {
+      aiReanalyzeExisting.checked = false;
+      saveAiConfig();
+    }
     analyzeAiButton.disabled = false;
     analyzeAiButton.textContent = originalLabel;
   }
@@ -851,8 +958,13 @@ aiVisionModel?.addEventListener("input", syncOpenAiPreset);
 aiOpenAiPreset?.addEventListener("change", () => {
   if (!aiVisionModel || !aiOpenAiPreset || aiOpenAiPreset.value === "custom") return;
   aiVisionModel.value = aiOpenAiPreset.value;
+  if (aiOpenAiPreset.value === "gpt-5.6-luna" && aiMaxFrames && Number(aiMaxFrames.value) > 60) {
+    aiMaxFrames.value = "60";
+  }
   if (aiConfigStatus) {
-    aiConfigStatus.textContent = `Selected ${aiOpenAiPreset.value}. Save settings and run Analyze with AI again.`;
+    aiConfigStatus.textContent = aiOpenAiPreset.value === "gpt-5.6-luna"
+      ? "Budget preset selected (up to 60 frames per video). Save settings; only missing clips are analyzed by default."
+      : "Detailed model selected. It costs about 10× Luna's model token price; enable reanalysis only when needed.";
   }
 });
 

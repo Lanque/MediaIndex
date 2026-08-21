@@ -81,16 +81,22 @@ AI provider and can consume time or API credits. Configure it in the app:
 2. Choose **Local (Ollama)**, **OpenAI (ChatGPT API)**, or **Google Gemini API**.
 3. Enter the API key for a cloud provider, check the model names and base URL,
    then press **Test connection** and **Save settings**. OpenAI users can choose
-   the fast GPT-5.6 Luna preset or the more detailed GPT-5.6 Terra preset.
+   the budget GPT-5.6 Luna preset or the more detailed GPT-5.6 Terra preset.
+   Luna is the default for cost-sensitive analysis; Terra is roughly ten times
+   Luna's model token price and should be reserved for difficult footage. See
+   the [official OpenAI model catalog](https://developers.openai.com/api/docs/models)
+   for current prices.
    **Library context** can optionally list the project, franchise, setting, or
    possible fictional characters to help with an unfamiliar collection; it is
    treated as a hint and not as visual proof.
 4. Select and index a folder, press **Analyze with AI**, and search with queries
    such as `Fortnite kill`, `enemy elimination`, or `victory`.
 
-Settings, including a cloud API key, are stored in this computer's local app
-storage and are not committed to the repository. **OpenAI (ChatGPT API)** means
-the OpenAI developer API, not the ChatGPT website subscription.
+Non-secret settings are stored in this computer's local app storage and are not
+committed to the repository. A cloud API key is kept only in the current app
+session; older persisted keys are removed from local storage when the updated
+app starts. **OpenAI (ChatGPT API)** means the OpenAI developer API, not the
+ChatGPT website subscription.
 
 For the local option, install and run [Ollama](https://ollama.com/), then make
 the selected vision and embedding models available (for example `gemma4` and
@@ -105,10 +111,17 @@ requests contain up to eight sampled frames, sampled JPEGs are capped at 1280
 pixels wide, and MediaIndex analyzes up to two clips concurrently. These bounds
 avoid oversized parallel uploads while retaining high-detail HUD analysis;
 local Ollama analysis stays sequential to protect local model resources.
-Sampling defaults to one frame per five seconds and at most 120 frames per file;
-for short, fast events such as a kill feed, set **Every (s)** to `2` or `1`.
+Sampling defaults to one frame per five seconds. New OpenAI configurations use
+a cost-conscious maximum of 60 frames per file; other provider defaults remain
+120. For short, fast events such as a kill feed, set **Every (s)** to `2` or `1`.
 The 0–100% progress bar shows the current phase and clip while analysis is
 running.
+
+**Analyze with AI** skips clips that already have annotations for the selected
+provider and models, preventing repeated button presses from spending credits
+again. Enable **Reanalyze existing clips** only for an intentional one-time
+refresh after changing sampling or library context; the checkbox resets after
+the run.
 
 The vision result stores entities, actions, setting, situation, readable
 on-screen text, and a general scene description. It covers ordinary footage,
@@ -117,8 +130,11 @@ depending on game-specific labels. AI Search combines embedding similarity with
 exact/inflected keyword matching. Adjacent hits from the same video within
 three seconds are presented as one best-scoring moment, so one event does not
 appear separately at seconds 4, 5, and 6. AI search results are shown in
-collapsible video groups: videos are ordered by their best match and each
-video's moments are ordered by timestamp. If the provider, vision model, or
+visual video cards with a locally generated best-moment thumbnail. Clicking the
+thumbnail starts Preview at that timestamp; additional moments remain in a
+compact chronological list. **Focused** relevance is the default and limits
+weak results and repeated moments; **Balanced** and **Broad** progressively
+expand discovery. If the provider, vision model, or
 embedding model changes, run **Analyze with AI** again; incompatible provider
 annotations are intentionally kept separate.
 

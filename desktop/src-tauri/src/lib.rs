@@ -3,6 +3,7 @@ pub mod local_index;
 pub mod metadata;
 pub mod scanner;
 
+use base64::Engine;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -111,37 +112,56 @@ async fn analyze_media_folder(
     app: tauri::AppHandle,
     path: String,
     config: Option<ai::AiRequestConfig>,
+    force: Option<bool>,
 ) -> Result<ai::AiIndexReport, String> {
-    tauri::async_runtime::spawn_blocking(move || analyze_media_folder_blocking(app, path, config))
-        .await
-        .map_err(|error| format!("AI analysis worker failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        analyze_media_folder_blocking(app, path, config, force.unwrap_or(false))
+    })
+    .await
+    .map_err(|error| format!("AI analysis worker failed: {error}"))?
 }
 
 fn analyze_media_folder_blocking(
     app: tauri::AppHandle,
     path: String,
     config: Option<ai::AiRequestConfig>,
+    force: bool,
 ) -> Result<ai::AiIndexReport, String> {
     let settings = ai::AiSettings::from_request(config)?;
     let mut index = open_local_index(&app)?;
     let root = Path::new(&path);
-    let files = index
+    let indexed_files = index
         .known_files()
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|file| Path::new(&file.path).starts_with(root))
         .collect::<Vec<_>>();
-    if files.is_empty() {
+    if indexed_files.is_empty() {
         return Err("No indexed active clips were found in the selected folder".to_owned());
+    }
+
+    let provider = settings.model_namespace();
+    let mut files = Vec::with_capacity(indexed_files.len());
+    let mut skipped_file_count = 0u64;
+    for file in indexed_files {
+        let already_analyzed = !force
+            && index
+                .has_ai_annotations_for_content_model(&file.content_hash, &provider)
+                .map_err(|error| error.to_string())?;
+        if already_analyzed {
+            skipped_file_count += 1;
+        } else {
+            files.push(file);
+        }
     }
 
     let mut report = ai::AiIndexReport {
         analyzed_file_count: 0,
+        skipped_file_count,
         annotation_count: 0,
         warnings: Vec::new(),
     };
     let total_files = files.len() as u64;
-    let provider = settings.model_namespace();
     emit_ai_progress(
         &app,
         0,
@@ -298,6 +318,7 @@ fn search_ai(
     app: tauri::AppHandle,
     query: String,
     config: Option<ai::AiRequestConfig>,
+    focus: Option<local_index::AiSearchFocus>,
 ) -> Result<Vec<local_index::AiSearchResult>, String> {
     let settings = ai::AiSettings::from_request(config)?;
     let model_namespace = settings.model_namespace();
@@ -313,8 +334,67 @@ fn search_ai(
     }
     let embedding = ai::embed_query(&query, &settings)?;
     index
-        .search_ai(&query, &embedding, 100, Some(&model_namespace))
+        .search_ai_with_focus(
+            &query,
+            &embedding,
+            100,
+            Some(&model_namespace),
+            focus.unwrap_or_default(),
+        )
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_ai_thumbnail(
+    app: tauri::AppHandle,
+    path: String,
+    timestamp_ms: u64,
+    ffmpeg_path: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        get_ai_thumbnail_blocking(app, path, timestamp_ms, ffmpeg_path)
+    })
+    .await
+    .map_err(|error| format!("thumbnail worker failed: {error}"))?
+}
+
+fn get_ai_thumbnail_blocking(
+    app: tauri::AppHandle,
+    path: String,
+    timestamp_ms: u64,
+    ffmpeg_path: Option<String>,
+) -> Result<String, String> {
+    let index = open_local_index(&app)?;
+    let indexed_file = index
+        .get_file(&path)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "The thumbnail clip is not in the active local index".to_owned())?;
+    if indexed_file.status != local_index::LocalFileStatus::Active || !Path::new(&path).is_file() {
+        return Err("The thumbnail clip is no longer available".to_owned());
+    }
+
+    let cache_directory = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("cannot determine thumbnail cache directory: {error}"))?
+        .join("thumbnails");
+    fs::create_dir_all(&cache_directory)
+        .map_err(|error| format!("cannot create thumbnail cache directory: {error}"))?;
+    let cache_path =
+        cache_directory.join(format!("{}-{timestamp_ms}.jpg", indexed_file.content_hash));
+    let thumbnail = match fs::read(&cache_path) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        _ => {
+            let executable = ai::resolve_ffmpeg_executable(ffmpeg_path);
+            let bytes = ai::extract_thumbnail(Path::new(&path), timestamp_ms, &executable)?;
+            let _ = fs::write(&cache_path, &bytes);
+            bytes
+        }
+    };
+    Ok(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(thumbnail)
+    ))
 }
 
 #[tauri::command]
@@ -369,6 +449,7 @@ pub fn run() {
             get_indexed_library_path,
             analyze_media_folder,
             search_ai,
+            get_ai_thumbnail,
             test_ai_connection,
             open_indexed_media_path
         ])
