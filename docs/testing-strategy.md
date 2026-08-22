@@ -24,6 +24,26 @@ Every pull request should run:
 
 The workflow is intentionally small while the repository is still a documentation-first scaffold. It should gain jobs rather than become a single opaque script.
 
+The current desktop job runs on Windows and verifies `npm ci`, the
+TypeScript/Vite build, Rust formatting, and the Rust test suite. This mirrors
+the supported desktop toolchain without requiring cloud services or media
+uploads. FFprobe parsing uses a small committed JSON fixture, while an
+unavailable FFprobe executable is tested as an actionable error state.
+The job also creates the production NSIS installer and uploads it as a
+short-lived workflow artifact, so packaging failures block the pull request.
+
+An opt-in real-media smoke test uses a local OpenAI HTTP stub, runs one real
+video through FFmpeg frame sampling, response parsing, embeddings, SQLite AI
+search, and local JPEG thumbnail extraction. Set `MEDIAINDEX_SMOKE_VIDEO` and
+run the ignored `analyzes_real_video_through_openai_response_pipeline` test;
+private footage and generated thumbnails must not be committed.
+
+Deterministic cancellation tests verify that concurrent AI runs are rejected,
+a stop request is observed before frame/API work begins, and the run lock is
+released after cancellation. Content-selection tests verify that duplicate paths
+with the same hash are analyzed once and files outside the selected root are
+excluded from the cloud preflight and run.
+
 ## Planned component checks
 
 | Component | Planned checks |
