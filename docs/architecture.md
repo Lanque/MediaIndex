@@ -48,6 +48,10 @@ incomplete so an interrupted hash cannot cause a false deletion. The concrete
 hashing and re-indexing policy is documented in
 [docs/local-index.md](local-index.md).
 
+The cloud database has a separate project-scoped model. Its shared contract is
+versioned under `shared/contracts/v1/`, and PostgreSQL row-level security checks
+the authenticated project owner through the transaction-local `app.user_id`.
+
 ## Synchronization
 
 Sync is explicit and incremental:

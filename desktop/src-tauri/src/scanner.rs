@@ -124,12 +124,20 @@ pub struct FileChange {
 }
 
 pub fn scan_folder(root: &Path, options: &ScanOptions) -> Result<ScanReport, ScanError> {
+    scan_folder_with_known_files(root, options, &HashMap::new())
+}
+
+pub fn scan_folder_with_known_files(
+    root: &Path,
+    options: &ScanOptions,
+    known_files: &HashMap<String, LocalFileRecord>,
+) -> Result<ScanReport, ScanError> {
     let metadata = fs::symlink_metadata(root).map_err(|error| ScanError::RootUnavailable {
         path: root.to_path_buf(),
         message: error.to_string(),
     })?;
 
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.is_dir() || is_link_or_reparse_point(&metadata) {
         return Err(ScanError::RootNotDirectory {
             path: root.to_path_buf(),
         });
@@ -137,7 +145,7 @@ pub fn scan_folder(root: &Path, options: &ScanOptions) -> Result<ScanReport, Sca
 
     let mut files = Vec::new();
     let mut warnings = Vec::new();
-    visit_directory(root, options, &mut files, &mut warnings);
+    visit_directory(root, options, known_files, &mut files, &mut warnings);
     files.sort_by(|left, right| path_key(&left.path).cmp(&path_key(&right.path)));
 
     Ok(ScanReport { files, warnings })
@@ -228,74 +236,117 @@ pub fn detect_changes(previous: &[LocalFileRecord], current: &[DiscoveredFile]) 
 fn visit_directory(
     directory: &Path,
     options: &ScanOptions,
+    known_files: &HashMap<String, LocalFileRecord>,
     files: &mut Vec<DiscoveredFile>,
     warnings: &mut Vec<ScanWarning>,
 ) {
-    let mut entries: Vec<_> = match fs::read_dir(directory) {
-        Ok(entries) => entries.filter_map(Result::ok).collect(),
-        Err(error) => {
-            warnings.push(ScanWarning {
-                path: display_path(directory),
-                message: format!("cannot read directory: {error}"),
-            });
-            return;
-        }
-    };
+    let mut pending_directories = vec![directory.to_path_buf()];
 
-    entries.sort_by(|left, right| {
-        path_key(&display_path(&left.path())).cmp(&path_key(&display_path(&right.path())))
-    });
-
-    for entry in entries {
-        let path = entry.path();
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
+    while let Some(directory) = pending_directories.pop() {
+        let mut entries: Vec<_> = match fs::read_dir(&directory) {
+            Ok(entries) => entries.filter_map(Result::ok).collect(),
             Err(error) => {
                 warnings.push(ScanWarning {
-                    path: display_path(&path),
-                    message: format!("cannot inspect entry: {error}"),
+                    path: display_path(&directory),
+                    message: format!("cannot read directory: {error}"),
                 });
                 continue;
             }
         };
 
-        if metadata.file_type().is_symlink() {
-            continue;
-        }
-
-        if metadata.is_dir() {
-            visit_directory(&path, options, files, warnings);
-            continue;
-        }
-
-        if !metadata.is_file() || !options.accepts(&path) {
-            continue;
-        }
-
-        let content_hash = match hash_file(&path) {
-            Ok(hash) => hash,
-            Err(error) => {
-                warnings.push(ScanWarning {
-                    path: display_path(&path),
-                    message: format!("cannot hash file: {error}"),
-                });
-                continue;
-            }
-        };
-
-        files.push(DiscoveredFile {
-            path: display_path(&path),
-            size_bytes: metadata.len(),
-            modified_unix_ms: modified_unix_ms(&metadata),
-            content_hash,
+        entries.sort_by(|left, right| {
+            path_key(&display_path(&left.path())).cmp(&path_key(&display_path(&right.path())))
         });
+
+        let mut child_directories = Vec::new();
+        for entry in entries {
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    warnings.push(ScanWarning {
+                        path: display_path(&path),
+                        message: format!("cannot inspect entry: {error}"),
+                    });
+                    continue;
+                }
+            };
+
+            if is_link_or_reparse_point(&metadata) {
+                continue;
+            }
+
+            if metadata.is_dir() {
+                child_directories.push(path);
+                continue;
+            }
+
+            if !metadata.is_file() || !options.accepts(&path) {
+                continue;
+            }
+
+            let path_string = display_path(&path);
+            let modified_unix_ms = modified_unix_ms(&metadata);
+            let content_hash = known_files
+                .get(&path_string)
+                .filter(|known| {
+                    known.size_bytes == metadata.len()
+                        && known.modified_unix_ms.is_some()
+                        && known.modified_unix_ms == modified_unix_ms
+                })
+                .map(|known| known.content_hash.clone())
+                .unwrap_or_else(|| match hash_file(&path) {
+                    Ok(hash) => hash,
+                    Err(error) => {
+                        warnings.push(ScanWarning {
+                            path: path_string.clone(),
+                            message: format!("cannot hash file: {error}"),
+                        });
+                        String::new()
+                    }
+                });
+
+            if content_hash.is_empty() {
+                continue;
+            }
+
+            files.push(DiscoveredFile {
+                path: path_string,
+                size_bytes: metadata.len(),
+                modified_unix_ms,
+                content_hash,
+            });
+        }
+
+        for child_directory in child_directories.into_iter().rev() {
+            pending_directories.push(child_directory);
+        }
+    }
+}
+
+fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
 fn hash_file(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; HASH_BUFFER_SIZE];
+    let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
 
     loop {
         let read = file.read(&mut buffer)?;
@@ -458,5 +509,30 @@ mod tests {
         let options = ScanOptions::with_extensions([".MP4", "mov"]);
         assert!(options.accepts(Path::new("clip.Mp4")));
         assert!(!options.accepts(Path::new("clip.mkv")));
+    }
+
+    #[test]
+    fn reuses_a_known_hash_when_file_identity_is_unchanged() {
+        let directory = TestDirectory::new("known-hash");
+        let path = directory.0.join("clip.mp4");
+        write(&path, b"content").expect("fixture should be written");
+        let metadata = fs::metadata(&path).expect("fixture metadata should be readable");
+        let path_string = display_path(&path);
+        let mut known_files = HashMap::new();
+        known_files.insert(
+            path_string.clone(),
+            LocalFileRecord {
+                path: path_string,
+                size_bytes: metadata.len(),
+                modified_unix_ms: modified_unix_ms(&metadata),
+                content_hash: "cached-hash".to_owned(),
+            },
+        );
+
+        let report =
+            scan_folder_with_known_files(&directory.0, &ScanOptions::default(), &known_files)
+                .expect("scan should succeed");
+
+        assert_eq!(report.files[0].content_hash, "cached-hash");
     }
 }
