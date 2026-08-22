@@ -22,6 +22,25 @@ local secret store. Production credentials belong in AWS Secrets Manager and
 are injected at runtime through least-privilege roles; they must not be placed
 in the desktop bundle, repository, logs, or fixtures.
 
+The desktop AI connection persists non-secret settings only. Cloud API keys
+are held in the current WebView session and legacy keys are removed from
+persistent local storage on startup. The backend never returns a key to search
+or thumbnail results.
+
+The production desktop WebView enforces a Content Security Policy that permits
+only bundled application resources, Tauri IPC, local asset-protocol video, and
+in-memory thumbnail images. The asset protocol starts with an empty filesystem
+scope. Before Preview receives a local URL, a Rust command confirms that the
+path is an active SQLite-indexed file, confirms it still exists, and authorizes
+only that file for the current process. System-player opening applies the same
+index and availability checks.
+
+Windows installers built locally or in pull-request CI are intentionally
+unsigned until the release owner provides an Authenticode certificate through
+the release environment. Certificate material and passwords must never be
+committed. Public distribution is gated on signing and verifying the final
+installer; unsigned artifacts remain test builds.
+
 ## Observability and failure behavior
 
 Structured events carry operation and job identifiers, while token-like fields
@@ -39,3 +58,27 @@ delivery, stale cursors, authorization failures, and worker crashes.
 - Cap queue batch size, retry count, and per-job processing time.
 - Require an explicit processing request before transcription, embeddings, or
   previews are created.
+
+## Desktop AI cost safeguards
+
+- GPT-5.6 Luna is the cost-sensitive OpenAI default; the substantially more
+  expensive Terra preset is labeled as an explicit detailed-analysis choice.
+- New OpenAI settings cap analysis at 60 sampled frames per video by default.
+- OpenAI and Gemini runs require confirmation after a local preflight reports
+  the unique content count and configured maximum sampled frames/vision
+  batches. Cancelling the dialog sends no provider requests.
+- Duplicate file paths that share a content hash are analyzed once, preventing
+  duplicate API spend for copied footage.
+- **Analyze with AI** skips content that already has annotations in the active
+  provider/model namespace. Reanalysis is a one-run checkbox that is never
+  persisted and resets after the run.
+- Only one AI analysis can run at a time. The stop control prevents additional
+  files and frame batches from starting, keeps completed clip annotations, and
+  lets a later run continue with missing clips. A cloud request already sent to
+  the provider may finish before cancellation takes effect.
+- Focused search limits low-ranking results, videos, and moments without making
+  another vision request. Query embeddings remain the only AI call during
+  search.
+- Best-moment thumbnails are extracted and cached locally with FFmpeg. The
+  thumbnail command accepts only active paths already present in the SQLite
+  index and never uploads the source frame.

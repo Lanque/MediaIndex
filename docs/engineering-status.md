@@ -18,16 +18,17 @@ of draft pull requests. The current implementation order is:
 | Documentation maintenance | #14 / this PR | in review |
 | First selected-media preview job | #30 / #32 | draft PR, local checks green |
 | FastAPI sync runtime | #31 / next PR | implementation in progress |
+| Desktop AI visual index and search | #38 / #39 | implementation and production-readiness fixes in review |
 
 ## Deliberate limitations
 
 - Pull requests remain drafts until the owner reviews and explicitly merges
   the stack. The intended merge order is the table order from local work
   through infrastructure.
-- GitHub main-branch protection is documented in
-  [docs/github-repository-settings.md](github-repository-settings.md), but the
-  private repository plan returned GitHub HTTP 403 because branch protection
-  requires GitHub Pro or a public repository.
+- GitHub main-branch protection was attempted, but the private repository plan
+  returned GitHub HTTP 403 because branch protection requires GitHub Pro or a
+  public repository. The repository remains configured through reviewed feature
+  branches and pull requests until that plan constraint changes.
 - Terraform CLI and a PostgreSQL server are not required for the default CI;
   static migration/infrastructure checks cover structure, while operators must
   run `terraform validate` and `psql`-based checks in their deployment

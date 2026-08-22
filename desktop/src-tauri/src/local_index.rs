@@ -1,3 +1,4 @@
+use crate::ai::AiAnnotation;
 use crate::metadata::MediaMetadata;
 use crate::scanner::{DiscoveredFile, ScanReport, ScanWarning};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -7,7 +8,11 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 1;
+const AI_RESULT_MERGE_WINDOW_MS: u64 = 3_000;
+const AI_FOCUSED_SCORE_WINDOW: f32 = 0.08;
+const AI_BALANCED_SCORE_WINDOW: f32 = 0.14;
+const AI_FOCUSED_SCORE_FLOOR: f32 = 0.46;
+const AI_BALANCED_SCORE_FLOOR: f32 = 0.36;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE media_assets (
@@ -30,6 +35,22 @@ CREATE TABLE local_files (
 
 CREATE INDEX local_files_content_hash_idx ON local_files(content_hash);
 CREATE INDEX local_files_status_idx ON local_files(status);
+"#;
+
+const MIGRATION_2: &str = r#"
+CREATE TABLE ai_annotations (
+    content_hash TEXT NOT NULL REFERENCES media_assets(content_hash),
+    timestamp_ms INTEGER NOT NULL,
+    description TEXT NOT NULL,
+    labels_json TEXT NOT NULL,
+    embedding_json TEXT NOT NULL,
+    confidence REAL,
+    model TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (content_hash, timestamp_ms, model)
+);
+
+CREATE INDEX ai_annotations_content_hash_idx ON ai_annotations(content_hash);
 "#;
 
 #[derive(Debug)]
@@ -150,6 +171,26 @@ pub struct SearchResult {
     pub status: LocalFileStatus,
     pub available: bool,
     pub metadata: Option<MediaMetadata>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AiSearchResult {
+    pub path: String,
+    pub content_hash: String,
+    pub timestamp_ms: u64,
+    pub score: f32,
+    pub description: String,
+    pub labels: Vec<String>,
+    pub available: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiSearchFocus {
+    #[default]
+    Focused,
+    Balanced,
+    Broad,
 }
 
 #[derive(Clone, Debug)]
@@ -342,6 +383,218 @@ impl SqliteIndex {
             .map_err(Into::into)
     }
 
+    pub fn replace_ai_annotations(
+        &mut self,
+        content_hash: &str,
+        annotations: &[AiAnnotation],
+    ) -> Result<(), IndexError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM ai_annotations WHERE content_hash = ?1",
+            params![content_hash],
+        )?;
+        for annotation in annotations {
+            transaction.execute(
+                "INSERT INTO ai_annotations(
+                    content_hash, timestamp_ms, description, labels_json,
+                    embedding_json, confidence, model
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    content_hash,
+                    annotation.timestamp_ms,
+                    annotation.description,
+                    serde_json::to_string(&annotation.labels)?,
+                    serde_json::to_string(&annotation.embedding)?,
+                    annotation.confidence,
+                    annotation.model,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn ai_annotation_count(&self) -> Result<u64, IndexError> {
+        Ok(self
+            .connection
+            .query_row("SELECT COUNT(*) FROM ai_annotations", [], |row| row.get(0))?)
+    }
+
+    pub fn ai_annotation_count_for_model(&self, model_namespace: &str) -> Result<u64, IndexError> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM ai_annotations WHERE model = ?1",
+            params![model_namespace],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn has_ai_annotations_for_content_model(
+        &self,
+        content_hash: &str,
+        model_namespace: &str,
+    ) -> Result<bool, IndexError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM ai_annotations
+                WHERE content_hash = ?1 AND model = ?2
+            )",
+            params![content_hash, model_namespace],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn search_ai(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        limit: usize,
+        model_namespace: Option<&str>,
+    ) -> Result<Vec<AiSearchResult>, IndexError> {
+        self.search_ai_with_focus(
+            query_text,
+            query_embedding,
+            limit,
+            model_namespace,
+            AiSearchFocus::Broad,
+        )
+    }
+
+    pub fn search_ai_with_focus(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        limit: usize,
+        model_namespace: Option<&str>,
+        focus: AiSearchFocus,
+    ) -> Result<Vec<AiSearchResult>, IndexError> {
+        let mut statement = self.connection.prepare(
+            "SELECT ai_annotations.timestamp_ms, ai_annotations.description,
+                    ai_annotations.labels_json, ai_annotations.embedding_json,
+                    local_files.path, local_files.content_hash, local_files.status
+             FROM ai_annotations
+             JOIN local_files ON local_files.content_hash = ai_annotations.content_hash
+             WHERE local_files.status = 'ACTIVE'
+               AND (?1 IS NULL OR ai_annotations.model = ?1)",
+        )?;
+        let rows = statement.query_map(params![model_namespace], |row| {
+            let timestamp_ms: u64 = row.get(0)?;
+            let description: String = row.get(1)?;
+            let labels: Vec<String> =
+                serde_json::from_str(&row.get::<_, String>(2)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            let embedding: Vec<f32> =
+                serde_json::from_str(&row.get::<_, String>(3)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            let path: String = row.get(4)?;
+            let content_hash: String = row.get(5)?;
+            let status: String = row.get(6)?;
+            Ok((
+                timestamp_ms,
+                description,
+                labels,
+                embedding,
+                path,
+                content_hash,
+                status,
+            ))
+        })?;
+
+        let mut ranked = rows
+            .filter_map(Result::ok)
+            .filter_map(
+                |(
+                    timestamp_ms,
+                    description,
+                    labels,
+                    stored_embedding,
+                    path,
+                    content_hash,
+                    status,
+                )| {
+                    let semantic_score = cosine_similarity(query_embedding, &stored_embedding)?;
+                    let keyword_score = lexical_relevance(query_text, &description, &labels);
+                    Some(AiSearchResult {
+                        timestamp_ms,
+                        score: (semantic_score * 0.70 + keyword_score * 0.30).max(0.0),
+                        description,
+                        labels,
+                        available: status == "ACTIVE" && Path::new(&path).is_file(),
+                        path,
+                        content_hash,
+                    })
+                },
+            )
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| path_key(&left.path).cmp(&path_key(&right.path)))
+                .then_with(|| left.timestamp_ms.cmp(&right.timestamp_ms))
+        });
+
+        let Some(top_score) = ranked.first().map(|result| result.score) else {
+            return Ok(Vec::new());
+        };
+        let (score_floor, max_videos, max_moments_per_video, result_limit) = match focus {
+            AiSearchFocus::Focused => (
+                (top_score - AI_FOCUSED_SCORE_WINDOW).max(AI_FOCUSED_SCORE_FLOOR),
+                8,
+                2,
+                limit.min(16),
+            ),
+            AiSearchFocus::Balanced => (
+                (top_score - AI_BALANCED_SCORE_WINDOW).max(AI_BALANCED_SCORE_FLOOR),
+                16,
+                3,
+                limit.min(48),
+            ),
+            AiSearchFocus::Broad => (0.0, usize::MAX, usize::MAX, limit),
+        };
+
+        let mut results: Vec<AiSearchResult> = Vec::with_capacity(result_limit.min(ranked.len()));
+        let mut video_counts = HashMap::<String, usize>::new();
+        for candidate in ranked {
+            if candidate.score < score_floor {
+                continue;
+            }
+            let repeats_existing_moment = results.iter().any(|existing| {
+                existing.content_hash == candidate.content_hash
+                    && existing.timestamp_ms.abs_diff(candidate.timestamp_ms)
+                        <= AI_RESULT_MERGE_WINDOW_MS
+            });
+            if repeats_existing_moment {
+                continue;
+            }
+            let is_new_video = !video_counts.contains_key(&candidate.content_hash);
+            if is_new_video && video_counts.len() == max_videos {
+                continue;
+            }
+            let video_count = video_counts
+                .entry(candidate.content_hash.clone())
+                .or_default();
+            if *video_count == max_moments_per_video {
+                continue;
+            }
+            *video_count += 1;
+            results.push(candidate);
+            if results.len() == result_limit {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
     pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>, IndexError> {
         let mut statement = self.connection.prepare(
             "SELECT local_files.path, local_files.content_hash, local_files.size_bytes,
@@ -392,22 +645,24 @@ impl SqliteIndex {
             );",
         )?;
 
-        let applied: Option<i64> = connection
-            .query_row(
-                "SELECT version FROM schema_migrations WHERE version = ?1",
-                params![SCHEMA_VERSION],
-                |row| row.get(0),
-            )
-            .optional()?;
+        for (version, migration) in [(1_i64, MIGRATION_1), (2_i64, MIGRATION_2)] {
+            let applied: Option<i64> = connection
+                .query_row(
+                    "SELECT version FROM schema_migrations WHERE version = ?1",
+                    params![version],
+                    |row| row.get(0),
+                )
+                .optional()?;
 
-        if applied.is_none() {
-            let transaction = connection.unchecked_transaction()?;
-            transaction.execute_batch(MIGRATION_1)?;
-            transaction.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                params![SCHEMA_VERSION],
-            )?;
-            transaction.commit()?;
+            if applied.is_none() {
+                let transaction = connection.unchecked_transaction()?;
+                transaction.execute_batch(migration)?;
+                transaction.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (?1)",
+                    params![version],
+                )?;
+                transaction.commit()?;
+            }
         }
 
         Ok(Self { connection })
@@ -466,6 +721,75 @@ fn parse_status(status: &str) -> LocalFileStatus {
         "MISSING" => LocalFileStatus::Missing,
         _ => LocalFileStatus::Active,
     }
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
+    if left.is_empty() || left.len() != right.len() {
+        return None;
+    }
+    let mut dot = 0.0;
+    let mut left_norm = 0.0;
+    let mut right_norm = 0.0;
+    for (left_value, right_value) in left.iter().zip(right) {
+        dot += left_value * right_value;
+        left_norm += left_value * left_value;
+        right_norm += right_value * right_value;
+    }
+    let denominator = left_norm.sqrt() * right_norm.sqrt();
+    (denominator > 0.0).then_some(dot / denominator)
+}
+
+fn lexical_relevance(query: &str, description: &str, labels: &[String]) -> f32 {
+    let query_terms = search_terms(query);
+    if query_terms.is_empty() {
+        return 0.0;
+    }
+    let searchable = format!(
+        "{} {}",
+        description.to_ascii_lowercase(),
+        labels.join(" ").to_ascii_lowercase()
+    );
+    let matched = query_terms
+        .iter()
+        .filter(|term| {
+            let stem = search_stem(term);
+            searchable.contains(term.as_str()) || (!stem.is_empty() && searchable.contains(&stem))
+        })
+        .count();
+    matched as f32 / query_terms.len() as f32
+}
+
+fn search_terms(value: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for term in value
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|term| term.len() >= 3)
+    {
+        if !terms.iter().any(|existing| existing == term) {
+            terms.push(term.to_owned());
+        }
+    }
+    terms
+}
+
+fn search_stem(term: &str) -> String {
+    if term.ends_with("ation") && term.len() > 6 {
+        return term[..term.len() - 3].to_owned();
+    }
+    if term.ends_with("ing") && term.len() > 5 {
+        return term[..term.len() - 3].to_owned();
+    }
+    if term.ends_with("ed") && term.len() > 4 {
+        return term[..term.len() - 2].to_owned();
+    }
+    if term.ends_with('e') && term.len() > 4 {
+        return term[..term.len() - 1].to_owned();
+    }
+    if term.ends_with('s') && term.len() > 4 {
+        return term[..term.len() - 1].to_owned();
+    }
+    term.to_owned()
 }
 
 fn matches_query(result: &SearchResult, query: &SearchQuery) -> bool {
@@ -708,7 +1032,7 @@ mod tests {
         let mut index = SqliteIndex::open_in_memory().expect("index should open");
         assert_eq!(
             index.schema_version().expect("version should be readable"),
-            1
+            2
         );
 
         let first = index
@@ -790,6 +1114,273 @@ mod tests {
                 .expect("metadata should be readable"),
             Some(metadata)
         );
+    }
+
+    #[test]
+    fn searches_ai_annotations_by_cosine_similarity() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/fortnite.mp4", "hash-fortnite")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        index
+            .replace_ai_annotations(
+                "hash-fortnite",
+                &[AiAnnotation {
+                    timestamp_ms: 12_000,
+                    description: "A player eliminates an enemy in a Fortnite fight".to_owned(),
+                    labels: vec!["fortnite".to_owned(), "kill".to_owned()],
+                    embedding: vec![1.0, 0.0],
+                    confidence: Some(0.9),
+                    model: "fixture".to_owned(),
+                }],
+            )
+            .expect("annotation should persist");
+
+        let results = index
+            .search_ai("fortnite kill", &[0.9, 0.1], 10, None)
+            .expect("AI search should work");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].timestamp_ms, 12_000);
+        assert!(results[0].score > 0.9);
+        assert_eq!(
+            index
+                .search_ai("elimination", &[0.9, 0.1], 10, Some("fixture"))
+                .expect("matching model namespace should work")
+                .len(),
+            1
+        );
+        assert!(index
+            .search_ai("elimination", &[0.9, 0.1], 10, Some("other-model"))
+            .expect("different model namespace should be empty")
+            .is_empty());
+    }
+
+    #[test]
+    fn boosts_inflected_event_keywords_in_ai_search() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/elimination.mp4", "hash-elimination")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        index
+            .replace_ai_annotations(
+                "hash-elimination",
+                &[AiAnnotation {
+                    timestamp_ms: 5_000,
+                    description: "The kill feed shows an enemy eliminated".to_owned(),
+                    labels: vec!["on-screen text: ELIMINATED".to_owned()],
+                    embedding: vec![0.1, 0.9],
+                    confidence: Some(0.9),
+                    model: "fixture".to_owned(),
+                }],
+            )
+            .expect("annotation should persist");
+
+        let results = index
+            .search_ai("elimination", &[0.0, 1.0], 10, Some("fixture"))
+            .expect("AI search should work");
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].score > 0.99);
+    }
+
+    #[test]
+    fn coalesces_adjacent_ai_timestamps_into_one_search_moment() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/scene.mp4", "hash-scene")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        let annotation = |timestamp_ms| AiAnnotation {
+            timestamp_ms,
+            description: "A character opens the same door".to_owned(),
+            labels: vec!["character".to_owned(), "opening door".to_owned()],
+            embedding: vec![1.0, 0.0],
+            confidence: Some(0.9),
+            model: "fixture".to_owned(),
+        };
+        index
+            .replace_ai_annotations(
+                "hash-scene",
+                &[
+                    annotation(4_000),
+                    annotation(5_000),
+                    annotation(6_000),
+                    annotation(10_000),
+                ],
+            )
+            .expect("annotations should persist");
+
+        let results = index
+            .search_ai("opening door", &[1.0, 0.0], 10, Some("fixture"))
+            .expect("AI search should work");
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.timestamp_ms)
+                .collect::<Vec<_>>(),
+            vec![4_000, 10_000]
+        );
+    }
+
+    #[test]
+    fn focused_ai_search_filters_weak_matches_and_caps_video_count() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        let files = (0..10)
+            .map(|index| {
+                file(
+                    &format!("/library/clip-{index}.mp4"),
+                    &format!("hash-{index}"),
+                )
+            })
+            .collect();
+        index
+            .reconcile(&report(files), &HashMap::new())
+            .expect("fixtures should be indexed");
+        for index_number in 0..10 {
+            index
+                .replace_ai_annotations(
+                    &format!("hash-{index_number}"),
+                    &[AiAnnotation {
+                        timestamp_ms: 1_000,
+                        description: "A person performs a visually similar action".to_owned(),
+                        labels: Vec::new(),
+                        embedding: vec![1.0, 0.0],
+                        confidence: Some(0.8),
+                        model: "fixture".to_owned(),
+                    }],
+                )
+                .expect("annotations should persist");
+        }
+        index
+            .replace_ai_annotations(
+                "hash-9",
+                &[AiAnnotation {
+                    timestamp_ms: 1_000,
+                    description: "An unrelated static title card".to_owned(),
+                    labels: Vec::new(),
+                    embedding: vec![0.0, 1.0],
+                    confidence: Some(0.8),
+                    model: "fixture".to_owned(),
+                }],
+            )
+            .expect("weak annotation should persist");
+
+        let results = index
+            .search_ai_with_focus(
+                "specific action",
+                &[1.0, 0.0],
+                100,
+                Some("fixture"),
+                AiSearchFocus::Focused,
+            )
+            .expect("focused AI search should work");
+
+        assert_eq!(results.len(), 8);
+        assert!(results.iter().all(|result| result.content_hash != "hash-9"));
+    }
+
+    #[test]
+    fn focused_ai_search_keeps_keyword_evidence_and_rejects_generic_similarity() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![
+                    file("/library/exact.mp4", "hash-exact"),
+                    file("/library/noise.mp4", "hash-noise"),
+                ]),
+                &HashMap::new(),
+            )
+            .expect("fixtures should be indexed");
+        index
+            .replace_ai_annotations(
+                "hash-exact",
+                &[AiAnnotation {
+                    timestamp_ms: 2_000,
+                    description: "The HUD reads eliminated after a player fires".to_owned(),
+                    labels: vec!["on-screen text: eliminated".to_owned()],
+                    embedding: vec![0.3, 0.953_939],
+                    confidence: Some(0.9),
+                    model: "fixture".to_owned(),
+                }],
+            )
+            .expect("exact annotation should persist");
+        index
+            .replace_ai_annotations(
+                "hash-noise",
+                &[AiAnnotation {
+                    timestamp_ms: 3_000,
+                    description: "A generic scene with no matching event".to_owned(),
+                    labels: Vec::new(),
+                    embedding: vec![0.6, 0.8],
+                    confidence: Some(0.8),
+                    model: "fixture".to_owned(),
+                }],
+            )
+            .expect("noise annotation should persist");
+
+        let focused = index
+            .search_ai_with_focus(
+                "eliminated",
+                &[1.0, 0.0],
+                100,
+                Some("fixture"),
+                AiSearchFocus::Focused,
+            )
+            .expect("focused search should work");
+        let balanced = index
+            .search_ai_with_focus(
+                "eliminated",
+                &[1.0, 0.0],
+                100,
+                Some("fixture"),
+                AiSearchFocus::Balanced,
+            )
+            .expect("balanced search should work");
+
+        assert_eq!(focused.len(), 1);
+        assert_eq!(focused[0].content_hash, "hash-exact");
+        assert_eq!(balanced.len(), 2);
+    }
+
+    #[test]
+    fn detects_existing_ai_analysis_for_a_content_and_model() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/ready.mp4", "hash-ready")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        index
+            .replace_ai_annotations(
+                "hash-ready",
+                &[AiAnnotation {
+                    timestamp_ms: 0,
+                    description: "Ready".to_owned(),
+                    labels: Vec::new(),
+                    embedding: vec![1.0],
+                    confidence: None,
+                    model: "model-a".to_owned(),
+                }],
+            )
+            .expect("annotation should persist");
+
+        assert!(index
+            .has_ai_annotations_for_content_model("hash-ready", "model-a")
+            .expect("existing analysis should be detected"));
+        assert!(!index
+            .has_ai_annotations_for_content_model("hash-ready", "model-b")
+            .expect("other model should remain absent"));
     }
 
     #[test]
