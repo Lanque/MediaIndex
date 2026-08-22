@@ -20,14 +20,15 @@ the logical asset.
 ## Hashing and re-indexing
 
 Media files are hashed during local discovery, before they are written to the
-index. SHA-256 is computed with a 1 MiB read buffer. The process never uploads
+index. SHA-256 is computed with a heap-allocated 1 MiB read buffer so large
+files cannot exhaust the Windows process stack. The process never uploads
 media bytes.
 
-The current implementation restarts a file hash from byte zero on the next
-scan; it does not persist partial digest state. If a read or hash fails, the
-scanner emits a warning and the index treats that scan as incomplete. Existing
-rows are not marked deleted because a failed hash must not look like a missing
-file.
+On a repeat scan, an indexed hash is reused when the path, file size, and
+modification timestamp are unchanged. Files that fail this identity check are
+hashed again from byte zero. If a read or hash fails, the scanner emits a
+warning and the index treats that scan as incomplete. Existing rows are not
+marked deleted because a failed hash must not look like a missing file.
 
 Re-indexing the same path and hash is idempotent. A changed hash is recorded as
 `MODIFIED`; a new path with an existing hash is recorded as `MOVED` or
@@ -37,4 +38,19 @@ physically deleted.
 
 Technical metadata is stored on the content identity when supplied by the
 FFprobe adapter. FFprobe itself remains a local process and its failures are
-returned as structured error state.
+returned as structured error state. A repeat scan reuses metadata already
+stored for the same content hash, so FFprobe is only invoked for new or changed
+content.
+
+## AI annotations
+
+AI annotations are stored separately from deterministic metadata in the
+`ai_annotations` table. Each row belongs to a content hash and contains a
+timestamp, short visual description, normalized labels, and an embedding. This
+keeps a query such as `Fortnite kill` tied to a playable moment rather than
+only to a filename.
+
+AI analysis is explicit and samples frames through the local FFmpeg executable.
+The application sends those sampled images to the configured AI provider only
+after the user presses **Analyze with AI**; ordinary folder scanning never
+invokes the AI provider.

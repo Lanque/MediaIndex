@@ -1,6 +1,8 @@
+use crate::scanner::{DiscoveredFile, ScanWarning};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,6 +37,29 @@ pub enum MetadataError {
     Io {
         message: String,
     },
+}
+
+impl Display for MetadataError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExecutableNotFound {
+                executable,
+                message,
+            } => write!(
+                formatter,
+                "FFprobe executable '{executable}' was not found: {message}"
+            ),
+            Self::ProcessFailed { status, message } => write!(
+                formatter,
+                "FFprobe failed with status {:?}: {message}",
+                status
+            ),
+            Self::InvalidOutput { message } => {
+                write!(formatter, "FFprobe returned invalid output: {message}")
+            }
+            Self::Io { message } => write!(formatter, "FFprobe could not be started: {message}"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -91,7 +116,9 @@ impl FfprobeMetadataProbe {
 
 impl MetadataProbe for FfprobeMetadataProbe {
     fn extract(&self, path: &Path) -> MetadataExtraction {
-        let output = match Command::new(&self.executable)
+        let mut command = Command::new(&self.executable);
+        configure_hidden_process(&mut command);
+        let output = match command
             .args([
                 "-v",
                 "error",
@@ -141,8 +168,57 @@ impl MetadataProbe for FfprobeMetadataProbe {
     }
 }
 
+fn configure_hidden_process(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
 pub fn extract_media_metadata(path: &Path) -> MetadataExtraction {
     FfprobeMetadataProbe::default().extract(path)
+}
+
+pub fn collect_metadata<P: MetadataProbe>(
+    files: &[DiscoveredFile],
+    probe: &P,
+) -> (HashMap<String, MediaMetadata>, Vec<ScanWarning>) {
+    collect_metadata_with_cache(files, probe, &HashMap::new())
+}
+
+pub fn collect_metadata_with_cache<P: MetadataProbe>(
+    files: &[DiscoveredFile],
+    probe: &P,
+    cached_by_hash: &HashMap<String, MediaMetadata>,
+) -> (HashMap<String, MediaMetadata>, Vec<ScanWarning>) {
+    let mut metadata_by_path = HashMap::new();
+    let mut warnings = Vec::new();
+
+    for file in files {
+        if let Some(metadata) = cached_by_hash.get(&file.content_hash) {
+            metadata_by_path.insert(file.path.clone(), metadata.clone());
+            continue;
+        }
+
+        let extraction = probe.extract(Path::new(&file.path));
+        match (extraction.metadata, extraction.error) {
+            (Some(metadata), _) => {
+                metadata_by_path.insert(file.path.clone(), metadata);
+            }
+            (None, Some(error)) => warnings.push(ScanWarning {
+                path: file.path.clone(),
+                message: error.to_string(),
+            }),
+            (None, None) => warnings.push(ScanWarning {
+                path: file.path.clone(),
+                message: "FFprobe returned no metadata".to_owned(),
+            }),
+        }
+    }
+
+    (metadata_by_path, warnings)
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,5 +417,93 @@ mod tests {
             extraction.metadata.expect("stub should succeed").size_bytes,
             Some(42)
         );
+    }
+
+    #[test]
+    fn collection_keeps_successful_metadata_and_reports_failures() {
+        struct MixedProbe;
+
+        impl MetadataProbe for MixedProbe {
+            fn extract(&self, path: &Path) -> MetadataExtraction {
+                if path.ends_with("broken.mp4") {
+                    MetadataExtraction::failure(MetadataError::ProcessFailed {
+                        status: Some(1),
+                        message: "fixture failure".to_owned(),
+                    })
+                } else {
+                    MetadataExtraction::success(MediaMetadata {
+                        duration_ms: Some(1_000),
+                        size_bytes: Some(42),
+                        container: Some("mp4".to_owned()),
+                        video_codec: None,
+                        audio_codec: None,
+                        width: None,
+                        height: None,
+                        frame_rate: None,
+                        start_time: None,
+                        creation_time: None,
+                    })
+                }
+            }
+        }
+
+        let files = vec![
+            DiscoveredFile {
+                path: "good.mp4".to_owned(),
+                size_bytes: 42,
+                modified_unix_ms: None,
+                content_hash: "hash-good".to_owned(),
+            },
+            DiscoveredFile {
+                path: "broken.mp4".to_owned(),
+                size_bytes: 42,
+                modified_unix_ms: None,
+                content_hash: "hash-broken".to_owned(),
+            },
+        ];
+
+        let (metadata, warnings) = collect_metadata(&files, &MixedProbe);
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata["good.mp4"].duration_ms, Some(1_000));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("fixture failure"));
+    }
+
+    #[test]
+    fn collection_reuses_cached_metadata_without_running_probe() {
+        struct FailingProbe;
+
+        impl MetadataProbe for FailingProbe {
+            fn extract(&self, _path: &Path) -> MetadataExtraction {
+                panic!("cached metadata should avoid probing");
+            }
+        }
+
+        let files = vec![DiscoveredFile {
+            path: "cached.mp4".to_owned(),
+            size_bytes: 42,
+            modified_unix_ms: None,
+            content_hash: "hash-cached".to_owned(),
+        }];
+        let cached = MediaMetadata {
+            duration_ms: Some(2_000),
+            size_bytes: Some(42),
+            container: Some("mp4".to_owned()),
+            video_codec: Some("h264".to_owned()),
+            audio_codec: None,
+            width: Some(1280),
+            height: Some(720),
+            frame_rate: None,
+            start_time: None,
+            creation_time: None,
+        };
+        let mut cached_by_hash = HashMap::new();
+        cached_by_hash.insert("hash-cached".to_owned(), cached.clone());
+
+        let (metadata, warnings) =
+            collect_metadata_with_cache(&files, &FailingProbe, &cached_by_hash);
+
+        assert_eq!(metadata.get("cached.mp4"), Some(&cached));
+        assert!(warnings.is_empty());
     }
 }
