@@ -41,3 +41,16 @@ FFprobe adapter. FFprobe itself remains a local process and its failures are
 returned as structured error state. A repeat scan reuses metadata already
 stored for the same content hash, so FFprobe is only invoked for new or changed
 content.
+
+## AI annotations
+
+AI annotations are stored separately from deterministic metadata in the
+`ai_annotations` table. Each row belongs to a content hash and contains a
+timestamp, short visual description, normalized labels, and an embedding. This
+keeps a query such as `Fortnite kill` tied to a playable moment rather than
+only to a filename.
+
+AI analysis is explicit and samples frames through the local FFmpeg executable.
+The application sends those sampled images to the configured AI provider only
+after the user presses **Analyze with AI**; ordinary folder scanning never
+invokes the AI provider.
