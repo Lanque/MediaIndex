@@ -41,7 +41,16 @@ Laptop B: E:/Backup/Day1/A001_C003.mp4
 Content:  the same SHA-256
 ```
 
-The local database can therefore store multiple LocalFile records that point to one logical MediaAsset. The hashing strategy, cost, and interrupted-hash behavior must be documented in the implementation issue and tests.
+The local database stores multiple `local_files` rows that can point to one
+logical `media_assets` row. Its versioned SQLite schema keeps paths as
+locations, preserves missing history, and treats a warning-bearing scan as
+incomplete so an interrupted hash cannot cause a false deletion. The concrete
+hashing and re-indexing policy is documented in
+[docs/local-index.md](local-index.md).
+
+The cloud database has a separate project-scoped model. Its shared contract is
+versioned under `shared/contracts/v1/`, and PostgreSQL row-level security checks
+the authenticated project owner through the transaction-local `app.user_id`.
 
 ## Synchronization
 
