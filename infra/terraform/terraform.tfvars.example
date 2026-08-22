@@ -1,0 +1,13 @@
+project_name = "mediaindex"
+environment  = "dev"
+aws_region   = "eu-north-1"
+
+# Keep optional workloads disabled until cost and network prerequisites are approved.
+enable_rds             = false
+enable_budget          = false
+worker_image           = ""
+private_subnet_ids     = []
+database_subnet_ids    = []
+budget_alert_emails    = []
+worker_security_group_id   = ""
+database_security_group_id = ""
