@@ -1,0 +1,1 @@
+"""Versioned MediaIndex API contracts."""
