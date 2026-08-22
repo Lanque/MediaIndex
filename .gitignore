@@ -3,10 +3,12 @@ node_modules/
 dist/
 build/
 .tauri/
+desktop/src-tauri/gen/
 
 # Rust
 target/
 Cargo.lock
+!desktop/src-tauri/Cargo.lock
 
 # Python
 __pycache__/

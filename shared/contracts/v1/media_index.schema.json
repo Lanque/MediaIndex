@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Lanque/MediaIndex/blob/main/shared/contracts/v1/media_index.schema.json",
+  "title": "MediaIndex cloud contract v1",
+  "type": "object",
+  "$defs": {
+    "Project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "owner_user_id"],
+      "properties": {
+        "id": {"type": "string", "format": "uuid"},
+        "name": {"type": "string", "minLength": 1, "maxLength": 200},
+        "owner_user_id": {"type": "string", "minLength": 1, "maxLength": 200}
+      }
+    },
+    "MediaMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "duration_ms": {"type": ["integer", "null"], "minimum": 0},
+        "size_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "container": {"type": ["string", "null"]},
+        "video_codec": {"type": ["string", "null"]},
+        "audio_codec": {"type": ["string", "null"]},
+        "width": {"type": ["integer", "null"], "minimum": 1},
+        "height": {"type": ["integer", "null"], "minimum": 1},
+        "frame_rate": {"type": ["string", "null"]},
+        "start_time": {"type": ["string", "null"]},
+        "creation_time": {"type": ["string", "null"]}
+      }
+    },
+    "MediaAsset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_hash", "size_bytes", "metadata"],
+      "properties": {
+        "content_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "metadata": {"$ref": "#/$defs/MediaMetadata"}
+      }
+    },
+    "LocalFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "status", "observed_at"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "status": {"type": "string", "enum": ["ACTIVE", "MISSING"]},
+        "observed_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "SyncChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "asset", "local_file"],
+      "properties": {
+        "operation": {"type": "string", "enum": ["UPSERT", "DELETE"]},
+        "asset": {"$ref": "#/$defs/MediaAsset"},
+        "local_file": {"$ref": "#/$defs/LocalFile"}
+      }
+    },
+    "SyncRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_id", "client_id", "idempotency_key", "base_cursor", "changes"],
+      "properties": {
+        "project_id": {"type": "string", "format": "uuid"},
+        "client_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 200},
+        "base_cursor": {"type": "integer", "minimum": 0},
+        "changes": {"type": "array", "maxItems": 1000, "items": {"$ref": "#/$defs/SyncChange"}}
+      }
+    },
+    "SyncResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["next_cursor", "accepted_changes", "conflicts"],
+      "properties": {
+        "next_cursor": {"type": "integer", "minimum": 0},
+        "accepted_changes": {"type": "integer", "minimum": 0},
+        "conflicts": {"type": "array", "items": {"type": "object"}}
+      }
+    }
+  }
+}

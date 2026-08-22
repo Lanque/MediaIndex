@@ -39,7 +39,10 @@ SQS, a worker service, explicit job requests, durable states, retries, dead-lett
 
 ### Phase 4 — Semantic search
 
-Start with PostgreSQL full-text search and ordinary filters. Add pgvector only after the deterministic search experience is useful.
+The desktop MVP now has an explicit sampled-frame visual index: AI-generated
+descriptions and embeddings are stored locally and natural-language queries can
+return timestamped moments. Extend this with PostgreSQL full-text search and
+pgvector after the deterministic and local AI search experience is useful.
 
 ### Phase 5 — AWS deployment and hardening
 
