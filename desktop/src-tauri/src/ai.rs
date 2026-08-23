@@ -139,7 +139,7 @@ fn sanitize_api_key(raw: &str) -> String {
             key = key[1..key.len() - 1].trim();
         }
     }
-    key.to_owned()
+    key.chars().filter(|c| !c.is_whitespace() && !c.is_control()).collect::<String>()
 }
 
 impl AiSettings {
