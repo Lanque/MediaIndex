@@ -334,6 +334,62 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+.model-info-card {
+  margin-top: 4px;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(30, 44, 76, 0.6);
+  border: 1px solid #2b3b63;
+  font-size: 0.72rem;
+  line-height: 1.4;
+  color: #c2d4f8;
+}
+
+.model-info-badges {
+  display: flex;
+  gap: 5px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.model-badge {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.model-badge-free {
+  background: #19381c;
+  color: #79e080;
+  border: 1px solid #2c6332;
+}
+
+.model-badge-budget {
+  background: #142f4c;
+  color: #7abeff;
+  border: 1px solid #235182;
+}
+
+.model-badge-premium {
+  background: #3c1e42;
+  color: #e599f7;
+  border: 1px solid #663370;
+}
+
+.model-badge-speed {
+  background: #36290e;
+  color: #ffd43b;
+  border: 1px solid #5e4819;
+}
+
+.model-info-desc {
+  margin: 0;
+  color: #9caed2;
+}
+
 .status-dot {
   width: 9px;
   height: 9px;
