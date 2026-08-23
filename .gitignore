@@ -40,3 +40,5 @@ venv/
 *.tmp
 coverage/
 reports/
+.idea/
+

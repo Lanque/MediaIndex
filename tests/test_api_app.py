@@ -118,5 +118,28 @@ class FastApiRuntimeTests(unittest.TestCase):
         )
 
 
+    def test_get_project_changes_returns_project_state(self) -> None:
+        payload = {
+            "project_id": self.project_id,
+            "client_id": "laptop",
+            "idempotency_key": "batch-changes",
+            "base_cursor": 0,
+            "changes": [sync_change()],
+        }
+        self.client.post(
+            f"/v1/projects/{self.project_id}/sync",
+            headers={"X-User-Id": "user-1"},
+            json=payload,
+        )
+        response = self.client.get(
+            f"/v1/projects/{self.project_id}/changes",
+            headers={"X-User-Id": "user-1"},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["current_cursor"], 1)
+        self.assertIn("D:/Footage/a.mp4", data["local_files"])
+
+
 if __name__ == "__main__":
     unittest.main()

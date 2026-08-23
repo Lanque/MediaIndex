@@ -114,6 +114,19 @@ class InMemorySyncServer:
             "local_files": copy.deepcopy(project.local_files),
         }
 
+    def get_changes(self, project_id: str, user_id: str, since_cursor: int = 0) -> dict[str, Any]:
+        project = self._projects.get(project_id)
+        if project is None:
+            raise ProjectNotFoundError("project is not available")
+        if project.owner_user_id != user_id:
+            raise AuthorizationError("authenticated user cannot access this project")
+        return {
+            "current_cursor": project.cursor,
+            "since_cursor": since_cursor,
+            "assets": copy.deepcopy(project.assets),
+            "local_files": copy.deepcopy(project.local_files),
+        }
+
 
 class SyncClient:
     """Cursor-aware client that keeps an in-flight batch until it is acknowledged."""
