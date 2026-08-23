@@ -328,6 +328,19 @@ const AI_SETTINGS_STORAGE_KEY = "mediaindex.ai.settings.v1";
 const AI_API_KEY_SESSION_STORAGE_KEY = "mediaindex.ai.api-key.session.v1";
 const LIBRARY_PATH_STORAGE_KEY = "mediaindex.library.path.v1";
 
+function cleanApiKey(raw: string): string {
+  let cleaned = raw.trim();
+  if (cleaned.toLowerCase().startsWith("bearer ")) {
+    cleaned = cleaned.slice(7).trim();
+  }
+  if ((cleaned.startsWith('"') && cleaned.endsWith('"')) || (cleaned.startsWith("'") && cleaned.endsWith("'"))) {
+    if (cleaned.length >= 2) {
+      cleaned = cleaned.slice(1, -1).trim();
+    }
+  }
+  return cleaned;
+}
+
 function aiDefaults(provider: AiProvider): AiConfig {
   if (provider === "openai") {
     return {
@@ -348,7 +361,7 @@ function aiDefaults(provider: AiProvider): AiConfig {
       provider,
       apiKey: "",
       visionModel: "gemini-1.5-flash",
-      embeddingModel: "text-embedding-004",
+      embeddingModel: "embedding-001",
       baseUrl: "https://generativelanguage.googleapis.com/v1beta",
       ffmpegPath: "",
       sampleIntervalSeconds: 5,
@@ -376,7 +389,7 @@ function readAiConfig(): AiConfig {
   const defaults = aiDefaults(provider);
   return {
     provider,
-    apiKey: aiApiKey?.value.trim() ?? "",
+    apiKey: cleanApiKey(aiApiKey?.value ?? ""),
     visionModel: aiVisionModel?.value.trim() || defaults.visionModel,
     embeddingModel: aiEmbeddingModel?.value.trim() || defaults.embeddingModel,
     baseUrl: aiBaseUrl?.value.trim() || defaults.baseUrl,
@@ -561,7 +574,7 @@ function updateAiProviderFields(): void {
       provider === "local"
         ? "nomic-embed-text"
         : provider === "gemini"
-          ? "text-embedding-004"
+          ? "embedding-001"
           : "text-embedding-3-small";
   }
   if (aiBaseUrl) {

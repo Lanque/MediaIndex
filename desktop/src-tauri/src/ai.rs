@@ -14,7 +14,7 @@ const DEFAULT_OPENAI_VISION_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_OPENAI_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_GEMINI_VISION_MODEL: &str = "gemini-3.6-flash";
-const DEFAULT_GEMINI_EMBEDDING_MODEL: &str = "gemini-embedding-001";
+const DEFAULT_GEMINI_EMBEDDING_MODEL: &str = "embedding-001";
 const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_LOCAL_VISION_MODEL: &str = "gemma4";
 const DEFAULT_LOCAL_EMBEDDING_MODEL: &str = "embeddinggemma";
@@ -127,6 +127,21 @@ pub struct AiSettings {
     context_hint: Option<String>,
 }
 
+fn sanitize_api_key(raw: &str) -> String {
+    let mut key = raw.trim();
+    if let Some(stripped) = key.strip_prefix("Bearer ") {
+        key = stripped.trim();
+    } else if let Some(stripped) = key.strip_prefix("bearer ") {
+        key = stripped.trim();
+    }
+    if (key.starts_with('"') && key.ends_with('"')) || (key.starts_with('\'') && key.ends_with('\'')) {
+        if key.len() >= 2 {
+            key = key[1..key.len() - 1].trim();
+        }
+    }
+    key.to_owned()
+}
+
 impl AiSettings {
     pub fn from_request(request: Option<AiRequestConfig>) -> Result<Self, String> {
         let request = request.unwrap_or_default();
@@ -151,7 +166,7 @@ impl AiSettings {
                 .or_else(|| env_non_empty("GEMINI_API_KEY")),
             AiProvider::Local => None,
         });
-        let api_key = api_key.unwrap_or_default();
+        let api_key = sanitize_api_key(&api_key.unwrap_or_default());
         if provider.is_remote() && api_key.is_empty() {
             return Err(match provider {
                 AiProvider::OpenAI => {
@@ -864,6 +879,7 @@ fn describe_gemini(
     prompt: &str,
     settings: &AiSettings,
 ) -> Result<String, String> {
+    let clean_model = settings.vision_model.trim_start_matches("models/").trim();
     let mut parts = vec![json!({"text": prompt})];
     parts.extend(
         encoded_frames.iter().map(
@@ -873,7 +889,7 @@ fn describe_gemini(
     let response = client
         .post(format!(
             "{}/models/{}:generateContent",
-            settings.base_url, settings.vision_model
+            settings.base_url, clean_model
         ))
         .header("x-goog-api-key", &settings.api_key)
         .json(&json!({
@@ -1031,20 +1047,18 @@ fn create_embeddings(
     Ok(embeddings)
 }
 
-fn create_gemini_embedding(
+fn request_single_gemini_embedding(
     client: &Client,
+    model: &str,
     text: &str,
     settings: &AiSettings,
-    kind: EmbeddingKind,
-) -> Result<Vec<f32>, String> {
-    let task_type = match kind {
-        EmbeddingKind::Document => "RETRIEVAL_DOCUMENT",
-        EmbeddingKind::Query => "RETRIEVAL_QUERY",
-    };
+    task_type: &str,
+) -> Result<Vec<f32>, (bool, String)> {
+    let clean_model = model.trim_start_matches("models/").trim();
     let response = client
         .post(format!(
             "{}/models/{}:embedContent",
-            settings.base_url, settings.embedding_model
+            settings.base_url, clean_model
         ))
         .header("x-goog-api-key", &settings.api_key)
         .json(&json!({
@@ -1052,8 +1066,9 @@ fn create_gemini_embedding(
             "taskType": task_type
         }))
         .send()
-        .map_err(|error| request_failure("Gemini embedding", &error))?;
-    let body = read_json_response(response, "Gemini embedding")?;
+        .map_err(|error| (false, request_failure("Gemini embedding", &error)))?;
+    let is_not_found = response.status() == reqwest::StatusCode::NOT_FOUND;
+    let body = read_json_response(response, "Gemini embedding").map_err(|err| (is_not_found, err))?;
     let embedding = body
         .get("embedding")
         .and_then(|embedding| embedding.get("values"))
@@ -1069,7 +1084,27 @@ fn create_gemini_embedding(
         });
     embedding
         .filter(|values| !values.is_empty())
-        .ok_or_else(|| "Gemini embedding returned no vector".to_owned())
+        .ok_or_else(|| (false, "Gemini embedding returned no vector".to_owned()))
+}
+
+fn create_gemini_embedding(
+    client: &Client,
+    text: &str,
+    settings: &AiSettings,
+    kind: EmbeddingKind,
+) -> Result<Vec<f32>, String> {
+    let task_type = match kind {
+        EmbeddingKind::Document => "RETRIEVAL_DOCUMENT",
+        EmbeddingKind::Query => "RETRIEVAL_QUERY",
+    };
+    match request_single_gemini_embedding(client, &settings.embedding_model, text, settings, task_type) {
+        Ok(vec) => Ok(vec),
+        Err((true, _)) if settings.embedding_model.trim_start_matches("models/").trim() != "embedding-001" => {
+            request_single_gemini_embedding(client, "embedding-001", text, settings, task_type)
+                .map_err(|(_, err)| err)
+        }
+        Err((_, err)) => Err(err),
+    }
 }
 
 fn values_to_embedding(values: &Vec<Value>) -> Vec<f32> {
