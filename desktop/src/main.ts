@@ -341,6 +341,21 @@ function cleanApiKey(raw: string): string {
   return cleaned;
 }
 
+function getSessionApiKey(provider: AiProvider): string {
+  if (provider === "local") return "";
+  return sessionStorage.getItem(`mediaindex.ai.api-key.${provider}.session.v1`) ?? "";
+}
+
+function setSessionApiKey(provider: AiProvider, key: string): void {
+  if (provider === "local") return;
+  const clean = cleanApiKey(key);
+  if (clean) {
+    sessionStorage.setItem(`mediaindex.ai.api-key.${provider}.session.v1`, clean);
+  } else {
+    sessionStorage.removeItem(`mediaindex.ai.api-key.${provider}.session.v1`);
+  }
+}
+
 function aiDefaults(provider: AiProvider): AiConfig {
   if (provider === "openai") {
     return {
@@ -360,8 +375,8 @@ function aiDefaults(provider: AiProvider): AiConfig {
     return {
       provider,
       apiKey: "",
-      visionModel: "gemini-1.5-flash",
-      embeddingModel: "embedding-001",
+      visionModel: "gemini-2.5-flash",
+      embeddingModel: "text-embedding-004",
       baseUrl: "https://generativelanguage.googleapis.com/v1beta",
       ffmpegPath: "",
       sampleIntervalSeconds: 5,
@@ -513,8 +528,11 @@ function selectModelPreset(presetId: string): void {
   if (aiProvider) aiProvider.value = preset.provider;
   if (aiVisionModel) aiVisionModel.value = preset.visionModel;
   if (aiEmbeddingModel) aiEmbeddingModel.value = preset.embeddingModel;
-  if (preset.id === "gpt-4o-mini" || preset.id === "gemini-1.5-flash") {
+  if (preset.id === "gpt-4o-mini" || preset.id.includes("flash")) {
     if (aiMaxFrames && Number(aiMaxFrames.value) > 60) aiMaxFrames.value = "60";
+  }
+  if (aiApiKey) {
+    aiApiKey.value = getSessionApiKey(preset.provider);
   }
   updateAiProviderFields();
   saveAiConfig();
@@ -537,7 +555,7 @@ function closeModelHub(): void {
 
 function applyAiConfig(config: AiConfig): void {
   if (aiProvider) aiProvider.value = config.provider;
-  if (aiApiKey) aiApiKey.value = config.apiKey;
+  if (aiApiKey) aiApiKey.value = config.apiKey || getSessionApiKey(config.provider);
   if (aiVisionModel) aiVisionModel.value = config.visionModel;
   if (aiEmbeddingModel) aiEmbeddingModel.value = config.embeddingModel;
   if (aiBaseUrl) aiBaseUrl.value = config.baseUrl;
@@ -566,7 +584,7 @@ function updateAiProviderFields(): void {
       provider === "local"
         ? "llava"
         : provider === "gemini"
-          ? "gemini-1.5-flash"
+          ? "gemini-2.5-flash"
           : "gpt-4o-mini";
   }
   if (aiEmbeddingModel) {
@@ -574,7 +592,7 @@ function updateAiProviderFields(): void {
       provider === "local"
         ? "nomic-embed-text"
         : provider === "gemini"
-          ? "embedding-001"
+          ? "text-embedding-004"
           : "text-embedding-3-small";
   }
   if (aiBaseUrl) {
@@ -598,11 +616,7 @@ function loadAiConfig(): void {
       saved?.provider === "openai" || saved?.provider === "gemini" || saved?.provider === "local"
         ? saved.provider
         : fallback.provider;
-    const legacyApiKey = typeof saved?.apiKey === "string" ? saved.apiKey : "";
-    const sessionApiKey = sessionStorage.getItem(AI_API_KEY_SESSION_STORAGE_KEY) ?? legacyApiKey;
-    if (legacyApiKey && !sessionStorage.getItem(AI_API_KEY_SESSION_STORAGE_KEY)) {
-      sessionStorage.setItem(AI_API_KEY_SESSION_STORAGE_KEY, legacyApiKey);
-    }
+    const sessionApiKey = getSessionApiKey(provider);
     if (saved && "apiKey" in saved) {
       const { apiKey: _removedApiKey, ...safeSettings } = saved;
       localStorage.setItem(AI_SETTINGS_STORAGE_KEY, JSON.stringify(safeSettings));
@@ -624,8 +638,7 @@ function saveAiConfig(): AiConfig {
   try {
     const { apiKey, reanalyzeExisting: _oneRunOverride, ...safeSettings } = config;
     localStorage.setItem(AI_SETTINGS_STORAGE_KEY, JSON.stringify(safeSettings));
-    if (apiKey) sessionStorage.setItem(AI_API_KEY_SESSION_STORAGE_KEY, apiKey);
-    else sessionStorage.removeItem(AI_API_KEY_SESSION_STORAGE_KEY);
+    setSessionApiKey(config.provider, apiKey);
     if (aiConfigStatus)
       aiConfigStatus.textContent = "Settings saved. API key is stored for this session only.";
   } catch (error) {
@@ -1135,6 +1148,24 @@ async function testAiConnection(): Promise<void> {
   if (!testAiConnectionButton) return;
   testAiConnectionButton.disabled = true;
   const config = saveAiConfig();
+  if (config.provider !== "local" && !config.apiKey) {
+    if (aiConfigStatus)
+      aiConfigStatus.textContent = `Please enter your ${aiProviderLabel(config.provider)} API key first.`;
+    testAiConnectionButton.disabled = false;
+    return;
+  }
+  if (config.provider === "openai" && config.apiKey.startsWith("AIza")) {
+    if (aiConfigStatus)
+      aiConfigStatus.textContent = `The entered key starts with 'AIza', which is a Google Gemini key. For OpenAI, please enter an OpenAI key (starts with sk-...).`;
+    testAiConnectionButton.disabled = false;
+    return;
+  }
+  if (config.provider === "gemini" && config.apiKey.startsWith("sk-")) {
+    if (aiConfigStatus)
+      aiConfigStatus.textContent = `The entered key starts with 'sk-', which is an OpenAI key. For Google Gemini, please enter a Google AI Studio key (starts with AIza...).`;
+    testAiConnectionButton.disabled = false;
+    return;
+  }
   if (aiConfigStatus)
     aiConfigStatus.textContent = `Testing ${aiProviderLabel(config.provider)} · ${config.embeddingModel}…`;
   try {
@@ -1147,9 +1178,9 @@ async function testAiConnection(): Promise<void> {
         report.vision_model +
         " / " +
         report.embedding_model +
-        " · " +
+        " (" +
         report.embedding_dimensions +
-        " dimensions";
+        " dimensions)";
     }
   } catch (error) {
     if (aiConfigStatus) aiConfigStatus.textContent = String(error);
@@ -1177,7 +1208,7 @@ modelHubTabs?.querySelectorAll<HTMLButtonElement>(".model-hub-tab").forEach((tab
 aiProvider?.addEventListener("change", () => {
   const provider = (aiProvider.value as AiProvider) || "gemini";
   const defaults = aiDefaults(provider);
-  if (aiApiKey) aiApiKey.value = "";
+  if (aiApiKey) aiApiKey.value = getSessionApiKey(provider);
   if (aiVisionModel) aiVisionModel.value = defaults.visionModel;
   if (aiEmbeddingModel) aiEmbeddingModel.value = defaults.embeddingModel;
   if (aiBaseUrl) aiBaseUrl.value = defaults.baseUrl;
