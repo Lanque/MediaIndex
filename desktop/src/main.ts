@@ -375,7 +375,7 @@ function aiDefaults(provider: AiProvider): AiConfig {
     return {
       provider,
       apiKey: "",
-      visionModel: "gemini-2.5-flash",
+      visionModel: "gemini-3.7-flash",
       embeddingModel: "text-embedding-004",
       baseUrl: "https://generativelanguage.googleapis.com/v1beta",
       ffmpegPath: "",
