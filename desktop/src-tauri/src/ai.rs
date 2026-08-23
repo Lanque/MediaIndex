@@ -886,11 +886,13 @@ fn describe_gemini(
             |(_, encoded)| json!({"inline_data": {"mime_type": "image/jpeg", "data": encoded}}),
         ),
     );
+    let url = if settings.base_url.contains('?') {
+        format!("{}/models/{}:generateContent&key={}", settings.base_url, clean_model, settings.api_key)
+    } else {
+        format!("{}/models/{}:generateContent?key={}", settings.base_url, clean_model, settings.api_key)
+    };
     let response = client
-        .post(format!(
-            "{}/models/{}:generateContent",
-            settings.base_url, clean_model
-        ))
+        .post(&url)
         .header("x-goog-api-key", &settings.api_key)
         .json(&json!({
             "contents": [{
@@ -1055,13 +1057,16 @@ fn request_single_gemini_embedding(
     task_type: &str,
 ) -> Result<Vec<f32>, (bool, String)> {
     let clean_model = model.trim_start_matches("models/").trim();
+    let url = if settings.base_url.contains('?') {
+        format!("{}/models/{}:embedContent&key={}", settings.base_url, clean_model, settings.api_key)
+    } else {
+        format!("{}/models/{}:embedContent?key={}", settings.base_url, clean_model, settings.api_key)
+    };
     let response = client
-        .post(format!(
-            "{}/models/{}:embedContent",
-            settings.base_url, clean_model
-        ))
+        .post(&url)
         .header("x-goog-api-key", &settings.api_key)
         .json(&json!({
+            "model": format!("models/{}", clean_model),
             "content": {"parts": [{"text": text}]},
             "taskType": task_type
         }))
@@ -1099,8 +1104,16 @@ fn create_gemini_embedding(
     };
     match request_single_gemini_embedding(client, &settings.embedding_model, text, settings, task_type) {
         Ok(vec) => Ok(vec),
-        Err((true, _)) if settings.embedding_model.trim_start_matches("models/").trim() != "embedding-001" => {
-            request_single_gemini_embedding(client, "embedding-001", text, settings, task_type)
+        Err((true, _)) => {
+            let fallbacks = ["text-embedding-004", "embedding-001"];
+            for alt in fallbacks {
+                if alt != settings.embedding_model.trim_start_matches("models/").trim() {
+                    if let Ok(vec) = request_single_gemini_embedding(client, alt, text, settings, task_type) {
+                        return Ok(vec);
+                    }
+                }
+            }
+            request_single_gemini_embedding(client, &settings.embedding_model, text, settings, task_type)
                 .map_err(|(_, err)| err)
         }
         Err((_, err)) => Err(err),
