@@ -86,38 +86,38 @@ app.innerHTML = `
         </div>
 
         <details class="ai-settings" open>
-          <summary>AI mudeli seadistus & ühendus</summary>
+          <summary>AI Connection & Model</summary>
           <p class="settings-help">
-            Vali parim pilve- või kohalik mudel vastavalt oma eelarvele ja vajadustele.
+            Choose a cloud or local vision model. Media footage always stays on your computer.
           </p>
 
           <div class="active-model-card" id="active-model-card">
             <div class="active-model-header">
-              <span class="eyebrow" style="margin: 0; font-size: 0.68rem;">Aktiivne mudel</span>
-              <span class="model-badge model-badge-budget" id="active-model-badge">Soodne</span>
+              <span class="eyebrow" style="margin: 0; font-size: 0.68rem;">Selected Model</span>
+              <span class="model-badge badge-recommended" id="active-model-badge">Recommended</span>
             </div>
             <div class="active-model-title" id="active-model-title">
-              <span>🤖</span> <strong id="active-model-name">Gemini 1.5 Flash</strong>
+              <strong id="active-model-name">Gemini 1.5 Flash</strong>
             </div>
-            <p id="active-model-cost" style="margin: 0; font-size: 0.72rem; color: #ffd43b;">~$0.075 / 1M tokenit</p>
+            <p id="active-model-cost" style="margin: 0; font-size: 0.72rem; color: #a8bfeb;">Free tier / $0.075 per 1M tokens</p>
             <button class="open-model-hub-btn" id="open-model-hub" type="button">
-              ✨ Vali või vaheta mudelit (Mudelite keskus)
+              Change Model & View Pricing...
             </button>
           </div>
 
           <form class="settings-form" id="ai-settings-form">
-            <label id="ai-api-key-label">API võti (API Key)
-              <input id="ai-api-key" name="api-key" type="password" autocomplete="off" placeholder="Sisesta Google või OpenAI API võti" />
+            <label id="ai-api-key-label">API Key
+              <input id="ai-api-key" name="api-key" type="password" autocomplete="off" placeholder="Enter Gemini or OpenAI API key" />
             </label>
 
             <details class="advanced-ai-settings" style="margin-top: 4px;">
-              <summary style="font-size: 0.72rem; color: #8fa6d8; cursor: pointer;">⚙️ Täpsemad tehnilised seaded</summary>
+              <summary style="font-size: 0.72rem; color: #8fa6d8; cursor: pointer;">Advanced Configuration</summary>
               <div style="display: grid; gap: 8px; margin-top: 8px;">
                 <label>Provider
                   <select id="ai-provider" name="provider">
-                    <option value="local">Local (Ollama) — 100% Free</option>
                     <option value="gemini">Google Gemini API</option>
                     <option value="openai">OpenAI API</option>
+                    <option value="local">Local (Ollama)</option>
                   </select>
                 </label>
                 <label>Vision model
@@ -129,30 +129,30 @@ app.innerHTML = `
                 <label>Base URL
                   <input id="ai-base-url" name="base-url" placeholder="http://127.0.0.1:11434" />
                 </label>
-                <label>FFmpeg path <span class="optional-label">(valikuline)</span>
+                <label>FFmpeg path <span class="optional-label">(optional)</span>
                   <input id="ai-ffmpeg-path" name="ffmpeg-path" placeholder="Uses PATH if empty" />
                 </label>
-                <label>Library context <span class="optional-label">(valikuline)</span>
-                  <input id="ai-context-hint" name="context-hint" placeholder="Projekt, tegelased, koht…" />
+                <label>Library context <span class="optional-label">(optional)</span>
+                  <input id="ai-context-hint" name="context-hint" placeholder="Project, franchise, characters, location..." />
                 </label>
                 <div class="settings-grid">
-                  <label>Iga (sek)
+                  <label>Every (s)
                     <input id="ai-sample-seconds" name="sample-seconds" min="1" type="number" />
                   </label>
-                  <label>Max kaadrit
+                  <label>Max frames
                     <input id="ai-max-frames" name="max-frames" min="1" type="number" />
                   </label>
                 </div>
                 <label class="checkbox-field">
                   <input id="ai-reanalyze-existing" name="reanalyze-existing" type="checkbox" />
-                  Analüüsi olemasolevad uuesti <span class="optional-label">(kasutab krediiti)</span>
+                  Reanalyze existing clips <span class="optional-label">(uses API credits)</span>
                 </label>
               </div>
             </details>
 
             <div class="settings-actions">
-              <button class="secondary-button" id="save-ai-settings" type="submit">Salvesta seaded</button>
-              <button class="secondary-button" id="test-ai-connection" type="button">Testi ühendust</button>
+              <button class="secondary-button" id="save-ai-settings" type="submit">Save Settings</button>
+              <button class="secondary-button" id="test-ai-connection" type="button">Test Connection</button>
             </div>
             <p class="settings-status" id="ai-config-status" role="status"></p>
           </form>
@@ -228,20 +228,20 @@ app.innerHTML = `
     <section class="model-hub-modal" role="dialog" aria-modal="true" aria-labelledby="model-hub-title">
       <div class="preview-header">
         <div>
-          <p class="eyebrow" style="margin-bottom: 4px;">AI MODEL HUB & COMPARISON</p>
-          <h2 id="model-hub-title" style="font-size: 1.4rem;">Vali AI mudel vastavalt oma vajadusele ja eelarvele</h2>
-          <p class="lede" style="font-size: 0.85rem; margin-top: 6px; color: #a0b2d6;">
-            Klõpsa sobival mudelil ja vajuta <strong>„Vali see mudel”</strong>. Seadistused rakenduvad automaatselt.
+          <p class="eyebrow" style="margin-bottom: 4px;">AI MODEL SELECTION & COMPARISON</p>
+          <h2 id="model-hub-title" style="font-size: 1.35rem;">Choose a Vision Model</h2>
+          <p class="lede" style="font-size: 0.85rem; margin-top: 4px; color: #8fa6d8;">
+            Select a model based on cost, speed, and accuracy requirements.
           </p>
         </div>
-        <button class="secondary-button" id="close-model-hub" type="button">Sulge ✕</button>
+        <button class="secondary-button" id="close-model-hub" type="button">Close</button>
       </div>
 
       <div class="model-hub-tabs" id="model-hub-tabs">
-        <button class="model-hub-tab is-active" type="button" data-filter="all">🌟 Kõik mudelid (${ALL_MODEL_PRESETS.length})</button>
-        <button class="model-hub-tab" type="button" data-filter="local">🟢 100% Tasuta & Kohalik (Ollama)</button>
-        <button class="model-hub-tab" type="button" data-filter="gemini">🔵 Google Gemini (Parim hind/kiirus)</button>
-        <button class="model-hub-tab" type="button" data-filter="openai">🟣 OpenAI ChatGPT (GPT-4o)</button>
+        <button class="model-hub-tab is-active" type="button" data-filter="all">All Models (${ALL_MODEL_PRESETS.length})</button>
+        <button class="model-hub-tab" type="button" data-filter="gemini">Google Gemini</button>
+        <button class="model-hub-tab" type="button" data-filter="openai">OpenAI</button>
+        <button class="model-hub-tab" type="button" data-filter="local">Local (Ollama)</button>
       </div>
 
       <div class="model-hub-grid" id="model-hub-grid"></div>
@@ -395,28 +395,33 @@ function aiProviderLabel(provider: AiProvider): string {
 function updateActiveModelCard(): void {
   const config = readAiConfig();
   const matched = ALL_MODEL_PRESETS.find(
-    (p) => p.provider === config.provider && p.visionModel.toLowerCase() === config.visionModel.toLowerCase(),
+    (p) =>
+      p.provider === config.provider &&
+      p.visionModel.toLowerCase() === config.visionModel.toLowerCase(),
   );
 
   if (matched) {
     if (activeModelName) activeModelName.textContent = matched.name;
-    if (activeModelCost) activeModelCost.textContent = `💰 ${matched.costLabel}`;
+    if (activeModelCost) activeModelCost.textContent = matched.pricing;
     if (activeModelBadge) {
-      activeModelBadge.textContent = matched.highlightBadge ?? matched.costTier.toUpperCase();
+      activeModelBadge.textContent = matched.badge ?? "Active";
       activeModelBadge.className = `model-badge ${
-        matched.costTier === "free"
-          ? "model-badge-free"
-          : matched.costTier === "premium"
-            ? "model-badge-premium"
-            : "model-badge-budget"
+        matched.badgeType === "free"
+          ? "badge-free"
+          : matched.badgeType === "pro"
+            ? "badge-pro"
+            : matched.badgeType === "recommended"
+              ? "badge-recommended"
+              : "badge-default"
       }`;
     }
   } else {
-    if (activeModelName) activeModelName.textContent = `${config.visionModel} (${aiProviderLabel(config.provider)})`;
-    if (activeModelCost) activeModelCost.textContent = `Kohandatud mudeli seadistus`;
+    if (activeModelName)
+      activeModelName.textContent = `${config.visionModel} (${aiProviderLabel(config.provider)})`;
+    if (activeModelCost) activeModelCost.textContent = "Custom configuration";
     if (activeModelBadge) {
       activeModelBadge.textContent = "Custom";
-      activeModelBadge.className = "model-badge model-badge-speed";
+      activeModelBadge.className = "model-badge badge-default";
     }
   }
 }
@@ -424,21 +429,24 @@ function updateActiveModelCard(): void {
 function renderModelHubGrid(filter: "all" | AiProvider = "all"): void {
   if (!modelHubGrid) return;
   const currentConfig = readAiConfig();
-  const presets = filter === "all" ? ALL_MODEL_PRESETS : ALL_MODEL_PRESETS.filter((p) => p.provider === filter);
+  const presets =
+    filter === "all"
+      ? ALL_MODEL_PRESETS
+      : ALL_MODEL_PRESETS.filter((p) => p.provider === filter);
 
   modelHubGrid.innerHTML = presets
     .map((preset) => {
       const isCurrent =
         preset.provider === currentConfig.provider &&
         preset.visionModel.toLowerCase() === currentConfig.visionModel.toLowerCase();
-      const tierBadgeClass =
-        preset.costTier === "free"
-          ? "model-badge-free"
-          : preset.costTier === "premium"
-            ? "model-badge-premium"
-            : "model-badge-budget";
-      const speedStars = "⭐".repeat(preset.speedRating);
-      const accuracyStars = "⭐".repeat(preset.accuracyRating);
+      const badgeClass =
+        preset.badgeType === "free"
+          ? "badge-free"
+          : preset.badgeType === "pro"
+            ? "badge-pro"
+            : preset.badgeType === "recommended"
+              ? "badge-recommended"
+              : "badge-default";
 
       return `<article class="model-card-item ${isCurrent ? "is-current" : ""}" data-preset-id="${escapeHtml(preset.id)}">
         <div>
@@ -447,28 +455,22 @@ function renderModelHubGrid(filter: "all" | AiProvider = "all"): void {
               <span class="model-card-provider">${escapeHtml(aiProviderLabel(preset.provider))}</span>
               <h3 class="model-card-title">${escapeHtml(preset.name)}</h3>
             </div>
-            <span class="model-badge ${tierBadgeClass}">${escapeHtml(preset.highlightBadge ?? preset.costTier.toUpperCase())}</span>
+            ${preset.badge ? `<span class="model-badge ${badgeClass}">${escapeHtml(preset.badge)}</span>` : ""}
           </div>
 
-          <div class="model-card-price-box">
-            <strong>💰 Hind & Kulu:</strong>
-            <span>${escapeHtml(preset.costLabel)}</span>
+          <div class="model-card-pricing">
+            <span>${escapeHtml(preset.pricing)}</span>
           </div>
 
-          <div class="model-card-metrics">
-            <div><strong>⚡ Kiirus:</strong> ${speedStars}<br/><span style="font-size:0.68rem; color:#8ea4cf;">${escapeHtml(preset.speed)}</span></div>
-            <div><strong>🎯 Täpsus:</strong> ${accuracyStars}<br/><span style="font-size:0.68rem; color:#8ea4cf;">${escapeHtml(preset.accuracy)}</span></div>
+          <div class="model-card-specs">
+            <span>Speed: <strong>${escapeHtml(preset.speed)}</strong></span>
+            <span>Accuracy: <strong>${escapeHtml(preset.accuracy)}</strong></span>
           </div>
 
-          <p class="model-card-desc">${escapeHtml(preset.description)}</p>
-
-          <p style="margin: 0 0 6px; font-size: 0.72rem; font-weight: 700; color: #b9d4ff;">✨ Eelised ja võimalused:</p>
-          <ul class="model-card-pros">
-            ${preset.pros.map((pro) => `<li>${escapeHtml(pro)}</li>`).join("")}
-          </ul>
+          <p class="model-card-summary">${escapeHtml(preset.summary)}</p>
 
           <div class="model-card-reqs">
-            <strong style="color: #c2d4f8;">📌 Vajab:</strong> ${escapeHtml(preset.requirements)}
+            <span>Requires: ${escapeHtml(preset.requirements)}</span>
           </div>
         </div>
 
@@ -477,7 +479,7 @@ function renderModelHubGrid(filter: "all" | AiProvider = "all"): void {
           type="button"
           data-select-preset="${escapeHtml(preset.id)}"
         >
-          ${isCurrent ? "✓ Praegu valitud mudel" : "Vali see mudel →"}
+          ${isCurrent ? "Selected Model" : "Select Model"}
         </button>
       </article>`;
     })
@@ -506,7 +508,7 @@ function selectModelPreset(presetId: string): void {
   updateActiveModelCard();
   closeModelHub();
   if (aiConfigStatus) {
-    aiConfigStatus.textContent = `Aktiivne mudel: ${preset.name} (${aiProviderLabel(preset.provider)}). ${preset.costLabel}`;
+    aiConfigStatus.textContent = `Selected model: ${preset.name} (${aiProviderLabel(preset.provider)}). ${preset.pricing}`;
   }
 }
 
@@ -543,8 +545,8 @@ function updateAiProviderFields(): void {
       provider === "local"
         ? "Not needed for Local (Ollama)"
         : provider === "gemini"
-          ? "Google AI Studio API võti (algab AIzaSy...)"
-          : "OpenAI API võti (algab sk-...)";
+          ? "Google Gemini API key (starts with AIza...)"
+          : "OpenAI API key (starts with sk-...)";
   }
   if (aiVisionModel) {
     aiVisionModel.placeholder =
@@ -612,7 +614,7 @@ function saveAiConfig(): AiConfig {
     if (apiKey) sessionStorage.setItem(AI_API_KEY_SESSION_STORAGE_KEY, apiKey);
     else sessionStorage.removeItem(AI_API_KEY_SESSION_STORAGE_KEY);
     if (aiConfigStatus)
-      aiConfigStatus.textContent = "Settings saved. API key is kept for this app session only.";
+      aiConfigStatus.textContent = "Settings saved. API key is stored for this session only.";
   } catch (error) {
     if (aiConfigStatus) aiConfigStatus.textContent = `Could not save AI settings: ${String(error)}`;
   }
