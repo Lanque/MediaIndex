@@ -402,12 +402,23 @@ function aiDefaults(provider: AiProvider): AiConfig {
 function readAiConfig(): AiConfig {
   const provider = (aiProvider?.value as AiProvider) || "gemini";
   const defaults = aiDefaults(provider);
+  let baseUrl = aiBaseUrl?.value.trim() || defaults.baseUrl;
+  if (provider === "openai" && (baseUrl.includes("googleapis.com") || baseUrl.includes("11434"))) {
+    baseUrl = defaults.baseUrl;
+    if (aiBaseUrl) aiBaseUrl.value = defaults.baseUrl;
+  } else if (provider === "gemini" && (baseUrl.includes("api.openai.com") || baseUrl.includes("11434"))) {
+    baseUrl = defaults.baseUrl;
+    if (aiBaseUrl) aiBaseUrl.value = defaults.baseUrl;
+  } else if (provider === "local" && (baseUrl.includes("googleapis.com") || baseUrl.includes("api.openai.com"))) {
+    baseUrl = defaults.baseUrl;
+    if (aiBaseUrl) aiBaseUrl.value = defaults.baseUrl;
+  }
   return {
     provider,
     apiKey: cleanApiKey(aiApiKey?.value ?? ""),
     visionModel: aiVisionModel?.value.trim() || defaults.visionModel,
     embeddingModel: aiEmbeddingModel?.value.trim() || defaults.embeddingModel,
-    baseUrl: aiBaseUrl?.value.trim() || defaults.baseUrl,
+    baseUrl,
     ffmpegPath: aiFfmpegPath?.value.trim() ?? "",
     sampleIntervalSeconds: Math.max(1, Number(aiSampleSeconds?.value ?? 5) || 5),
     maxFrames: Math.max(1, Number(aiMaxFrames?.value ?? defaults.maxFrames) || defaults.maxFrames),
@@ -525,9 +536,11 @@ function renderModelHubGrid(filter: "all" | AiProvider = "all"): void {
 function selectModelPreset(presetId: string): void {
   const preset = ALL_MODEL_PRESETS.find((p) => p.id === presetId);
   if (!preset) return;
+  const defaults = aiDefaults(preset.provider);
   if (aiProvider) aiProvider.value = preset.provider;
   if (aiVisionModel) aiVisionModel.value = preset.visionModel;
   if (aiEmbeddingModel) aiEmbeddingModel.value = preset.embeddingModel;
+  if (aiBaseUrl) aiBaseUrl.value = defaults.baseUrl;
   if (preset.id === "gpt-4o-mini" || preset.id.includes("flash")) {
     if (aiMaxFrames && Number(aiMaxFrames.value) > 60) aiMaxFrames.value = "60";
   }
@@ -584,7 +597,7 @@ function updateAiProviderFields(): void {
       provider === "local"
         ? "llava"
         : provider === "gemini"
-          ? "gemini-2.5-flash"
+          ? "gemini-3.7-flash"
           : "gpt-4o-mini";
   }
   if (aiEmbeddingModel) {
@@ -617,14 +630,24 @@ function loadAiConfig(): void {
         ? saved.provider
         : fallback.provider;
     const sessionApiKey = getSessionApiKey(provider);
+    const defaults = aiDefaults(provider);
+    let baseUrl = saved?.baseUrl?.trim() || defaults.baseUrl;
+    if (provider === "openai" && (baseUrl.includes("googleapis.com") || baseUrl.includes("11434"))) {
+      baseUrl = defaults.baseUrl;
+    } else if (provider === "gemini" && (baseUrl.includes("api.openai.com") || baseUrl.includes("11434"))) {
+      baseUrl = defaults.baseUrl;
+    } else if (provider === "local" && (baseUrl.includes("googleapis.com") || baseUrl.includes("api.openai.com"))) {
+      baseUrl = defaults.baseUrl;
+    }
     if (saved && "apiKey" in saved) {
       const { apiKey: _removedApiKey, ...safeSettings } = saved;
       localStorage.setItem(AI_SETTINGS_STORAGE_KEY, JSON.stringify(safeSettings));
     }
     applyAiConfig({
-      ...aiDefaults(provider),
+      ...defaults,
       ...saved,
       provider,
+      baseUrl,
       apiKey: sessionApiKey,
       reanalyzeExisting: false,
     });
