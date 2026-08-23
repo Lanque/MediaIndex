@@ -205,7 +205,7 @@ impl AiSettings {
         let embedding_model = non_empty(request.embedding_model)
             .or_else(|| env_non_empty("MEDIAINDEX_AI_EMBEDDING_MODEL"))
             .unwrap_or_else(|| default_embedding_model.to_owned());
-        let base_url = non_empty(request.base_url)
+        let mut base_url = non_empty(request.base_url)
             .or_else(|| env_non_empty("MEDIAINDEX_AI_BASE_URL"))
             .or_else(|| match provider {
                 AiProvider::OpenAI => env_non_empty("MEDIAINDEX_OPENAI_BASE_URL"),
@@ -215,6 +215,19 @@ impl AiSettings {
             .unwrap_or_else(|| default_base_url.to_owned())
             .trim_end_matches('/')
             .to_owned();
+
+        match provider {
+            AiProvider::OpenAI if base_url.contains("googleapis.com") || base_url.contains("11434") => {
+                base_url = DEFAULT_OPENAI_BASE_URL.to_owned();
+            }
+            AiProvider::Gemini if base_url.contains("api.openai.com") || base_url.contains("11434") => {
+                base_url = DEFAULT_GEMINI_BASE_URL.to_owned();
+            }
+            AiProvider::Local if base_url.contains("googleapis.com") || base_url.contains("api.openai.com") => {
+                base_url = DEFAULT_LOCAL_BASE_URL.to_owned();
+            }
+            _ => {}
+        }
 
         let sample_interval_seconds = match request.sample_interval_seconds {
             Some(value) => value,
