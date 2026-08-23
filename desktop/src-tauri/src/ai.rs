@@ -1105,7 +1105,7 @@ fn create_gemini_embedding(
     match request_single_gemini_embedding(client, &settings.embedding_model, text, settings, task_type) {
         Ok(vec) => Ok(vec),
         Err((true, _)) => {
-            let fallbacks = ["text-embedding-004", "embedding-001"];
+            let fallbacks = ["gemini-embedding-001", "text-embedding-004", "embedding-001"];
             for alt in fallbacks {
                 if alt != settings.embedding_model.trim_start_matches("models/").trim() {
                     if let Ok(vec) = request_single_gemini_embedding(client, alt, text, settings, task_type) {
