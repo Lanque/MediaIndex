@@ -3,18 +3,20 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
-import type {
-  AiAnalysisPlan,
-  AiConfig,
-  AiConnectionReport,
-  AiIndexReport,
-  AiProgress,
-  AiProvider,
-  AiSearchFocus,
-  AiSearchResult,
-  IndexReport,
-  SearchFilters,
-  SearchResult,
+import {
+  MODEL_CATALOG,
+  type AiAnalysisPlan,
+  type AiConfig,
+  type AiConnectionReport,
+  type AiIndexReport,
+  type AiProgress,
+  type AiProvider,
+  type AiSearchFocus,
+  type AiSearchResult,
+  type IndexReport,
+  type ModelPreset,
+  type SearchFilters,
+  type SearchResult,
 } from "./types";
 import {
   conciseMessage,
@@ -83,34 +85,30 @@ app.innerHTML = `
           </div>
         </div>
         <details class="ai-settings">
-          <summary>AI connection</summary>
+          <summary>AI connection & models</summary>
           <p class="settings-help">
-            Choose local Ollama, OpenAI (ChatGPT API), or Gemini. Settings stay on this computer. Use Every (s) = 1–2 for short actions and fast scene changes.
+            Choose local Ollama, Google Gemini, or OpenAI. Settings stay on this computer.
           </p>
           <form class="settings-form" id="ai-settings-form">
             <label>Provider
               <select id="ai-provider" name="provider">
-                <option value="local">Local (Ollama)</option>
-                <option value="openai">OpenAI (ChatGPT API)</option>
-                <option value="gemini">Google Gemini API</option>
+                <option value="local">Local (Ollama) — 100% Free & Private</option>
+                <option value="gemini">Google Gemini API — Fast & Best Value</option>
+                <option value="openai">OpenAI API — GPT-4o / GPT-4o mini</option>
               </select>
+            </label>
+            <label id="ai-model-preset-label">Mudeli valik (Model Preset)
+              <select id="ai-model-preset" name="model-preset"></select>
+              <div id="ai-model-info" class="model-info-card"></div>
             </label>
             <label id="ai-api-key-label">API key
               <input id="ai-api-key" name="api-key" type="password" autocomplete="off" placeholder="Only for cloud providers" />
             </label>
             <label>Vision model
-              <input id="ai-vision-model" name="vision-model" placeholder="gemma4" />
-            </label>
-            <label id="ai-openai-preset-label">OpenAI recognition preset
-              <select id="ai-openai-preset" name="openai-preset">
-                <option value="custom">Current / custom model</option>
-                <option value="gpt-5.6-luna">Budget default · GPT-5.6 Luna</option>
-                <option value="gpt-5.6-terra">Detailed (~10× token price) · GPT-5.6 Terra</option>
-              </select>
-              <span class="field-help">Luna is the cost-sensitive default. Use Terra only for difficult footage; changing model requires analysis again.</span>
+              <input id="ai-vision-model" name="vision-model" placeholder="gpt-4o-mini" />
             </label>
             <label>Embedding model
-              <input id="ai-embedding-model" name="embedding-model" placeholder="embeddinggemma" />
+              <input id="ai-embedding-model" name="embedding-model" placeholder="text-embedding-3-small" />
             </label>
             <label>Base URL
               <input id="ai-base-url" name="base-url" placeholder="http://127.0.0.1:11434" />
@@ -226,11 +224,11 @@ const selectFolderButton = document.querySelector<HTMLButtonElement>("#select-fo
 const analyzeAiButton = document.querySelector<HTMLButtonElement>("#analyze-ai");
 const aiSettingsForm = document.querySelector<HTMLFormElement>("#ai-settings-form");
 const aiProvider = document.querySelector<HTMLSelectElement>("#ai-provider");
+const aiModelPreset = document.querySelector<HTMLSelectElement>("#ai-model-preset");
+const aiModelInfo = document.querySelector<HTMLElement>("#ai-model-info");
 const aiApiKey = document.querySelector<HTMLInputElement>("#ai-api-key");
 const aiApiKeyLabel = document.querySelector<HTMLLabelElement>("#ai-api-key-label");
 const aiVisionModel = document.querySelector<HTMLInputElement>("#ai-vision-model");
-const aiOpenAiPresetLabel = document.querySelector<HTMLLabelElement>("#ai-openai-preset-label");
-const aiOpenAiPreset = document.querySelector<HTMLSelectElement>("#ai-openai-preset");
 const aiEmbeddingModel = document.querySelector<HTMLInputElement>("#ai-embedding-model");
 const aiBaseUrl = document.querySelector<HTMLInputElement>("#ai-base-url");
 const aiFfmpegPath = document.querySelector<HTMLInputElement>("#ai-ffmpeg-path");
@@ -283,7 +281,7 @@ function aiDefaults(provider: AiProvider): AiConfig {
     return {
       provider,
       apiKey: "",
-      visionModel: "gpt-5.6-luna",
+      visionModel: "gpt-4o-mini",
       embeddingModel: "text-embedding-3-small",
       baseUrl: "https://api.openai.com/v1",
       ffmpegPath: "",
@@ -297,8 +295,8 @@ function aiDefaults(provider: AiProvider): AiConfig {
     return {
       provider,
       apiKey: "",
-      visionModel: "gemini-3.6-flash",
-      embeddingModel: "gemini-embedding-001",
+      visionModel: "gemini-1.5-flash",
+      embeddingModel: "text-embedding-004",
       baseUrl: "https://generativelanguage.googleapis.com/v1beta",
       ffmpegPath: "",
       sampleIntervalSeconds: 5,
@@ -310,8 +308,8 @@ function aiDefaults(provider: AiProvider): AiConfig {
   return {
     provider: "local",
     apiKey: "",
-    visionModel: "gemma4",
-    embeddingModel: "embeddinggemma",
+    visionModel: "llava",
+    embeddingModel: "nomic-embed-text",
     baseUrl: "http://127.0.0.1:11434",
     ffmpegPath: "",
     sampleIntervalSeconds: 5,
@@ -339,7 +337,61 @@ function readAiConfig(): AiConfig {
 }
 
 function aiProviderLabel(provider: AiProvider): string {
-  return provider === "openai" ? "OpenAI" : provider === "gemini" ? "Gemini" : "Local (Ollama)";
+  return provider === "openai" ? "OpenAI" : provider === "gemini" ? "Google Gemini" : "Local (Ollama)";
+}
+
+function renderModelInfoCard(preset: ModelPreset): void {
+  if (!aiModelInfo) return;
+  const tierClass =
+    preset.costTier === "free"
+      ? "model-badge-free"
+      : preset.costTier === "premium"
+        ? "model-badge-premium"
+        : "model-badge-budget";
+  aiModelInfo.innerHTML = `
+    <div class="model-info-badges">
+      <span class="model-badge ${tierClass}">${escapeHtml(preset.costLabel)}</span>
+      <span class="model-badge model-badge-speed">⚡ ${escapeHtml(preset.speed)}</span>
+      <span class="model-badge">🎯 Täpsus: ${escapeHtml(preset.accuracy)}</span>
+    </div>
+    <p class="model-info-desc">${escapeHtml(preset.description)}</p>
+  `;
+}
+
+function updateModelPresetOptions(): void {
+  const provider = (aiProvider?.value as AiProvider) || "local";
+  const catalog = MODEL_CATALOG[provider] || MODEL_CATALOG.local;
+  if (aiModelPreset) {
+    aiModelPreset.innerHTML = catalog
+      .map((preset) => `<option value="${preset.id}">${escapeHtml(preset.name)}</option>`)
+      .join("");
+  }
+  syncModelPreset();
+}
+
+function syncModelPreset(): void {
+  if (!aiModelPreset) return;
+  const provider = (aiProvider?.value as AiProvider) || "local";
+  const catalog = MODEL_CATALOG[provider] || MODEL_CATALOG.local;
+  const currentVision = aiVisionModel?.value.trim().toLowerCase() ?? "";
+
+  const matched = catalog.find(
+    (preset) => preset.id !== "custom" && preset.visionModel.toLowerCase() === currentVision,
+  );
+  if (matched) {
+    aiModelPreset.value = matched.id;
+    renderModelInfoCard(matched);
+  } else {
+    const customPreset = catalog.find((p) => p.id === "custom") || catalog[0];
+    aiModelPreset.value = "custom";
+    renderModelInfoCard({
+      ...customPreset,
+      costLabel: "Kohandatud parameetrid",
+      description: currentVision
+        ? `Kasutusel aktiivne mudel: ${currentVision}`
+        : customPreset.description,
+    });
+  }
 }
 
 function applyAiConfig(config: AiConfig): void {
@@ -356,17 +408,9 @@ function applyAiConfig(config: AiConfig): void {
   updateAiProviderFields();
 }
 
-function syncOpenAiPreset(): void {
-  if (!aiOpenAiPreset) return;
-  const model = aiVisionModel?.value.trim().toLowerCase() ?? "";
-  aiOpenAiPreset.value =
-    model === "gpt-5.6-luna" || model === "gpt-5.6-terra" ? model : "custom";
-}
-
 function updateAiProviderFields(): void {
   const provider = (aiProvider?.value as AiProvider) || "local";
   if (aiApiKeyLabel) aiApiKeyLabel.hidden = provider === "local";
-  if (aiOpenAiPresetLabel) aiOpenAiPresetLabel.hidden = provider !== "openai";
   if (aiApiKey) {
     aiApiKey.placeholder =
       provider === "local" ? "Not needed for Local (Ollama)" : "Kept until this app closes";
@@ -374,17 +418,17 @@ function updateAiProviderFields(): void {
   if (aiVisionModel) {
     aiVisionModel.placeholder =
       provider === "local"
-        ? "gemma4"
+        ? "llava"
         : provider === "gemini"
-          ? "gemini-3.6-flash"
-          : "gpt-5.6-luna";
+          ? "gemini-1.5-flash"
+          : "gpt-4o-mini";
   }
   if (aiEmbeddingModel) {
     aiEmbeddingModel.placeholder =
       provider === "local"
-        ? "embeddinggemma"
+        ? "nomic-embed-text"
         : provider === "gemini"
-          ? "gemini-embedding-001"
+          ? "text-embedding-004"
           : "text-embedding-3-small";
   }
   if (aiBaseUrl) {
@@ -395,7 +439,7 @@ function updateAiProviderFields(): void {
           ? "https://generativelanguage.googleapis.com/v1beta"
           : "https://api.openai.com/v1";
   }
-  syncOpenAiPreset();
+  updateModelPresetOptions();
 }
 
 function loadAiConfig(): void {
@@ -978,20 +1022,27 @@ aiProvider?.addEventListener("change", () => {
   saveAiConfig();
 });
 
-aiVisionModel?.addEventListener("input", syncOpenAiPreset);
+aiVisionModel?.addEventListener("input", syncModelPreset);
 
-aiOpenAiPreset?.addEventListener("change", () => {
-  if (!aiVisionModel || !aiOpenAiPreset || aiOpenAiPreset.value === "custom") return;
-  aiVisionModel.value = aiOpenAiPreset.value;
-  if (aiOpenAiPreset.value === "gpt-5.6-luna" && aiMaxFrames && Number(aiMaxFrames.value) > 60) {
-    aiMaxFrames.value = "60";
+aiModelPreset?.addEventListener("change", () => {
+  const provider = (aiProvider?.value as AiProvider) || "local";
+  const catalog = MODEL_CATALOG[provider] || MODEL_CATALOG.local;
+  const selected = catalog.find((p) => p.id === aiModelPreset.value);
+  if (!selected) return;
+
+  if (selected.id !== "custom") {
+    if (aiVisionModel) aiVisionModel.value = selected.visionModel;
+    if (aiEmbeddingModel && selected.embeddingModel) aiEmbeddingModel.value = selected.embeddingModel;
+    if (
+      (selected.id === "gpt-4o-mini" || selected.id === "gemini-1.5-flash") &&
+      aiMaxFrames &&
+      Number(aiMaxFrames.value) > 60
+    ) {
+      aiMaxFrames.value = "60";
+    }
   }
-  if (aiConfigStatus) {
-    aiConfigStatus.textContent =
-      aiOpenAiPreset.value === "gpt-5.6-luna"
-        ? "Budget preset selected (up to 60 frames per video). Save settings; only missing clips are analyzed by default."
-        : "Detailed model selected. It costs about 10× Luna's model token price; enable reanalysis only when needed.";
-  }
+  renderModelInfoCard(selected);
+  saveAiConfig();
 });
 
 aiSettingsForm?.addEventListener("submit", (event) => {
