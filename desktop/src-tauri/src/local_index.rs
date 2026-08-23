@@ -53,6 +53,19 @@ CREATE TABLE ai_annotations (
 CREATE INDEX ai_annotations_content_hash_idx ON ai_annotations(content_hash);
 "#;
 
+const MIGRATION_3: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+    path,
+    searchable_text
+);
+
+INSERT OR IGNORE INTO search_fts(path, searchable_text)
+SELECT local_files.path, local_files.path || ' ' || COALESCE(media_assets.metadata_json, '')
+FROM local_files
+JOIN media_assets ON media_assets.content_hash = local_files.content_hash
+WHERE local_files.status = 'ACTIVE';
+"#;
+
 #[derive(Debug)]
 pub enum IndexError {
     Database(rusqlite::Error),
@@ -289,6 +302,8 @@ impl SqliteIndex {
                     "UPDATE local_files SET status = 'MISSING', last_seen_at = CURRENT_TIMESTAMP WHERE path = ?1",
                     params![file.path],
                 )?;
+                let _ = transaction
+                    .execute("DELETE FROM search_fts WHERE path = ?1", params![file.path]);
                 changes.push(IndexChange {
                     kind: IndexChangeKind::Deleted,
                     path: file.path,
@@ -509,6 +524,9 @@ impl SqliteIndex {
             ))
         })?;
 
+        let query_norm_sq: f32 = query_embedding.iter().map(|v| v * v).sum();
+        let query_norm = query_norm_sq.sqrt();
+
         let mut ranked = rows
             .filter_map(Result::ok)
             .filter_map(
@@ -521,7 +539,8 @@ impl SqliteIndex {
                     content_hash,
                     status,
                 )| {
-                    let semantic_score = cosine_similarity(query_embedding, &stored_embedding)?;
+                    let semantic_score =
+                        cosine_similarity_fast(query_embedding, query_norm, &stored_embedding)?;
                     let keyword_score = lexical_relevance(query_text, &description, &labels);
                     Some(AiSearchResult {
                         timestamp_ms,
@@ -645,7 +664,11 @@ impl SqliteIndex {
             );",
         )?;
 
-        for (version, migration) in [(1_i64, MIGRATION_1), (2_i64, MIGRATION_2)] {
+        for (version, migration) in [
+            (1_i64, MIGRATION_1),
+            (2_i64, MIGRATION_2),
+            (3_i64, MIGRATION_3),
+        ] {
             let applied: Option<i64> = connection
                 .query_row(
                     "SELECT version FROM schema_migrations WHERE version = ?1",
@@ -713,6 +736,12 @@ fn upsert_file(
             file.modified_unix_ms
         ],
     )?;
+    let searchable_text = format!("{} {}", file.path, metadata_search_text(metadata));
+    let _ = transaction.execute("DELETE FROM search_fts WHERE path = ?1", params![file.path]);
+    let _ = transaction.execute(
+        "INSERT INTO search_fts(path, searchable_text) VALUES (?1, ?2)",
+        params![file.path, searchable_text],
+    );
     Ok(())
 }
 
@@ -723,20 +752,28 @@ fn parse_status(status: &str) -> LocalFileStatus {
     }
 }
 
+fn cosine_similarity_fast(left: &[f32], left_norm: f32, right: &[f32]) -> Option<f32> {
+    if left.is_empty() || left.len() != right.len() || left_norm <= 0.0 {
+        return None;
+    }
+    let mut dot = 0.0;
+    let mut right_norm_sq = 0.0;
+    for (left_value, right_value) in left.iter().zip(right) {
+        dot += left_value * right_value;
+        right_norm_sq += right_value * right_value;
+    }
+    let denominator = left_norm * right_norm_sq.sqrt();
+    (denominator > 0.0).then_some(dot / denominator)
+}
+
+#[allow(dead_code)]
 fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
     if left.is_empty() || left.len() != right.len() {
         return None;
     }
-    let mut dot = 0.0;
-    let mut left_norm = 0.0;
-    let mut right_norm = 0.0;
-    for (left_value, right_value) in left.iter().zip(right) {
-        dot += left_value * right_value;
-        left_norm += left_value * left_value;
-        right_norm += right_value * right_value;
-    }
-    let denominator = left_norm.sqrt() * right_norm.sqrt();
-    (denominator > 0.0).then_some(dot / denominator)
+    let left_norm_sq: f32 = left.iter().map(|value| value * value).sum();
+    let left_norm = left_norm_sq.sqrt();
+    cosine_similarity_fast(left, left_norm, right)
 }
 
 fn lexical_relevance(query: &str, description: &str, labels: &[String]) -> f32 {
@@ -1032,7 +1069,7 @@ mod tests {
         let mut index = SqliteIndex::open_in_memory().expect("index should open");
         assert_eq!(
             index.schema_version().expect("version should be readable"),
-            2
+            3
         );
 
         let first = index

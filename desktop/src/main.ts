@@ -1,107 +1,30 @@
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
-type IndexReport = {
-  active_file_count: number;
-  changes: Array<{ kind: string; path: string; content_hash?: string }>;
-  warnings: Array<{ path: string; message: string }>;
-};
-
-type SearchFilters = {
-  keyword?: string;
-  folder?: string;
-  date_from_unix_ms?: number;
-  date_to_unix_ms?: number;
-  resolution?: string;
-  frame_rate?: string;
-  min_duration_ms?: number;
-  max_duration_ms?: number;
-  codec?: string;
-  sort_by: "name" | "duration" | "size" | "modified" | "resolution";
-  sort_direction: "asc" | "desc";
-};
-
-type SearchResult = {
-  path: string;
-  content_hash: string;
-  size_bytes: number;
-  modified_unix_ms: number | null;
-  status: "ACTIVE" | "MISSING";
-  available: boolean;
-  timestamp_ms?: number;
-  ai_description?: string;
-  match_score?: number;
-  metadata: {
-    duration_ms: number | null;
-    container: string | null;
-    video_codec: string | null;
-    audio_codec: string | null;
-    width: number | null;
-    height: number | null;
-    frame_rate: string | null;
-  } | null;
-};
-
-type AiIndexReport = {
-  analyzed_file_count: number;
-  skipped_file_count: number;
-  annotation_count: number;
-  cancelled: boolean;
-  warnings: Array<{ path: string; message: string }>;
-};
-
-type AiAnalysisPlan = {
-  analyze_file_count: number;
-  skipped_file_count: number;
-  max_frames_per_file: number;
-  max_sampled_frames: number;
-  max_vision_requests: number;
-  model: string;
-};
-
-type AiProgress = {
-  completed_files: number;
-  total_files: number;
-  current_file: string;
-  provider: string;
-  percent: number;
-  phase: string;
-};
-
-type AiProvider = "local" | "openai" | "gemini";
-type AiSearchFocus = "focused" | "balanced" | "broad";
-
-type AiConfig = {
-  provider: AiProvider;
-  apiKey: string;
-  visionModel: string;
-  embeddingModel: string;
-  baseUrl: string;
-  ffmpegPath: string;
-  sampleIntervalSeconds: number;
-  maxFrames: number;
-  contextHint: string;
-  reanalyzeExisting: boolean;
-};
-
-type AiConnectionReport = {
-  provider: string;
-  vision_model: string;
-  embedding_model: string;
-  embedding_dimensions: number;
-};
-
-type AiSearchResult = {
-  path: string;
-  content_hash: string;
-  timestamp_ms: number;
-  score: number;
-  description: string;
-  labels: string[];
-  available: boolean;
-};
+import type {
+  AiAnalysisPlan,
+  AiConfig,
+  AiConnectionReport,
+  AiIndexReport,
+  AiProgress,
+  AiProvider,
+  AiSearchFocus,
+  AiSearchResult,
+  IndexReport,
+  SearchFilters,
+  SearchResult,
+} from "./types";
+import {
+  conciseMessage,
+  dateToUnixMs,
+  escapeHtml,
+  formatBytes,
+  formatDuration,
+  numberToMs,
+} from "./utils/formatters";
+import * as tauriApi from "./services/tauri";
 
 const MAX_RENDERED_RESULTS = 500;
 
@@ -340,6 +263,7 @@ const previewPath = document.querySelector<HTMLElement>("#preview-path");
 const previewMessage = document.querySelector<HTMLElement>("#preview-message");
 const previewVideo = document.querySelector<HTMLVideoElement>("#preview-video");
 const closePreviewButton = document.querySelector<HTMLButtonElement>("#close-preview");
+
 let selectedLibraryPath = "";
 let pendingPreviewTimestamp = 0;
 let previewGeneration = 0;
@@ -435,9 +359,8 @@ function applyAiConfig(config: AiConfig): void {
 function syncOpenAiPreset(): void {
   if (!aiOpenAiPreset) return;
   const model = aiVisionModel?.value.trim().toLowerCase() ?? "";
-  aiOpenAiPreset.value = model === "gpt-5.6-luna" || model === "gpt-5.6-terra"
-    ? model
-    : "custom";
+  aiOpenAiPreset.value =
+    model === "gpt-5.6-luna" || model === "gpt-5.6-terra" ? model : "custom";
 }
 
 function updateAiProviderFields(): void {
@@ -445,20 +368,32 @@ function updateAiProviderFields(): void {
   if (aiApiKeyLabel) aiApiKeyLabel.hidden = provider === "local";
   if (aiOpenAiPresetLabel) aiOpenAiPresetLabel.hidden = provider !== "openai";
   if (aiApiKey) {
-    aiApiKey.placeholder = provider === "local" ? "Not needed for Local (Ollama)" : "Kept until this app closes";
+    aiApiKey.placeholder =
+      provider === "local" ? "Not needed for Local (Ollama)" : "Kept until this app closes";
   }
   if (aiVisionModel) {
-    aiVisionModel.placeholder = provider === "local" ? "gemma4" : provider === "gemini" ? "gemini-3.6-flash" : "gpt-5.6-luna";
+    aiVisionModel.placeholder =
+      provider === "local"
+        ? "gemma4"
+        : provider === "gemini"
+          ? "gemini-3.6-flash"
+          : "gpt-5.6-luna";
   }
   if (aiEmbeddingModel) {
-    aiEmbeddingModel.placeholder = provider === "local" ? "embeddinggemma" : provider === "gemini" ? "gemini-embedding-001" : "text-embedding-3-small";
+    aiEmbeddingModel.placeholder =
+      provider === "local"
+        ? "embeddinggemma"
+        : provider === "gemini"
+          ? "gemini-embedding-001"
+          : "text-embedding-3-small";
   }
   if (aiBaseUrl) {
-    aiBaseUrl.placeholder = provider === "local"
-      ? "http://127.0.0.1:11434"
-      : provider === "gemini"
-        ? "https://generativelanguage.googleapis.com/v1beta"
-        : "https://api.openai.com/v1";
+    aiBaseUrl.placeholder =
+      provider === "local"
+        ? "http://127.0.0.1:11434"
+        : provider === "gemini"
+          ? "https://generativelanguage.googleapis.com/v1beta"
+          : "https://api.openai.com/v1";
   }
   syncOpenAiPreset();
 }
@@ -466,10 +401,13 @@ function updateAiProviderFields(): void {
 function loadAiConfig(): void {
   const fallback = aiDefaults("local");
   try {
-    const saved = JSON.parse(localStorage.getItem(AI_SETTINGS_STORAGE_KEY) ?? "null") as Partial<AiConfig> | null;
-    const provider = saved?.provider === "openai" || saved?.provider === "gemini" || saved?.provider === "local"
-      ? saved.provider
-      : fallback.provider;
+    const saved = JSON.parse(
+      localStorage.getItem(AI_SETTINGS_STORAGE_KEY) ?? "null",
+    ) as Partial<AiConfig> | null;
+    const provider =
+      saved?.provider === "openai" || saved?.provider === "gemini" || saved?.provider === "local"
+        ? saved.provider
+        : fallback.provider;
     const legacyApiKey = typeof saved?.apiKey === "string" ? saved.apiKey : "";
     const sessionApiKey = sessionStorage.getItem(AI_API_KEY_SESSION_STORAGE_KEY) ?? legacyApiKey;
     if (legacyApiKey && !sessionStorage.getItem(AI_API_KEY_SESSION_STORAGE_KEY)) {
@@ -498,7 +436,8 @@ function saveAiConfig(): AiConfig {
     localStorage.setItem(AI_SETTINGS_STORAGE_KEY, JSON.stringify(safeSettings));
     if (apiKey) sessionStorage.setItem(AI_API_KEY_SESSION_STORAGE_KEY, apiKey);
     else sessionStorage.removeItem(AI_API_KEY_SESSION_STORAGE_KEY);
-    if (aiConfigStatus) aiConfigStatus.textContent = "Settings saved. API key is kept for this app session only.";
+    if (aiConfigStatus)
+      aiConfigStatus.textContent = "Settings saved. API key is kept for this app session only.";
   } catch (error) {
     if (aiConfigStatus) aiConfigStatus.textContent = `Could not save AI settings: ${String(error)}`;
   }
@@ -512,7 +451,7 @@ async function restoreSelectedLibrary(): Promise<void> {
     if (!("__TAURI_INTERNALS__" in window)) return;
     let savedPath = localStorage.getItem(LIBRARY_PATH_STORAGE_KEY)?.trim() ?? "";
     if (!savedPath) {
-      savedPath = (await invoke<string | null>("get_indexed_library_path"))?.trim() ?? "";
+      savedPath = (await tauriApi.getIndexedLibraryPath())?.trim() ?? "";
       if (savedPath) localStorage.setItem(LIBRARY_PATH_STORAGE_KEY, savedPath);
     }
     if (!savedPath) return;
@@ -536,7 +475,8 @@ function showAiProgress(percent: number, label: string, isError = false): void {
   }
   if (analysisProgressLabel) analysisProgressLabel.textContent = label;
   if (analysisProgressPercent) analysisProgressPercent.textContent = `${safePercent}%`;
-  if (analysisProgressTrack) analysisProgressTrack.setAttribute("aria-valuenow", String(safePercent));
+  if (analysisProgressTrack)
+    analysisProgressTrack.setAttribute("aria-valuenow", String(safePercent));
   if (analysisProgressFill) analysisProgressFill.style.width = `${safePercent}%`;
 }
 
@@ -554,13 +494,6 @@ void listen<AiProgress>("ai-progress", ({ payload }) => {
   }
 });
 
-function conciseMessage(value: unknown, maxLength = 240): string {
-  let message = String(value).replace(/\s+/g, " ").trim();
-  const rawJsonStart = message.search(/[\[{]\s*"(?:id|error|object|status)"/);
-  if (rawJsonStart > 0) message = message.slice(0, rawJsonStart).trimEnd();
-  return message.length > maxLength ? `${message.slice(0, maxLength - 1).trimEnd()}…` : message;
-}
-
 function summarizeAiWarnings(warnings: AiIndexReport["warnings"]): string {
   if (warnings.length === 0) return "";
   const first = warnings[0];
@@ -569,56 +502,11 @@ function summarizeAiWarnings(warnings: AiIndexReport["warnings"]): string {
   return `${fileName}: ${conciseMessage(first.message)}${remaining}`;
 }
 
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>'"]/g, (character) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    "'": "&#39;",
-    '"': "&quot;",
-  })[character] ?? character);
-}
-
-function dateToUnixMs(value: string): number | undefined {
-  if (!value) return undefined;
-  const timestamp = Date.parse(`${value}T00:00:00Z`);
-  return Number.isNaN(timestamp) ? undefined : timestamp;
-}
-
-function formatBytes(value: number): string {
-  if (value < 1024) return `${value} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let amount = value;
-  let unit = "B";
-  for (const nextUnit of units) {
-    amount /= 1024;
-    unit = nextUnit;
-    if (amount < 1024) break;
-  }
-  return `${amount.toFixed(amount >= 10 ? 0 : 1)} ${unit}`;
-}
-
-function formatDuration(durationMs: number | null | undefined): string {
-  if (durationMs == null) return "duration unavailable";
-  const totalSeconds = Math.round(durationMs / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  return hours > 0
-    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
-    : `${minutes}:${String(seconds).padStart(2, "0")}`;
-}
-
-function numberToMs(value: string): number | undefined {
-  if (!value) return undefined;
-  const seconds = Number(value);
-  return Number.isFinite(seconds) && seconds >= 0 ? Math.round(seconds * 1000) : undefined;
-}
-
 function readFilters(): SearchFilters {
   const value = (id: string) => document.querySelector<HTMLInputElement>(id)?.value.trim() ?? "";
   const sortBy = document.querySelector<HTMLSelectElement>("#sort-by")?.value ?? "name";
-  const sortDirection = document.querySelector<HTMLSelectElement>("#sort-direction")?.value ?? "asc";
+  const sortDirection =
+    document.querySelector<HTMLSelectElement>("#sort-direction")?.value ?? "asc";
   return {
     keyword: value("#search-input") || undefined,
     folder: value("#filter-folder") || undefined,
@@ -656,9 +544,10 @@ async function openPreview(path: string, name: string, timestampMs = 0): Promise
   }
   previewDialog.hidden = false;
   try {
-    const allowedPath = "__TAURI_INTERNALS__" in window
-      ? await invoke<string>("prepare_indexed_media_preview", { path })
-      : path;
+    const allowedPath =
+      "__TAURI_INTERNALS__" in window
+        ? await tauriApi.prepareIndexedMediaPreview(path)
+        : path;
     if (generation !== previewGeneration) return;
     previewVideo.src = convertFileSrc(allowedPath);
     previewVideo.load();
@@ -678,7 +567,9 @@ function renderResultCard(result: SearchResult, index: number): string {
       : "Technical metadata unavailable";
   const status = result.available ? "Available" : "Unavailable — rescan or restore this path";
   const fileName = result.path.split(/[\\/]/).pop() ?? result.path;
-  const previewLabel = result.timestamp_ms ? `Preview @ ${formatDuration(result.timestamp_ms)}` : "Preview";
+  const previewLabel = result.timestamp_ms
+    ? `Preview @ ${formatDuration(result.timestamp_ms)}`
+    : "Preview";
   return `<article class="result-card ${result.available ? "" : "result-card-unavailable"}">
     <div>
       <p class="result-index">${String(index + 1).padStart(2, "0")}</p>
@@ -704,31 +595,37 @@ function renderGroupedAiResults(results: SearchResult[]): string {
 
   const groupedResults = Array.from(groups.values());
   const topScore = groupedResults[0]?.[0]?.match_score ?? 0;
-  return groupedResults.map((group, groupIndex) => {
-    const bestMatch = group[0];
-    const fileName = bestMatch.path.split(/[\\/]/).pop() ?? bestMatch.path;
-    const parentFolder = bestMatch.path.split(/[\\/]/).slice(0, -1).pop() ?? "Local library";
-    const moments = [...group].sort((left, right) =>
-      (left.timestamp_ms ?? 0) - (right.timestamp_ms ?? 0)
-    );
-    const bestScore = Math.max(...group.map((result) => result.match_score ?? 0));
-    const relevance = groupIndex === 0 ? "Top match" : bestScore >= topScore - 0.04 ? "Strong" : "Related";
-    const timestamp = bestMatch.timestamp_ms ?? 0;
-    const thumbnailKey = `${bestMatch.content_hash}:${timestamp}`;
-    const otherMoments = moments.filter((moment) => moment !== bestMatch);
-    const extraMoments = otherMoments.length
-      ? `<details class="video-moments">
+  return groupedResults
+    .map((group, groupIndex) => {
+      const bestMatch = group[0];
+      const fileName = bestMatch.path.split(/[\\/]/).pop() ?? bestMatch.path;
+      const parentFolder = bestMatch.path.split(/[\\/]/).slice(0, -1).pop() ?? "Local library";
+      const moments = [...group].sort(
+        (left, right) => (left.timestamp_ms ?? 0) - (right.timestamp_ms ?? 0),
+      );
+      const bestScore = Math.max(...group.map((result) => result.match_score ?? 0));
+      const relevance =
+        groupIndex === 0 ? "Top match" : bestScore >= topScore - 0.04 ? "Strong" : "Related";
+      const timestamp = bestMatch.timestamp_ms ?? 0;
+      const thumbnailKey = `${bestMatch.content_hash}:${timestamp}`;
+      const otherMoments = moments.filter((moment) => moment !== bestMatch);
+      const extraMoments = otherMoments.length
+        ? `<details class="video-moments">
           <summary>${otherMoments.length} more ${otherMoments.length === 1 ? "moment" : "moments"}</summary>
           <div class="moment-list">
-            ${otherMoments.map((moment) => `<button class="moment-row preview-result" type="button" data-name="${escapeHtml(fileName)}" data-path="${escapeHtml(moment.path)}" data-timestamp-ms="${moment.timestamp_ms ?? 0}" ${moment.available ? "" : "disabled"}>
+            ${otherMoments
+              .map(
+                (moment) => `<button class="moment-row preview-result" type="button" data-name="${escapeHtml(fileName)}" data-path="${escapeHtml(moment.path)}" data-timestamp-ms="${moment.timestamp_ms ?? 0}" ${moment.available ? "" : "disabled"}>
               <strong>${escapeHtml(formatDuration(moment.timestamp_ms))}</strong>
               <span>${escapeHtml(moment.ai_description ?? "Matching scene")}</span>
               <span aria-hidden="true">▶</span>
-            </button>`).join("")}
+            </button>`,
+              )
+              .join("")}
           </div>
         </details>`
-      : "";
-    return `<article class="video-result-card ${bestMatch.available ? "" : "result-card-unavailable"}">
+        : "";
+      return `<article class="video-result-card ${bestMatch.available ? "" : "result-card-unavailable"}">
       <button class="video-thumbnail preview-result" type="button" data-name="${escapeHtml(fileName)}" data-path="${escapeHtml(bestMatch.path)}" data-timestamp-ms="${timestamp}" data-thumbnail-key="${escapeHtml(thumbnailKey)}" ${bestMatch.available ? "" : "disabled"} aria-label="Preview ${escapeHtml(fileName)} at ${escapeHtml(formatDuration(timestamp))}">
         <img alt="" />
         <span class="thumbnail-placeholder">Creating local thumbnail…</span>
@@ -748,7 +645,8 @@ function renderGroupedAiResults(results: SearchResult[]): string {
         ${extraMoments}
       </div>
     </article>`;
-  }).join("");
+    })
+    .join("");
 }
 
 async function loadAiThumbnails(ffmpegPath: string): Promise<void> {
@@ -766,11 +664,11 @@ async function loadAiThumbnails(ffmpegPath: string): Promise<void> {
       try {
         let dataUrl = thumbnailCache.get(key);
         if (!dataUrl) {
-          dataUrl = await invoke<string>("get_ai_thumbnail", {
-            path: button.dataset.path ?? "",
-            timestampMs: Number(button.dataset.timestampMs ?? "0"),
-            ffmpegPath: ffmpegPath || null,
-          });
+          dataUrl = await tauriApi.getAiThumbnail(
+            button.dataset.path ?? "",
+            Number(button.dataset.timestampMs ?? "0"),
+            ffmpegPath,
+          );
           thumbnailCache.set(key, dataUrl);
         }
         if (generation !== thumbnailGeneration || !button.isConnected) return;
@@ -818,7 +716,7 @@ function renderResults(results: SearchResult[], groupByVideo = false): void {
   resultList.querySelectorAll<HTMLButtonElement>(".open-result").forEach((button) => {
     button.addEventListener("click", async () => {
       try {
-        await invoke("open_indexed_media_path", { path: button.dataset.path ?? "" });
+        await tauriApi.openIndexedMediaPath(button.dataset.path ?? "");
       } catch (error) {
         if (libraryStatus) libraryStatus.textContent = "Could not open clip";
         if (libraryPath) libraryPath.textContent = String(error);
@@ -836,7 +734,7 @@ async function searchLibrary(trigger?: HTMLButtonElement): Promise<void> {
   if (libraryStatus) libraryStatus.textContent = "Searching local index…";
   if (libraryPath) libraryPath.textContent = "Applying filters and sorting";
   try {
-    const results = await invoke<SearchResult[]>("search_media", { query: readFilters() });
+    const results = await tauriApi.searchMedia(readFilters());
     renderResults(results);
     if (clipCount) clipCount.textContent = `${results.length} matches`;
     if (libraryStatus) libraryStatus.textContent = `${results.length} matching clips`;
@@ -871,7 +769,7 @@ async function searchAiLibrary(): Promise<void> {
   }
   if (libraryStatus) libraryStatus.textContent = "AI search in progress…";
   try {
-    const matches = await invoke<AiSearchResult[]>("search_ai", { query, config, focus });
+    const matches = await tauriApi.searchAi(query, config, focus);
     const displayResults: SearchResult[] = matches.map((match) => ({
       path: match.path,
       content_hash: match.content_hash,
@@ -888,10 +786,12 @@ async function searchAiLibrary(): Promise<void> {
     void loadAiThumbnails(config.ffmpegPath);
     const videoCount = new Set(matches.map((match) => match.content_hash)).size;
     if (clipCount) clipCount.textContent = `${videoCount} videos · ${matches.length} moments`;
-    if (libraryStatus) libraryStatus.textContent = `${matches.length} AI moments in ${videoCount} videos for “${query}”`;
-    if (aiSearchStatus) aiSearchStatus.textContent = matches.length
-      ? `${focus === "focused" ? "Focused" : focus === "balanced" ? "Balanced" : "Broad"} results · click a thumbnail to preview.`
-      : "No AI matches. Analyze the selected folder first or try another description.";
+    if (libraryStatus)
+      libraryStatus.textContent = `${matches.length} AI moments in ${videoCount} videos for “${query}”`;
+    if (aiSearchStatus)
+      aiSearchStatus.textContent = matches.length
+        ? `${focus === "focused" ? "Focused" : focus === "balanced" ? "Balanced" : "Broad"} results · click a thumbnail to preview.`
+        : "No AI matches. Analyze the selected folder first or try another description.";
   } catch (error) {
     const message = String(error);
     if (aiSearchStatus) aiSearchStatus.textContent = message;
@@ -916,11 +816,11 @@ async function analyzeLibraryWithAi(): Promise<void> {
   const config = saveAiConfig();
   let analysisStarted = false;
   try {
-    const plan = await invoke<AiAnalysisPlan>("plan_ai_analysis", {
-      path: selectedLibraryPath,
+    const plan = await tauriApi.planAiAnalysis(
+      selectedLibraryPath,
       config,
-      force: config.reanalyzeExisting,
-    });
+      config.reanalyzeExisting,
+    );
     if (config.provider !== "local" && plan.analyze_file_count > 0) {
       const action = config.reanalyzeExisting ? "reanalyze" : "analyze";
       const skipped = plan.skipped_file_count
@@ -928,12 +828,13 @@ async function analyzeLibraryWithAi(): Promise<void> {
         : "";
       const confirmed = window.confirm(
         `${aiProviderLabel(config.provider)} will ${action} ${plan.analyze_file_count} unique videos.\n\n` +
-        `Maximum configured upload: ${plan.max_sampled_frames} sampled frame images in up to ${plan.max_vision_requests} vision batches ` +
-        `(${plan.max_frames_per_file} frames per video). Short clips may use less.${skipped}\n\nContinue?`,
+          `Maximum configured upload: ${plan.max_sampled_frames} sampled frame images in up to ${plan.max_vision_requests} vision batches ` +
+          `(${plan.max_frames_per_file} frames per video). Short clips may use less.${skipped}\n\nContinue?`,
       );
       if (!confirmed) {
         if (libraryStatus) libraryStatus.textContent = "AI analysis not started";
-        if (libraryPath) libraryPath.textContent = "No API requests were sent and no credits were used.";
+        if (libraryPath)
+          libraryPath.textContent = "No API requests were sent and no credits were used.";
         if (aiSearchStatus) aiSearchStatus.textContent = "Analysis cancelled before upload.";
         return;
       }
@@ -946,29 +847,41 @@ async function analyzeLibraryWithAi(): Promise<void> {
     analyzeAiButton.setAttribute("aria-pressed", "true");
     showAiProgress(0, "Preparing clips");
     if (libraryStatus) libraryStatus.textContent = "AI analysis in progress…";
-    if (libraryPath) libraryPath.textContent = `Using ${aiProviderLabel(config.provider)} · ${config.visionModel} / ${config.embeddingModel}`;
-    const report = await invoke<AiIndexReport>("analyze_media_folder", {
-      path: selectedLibraryPath,
+    if (libraryPath)
+      libraryPath.textContent = `Using ${aiProviderLabel(config.provider)} · ${config.visionModel} / ${config.embeddingModel}`;
+    const report = await tauriApi.analyzeMediaFolder(
+      selectedLibraryPath,
       config,
-      force: config.reanalyzeExisting,
-    });
+      config.reanalyzeExisting,
+    );
     if (report.cancelled) {
       showAiProgress(lastAiProgressPercent, "Analysis stopped");
-      if (libraryStatus) libraryStatus.textContent = `AI analysis stopped · ${report.analyzed_file_count} clips saved`;
-      if (libraryPath) libraryPath.textContent = `${report.annotation_count} new visual moments kept · unstarted clips were not charged`;
-      if (aiSearchStatus) aiSearchStatus.textContent = "Completed clips remain searchable. Start analysis again later to continue with missing clips.";
+      if (libraryStatus)
+        libraryStatus.textContent = `AI analysis stopped · ${report.analyzed_file_count} clips saved`;
+      if (libraryPath)
+        libraryPath.textContent = `${report.annotation_count} new visual moments kept · unstarted clips were not charged`;
+      if (aiSearchStatus)
+        aiSearchStatus.textContent =
+          "Completed clips remain searchable. Start analysis again later to continue with missing clips.";
     } else {
       const warningSuffix = report.warnings.length ? ` · ${report.warnings.length} warnings` : "";
       const warningDetails = summarizeAiWarnings(report.warnings);
-      showAiProgress(100, report.warnings.length ? "Analysis complete with warnings" : "Analysis complete");
-      const skippedSuffix = report.skipped_file_count ? ` · ${report.skipped_file_count} already ready` : "";
-      if (libraryStatus) libraryStatus.textContent = `AI indexed ${report.analyzed_file_count} clips${skippedSuffix}${warningSuffix}`;
+      showAiProgress(
+        100,
+        report.warnings.length ? "Analysis complete with warnings" : "Analysis complete",
+      );
+      const skippedSuffix = report.skipped_file_count
+        ? ` · ${report.skipped_file_count} already ready`
+        : "";
+      if (libraryStatus)
+        libraryStatus.textContent = `AI indexed ${report.analyzed_file_count} clips${skippedSuffix}${warningSuffix}`;
       if (libraryPath) {
-        libraryPath.textContent = report.analyzed_file_count === 0 && report.skipped_file_count > 0
-          ? "Existing AI index kept · no API credits used"
-          : warningDetails
-            ? `${report.annotation_count} new visual moments stored locally · ${warningDetails}`
-            : `${report.annotation_count} new visual moments stored locally`;
+        libraryPath.textContent =
+          report.analyzed_file_count === 0 && report.skipped_file_count > 0
+            ? "Existing AI index kept · no API credits used"
+            : warningDetails
+              ? `${report.annotation_count} new visual moments stored locally · ${warningDetails}`
+              : `${report.annotation_count} new visual moments stored locally`;
       }
       if (aiSearchStatus) {
         aiSearchStatus.textContent = warningDetails
@@ -979,7 +892,10 @@ async function analyzeLibraryWithAi(): Promise<void> {
       }
     }
   } catch (error) {
-    if (libraryStatus) libraryStatus.textContent = analysisStarted ? "AI analysis failed" : "Could not prepare AI analysis";
+    if (libraryStatus)
+      libraryStatus.textContent = analysisStarted
+        ? "AI analysis failed"
+        : "Could not prepare AI analysis";
     if (libraryPath) libraryPath.textContent = conciseMessage(error);
     if (analysisStarted) showAiProgress(lastAiProgressPercent, "Analysis stopped", true);
   } finally {
@@ -1005,9 +921,11 @@ async function cancelAiAnalysis(): Promise<void> {
   analyzeAiButton.textContent = "Stopping…";
   showAiProgress(lastAiProgressPercent, "Stopping after current request…");
   if (libraryStatus) libraryStatus.textContent = "Stopping AI analysis…";
-  if (libraryPath) libraryPath.textContent = "No new files or frame batches will start. The current API request may still finish.";
+  if (libraryPath)
+    libraryPath.textContent =
+      "No new files or frame batches will start. The current API request may still finish.";
   try {
-    aiStopRequested = await invoke<boolean>("cancel_ai_analysis");
+    aiStopRequested = await tauriApi.cancelAiAnalysis();
     if (!aiStopRequested && libraryPath) {
       libraryPath.textContent = "Analysis is already finishing.";
     }
@@ -1026,13 +944,21 @@ async function testAiConnection(): Promise<void> {
   if (!testAiConnectionButton) return;
   testAiConnectionButton.disabled = true;
   const config = saveAiConfig();
-  if (aiConfigStatus) aiConfigStatus.textContent = `Testing ${aiProviderLabel(config.provider)} · ${config.embeddingModel}…`;
+  if (aiConfigStatus)
+    aiConfigStatus.textContent = `Testing ${aiProviderLabel(config.provider)} · ${config.embeddingModel}…`;
   try {
-    const report = await invoke<AiConnectionReport>("test_ai_connection", {
-      config,
-    });
+    const report = await tauriApi.testAiConnection(config);
     if (aiConfigStatus) {
-      aiConfigStatus.textContent = "Connected: " + report.provider + " · " + report.embedding_model + " · " + report.embedding_dimensions + " dimensions";
+      aiConfigStatus.textContent =
+        "Connected: " +
+        report.provider +
+        " · " +
+        report.vision_model +
+        " / " +
+        report.embedding_model +
+        " · " +
+        report.embedding_dimensions +
+        " dimensions";
     }
   } catch (error) {
     if (aiConfigStatus) aiConfigStatus.textContent = String(error);
@@ -1061,9 +987,10 @@ aiOpenAiPreset?.addEventListener("change", () => {
     aiMaxFrames.value = "60";
   }
   if (aiConfigStatus) {
-    aiConfigStatus.textContent = aiOpenAiPreset.value === "gpt-5.6-luna"
-      ? "Budget preset selected (up to 60 frames per video). Save settings; only missing clips are analyzed by default."
-      : "Detailed model selected. It costs about 10× Luna's model token price; enable reanalysis only when needed.";
+    aiConfigStatus.textContent =
+      aiOpenAiPreset.value === "gpt-5.6-luna"
+        ? "Budget preset selected (up to 60 frames per video). Save settings; only missing clips are analyzed by default."
+        : "Detailed model selected. It costs about 10× Luna's model token price; enable reanalysis only when needed.";
   }
 });
 
@@ -1093,11 +1020,12 @@ selectFolderButton?.addEventListener("click", async () => {
   if (libraryPath) libraryPath.textContent = selected;
 
   try {
-    const report = await invoke<IndexReport>("index_media_folder", { path: selected });
+    const report = await tauriApi.indexMediaFolder(selected);
     selectedLibraryPath = selected;
     if (analyzeAiButton) analyzeAiButton.disabled = false;
     if (libraryStatus) {
-      libraryStatus.textContent = report.warnings.length === 0 ? "Folder indexed" : "Folder indexed with warnings";
+      libraryStatus.textContent =
+        report.warnings.length === 0 ? "Folder indexed" : "Folder indexed with warnings";
     }
     if (clipCount) clipCount.textContent = `${report.active_file_count} clips`;
     try {
@@ -1135,12 +1063,9 @@ analyzeAiButton?.addEventListener("click", () => {
   else void analyzeLibraryWithAi();
 });
 
-document.querySelector<HTMLButtonElement>("#learn-more")?.addEventListener(
-  "click",
-  () => {
-    window.alert("See docs/project-plan.md for the current MVP scope.");
-  },
-);
+document.querySelector<HTMLButtonElement>("#learn-more")?.addEventListener("click", () => {
+  window.alert("See docs/project-plan.md for the current MVP scope.");
+});
 
 void restoreSelectedLibrary();
 
@@ -1159,10 +1084,19 @@ previewVideo?.addEventListener("loadedmetadata", () => {
 });
 previewVideo?.addEventListener("error", () => {
   if (previewMessage) {
-    previewMessage.textContent = "This clip cannot be previewed in the embedded player. Use Open to launch it in your system player.";
+    previewMessage.textContent =
+      "This clip cannot be previewed in the embedded player. Use Open to launch it in your system player.";
     previewMessage.hidden = false;
   }
 });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && previewDialog && !previewDialog.hidden) closePreview();
+  if (event.key === "Escape" && previewDialog && !previewDialog.hidden) {
+    closePreview();
+  } else if (event.key === " " && previewDialog && !previewDialog.hidden && previewVideo) {
+    if (event.target === document.body || event.target === previewDialog || event.target === previewVideo) {
+      event.preventDefault();
+      if (previewVideo.paused) void previewVideo.play();
+      else previewVideo.pause();
+    }
+  }
 });

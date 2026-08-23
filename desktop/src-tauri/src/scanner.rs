@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -343,17 +343,45 @@ fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
     }
 }
 
+const FULL_HASH_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
+const SAMPLE_CHUNK_SIZE: usize = 256 * 1024;
+
 fn hash_file(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
+    let metadata = file.metadata()?;
+    let size = metadata.len();
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
 
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    if size <= FULL_HASH_THRESHOLD_BYTES {
+        let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
         }
-        hasher.update(&buffer[..read]);
+    } else {
+        hasher.update(b"FAST_TIERED_V1:");
+        hasher.update(size.to_be_bytes());
+
+        let mut chunk = vec![0u8; SAMPLE_CHUNK_SIZE];
+
+        // 1. Initial chunk
+        let read = file.read(&mut chunk)?;
+        hasher.update(&chunk[..read]);
+
+        // 2. Middle chunk
+        let middle_offset = size / 2;
+        file.seek(SeekFrom::Start(middle_offset))?;
+        let read = file.read(&mut chunk)?;
+        hasher.update(&chunk[..read]);
+
+        // 3. Tail chunk
+        let tail_offset = size.saturating_sub(SAMPLE_CHUNK_SIZE as u64);
+        file.seek(SeekFrom::Start(tail_offset))?;
+        let read = file.read(&mut chunk)?;
+        hasher.update(&chunk[..read]);
     }
 
     Ok(format!("{:x}", hasher.finalize()))
@@ -534,5 +562,21 @@ mod tests {
                 .expect("scan should succeed");
 
         assert_eq!(report.files[0].content_hash, "cached-hash");
+    }
+
+    #[test]
+    fn hashes_large_file_deterministically() {
+        let directory = TestDirectory::new("large-file-hash");
+        let path = directory.0.join("large_clip.mp4");
+        let file = File::create(&path).expect("large file should be created");
+        file.set_len(17 * 1024 * 1024)
+            .expect("file length should be set");
+        drop(file);
+
+        let hash_1 = hash_file(&path).expect("first hash should succeed");
+        let hash_2 = hash_file(&path).expect("second hash should succeed");
+
+        assert_eq!(hash_1, hash_2);
+        assert!(!hash_1.is_empty());
     }
 }
