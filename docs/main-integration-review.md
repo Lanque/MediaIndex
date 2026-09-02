@@ -14,7 +14,8 @@ must not be used for review statistics.
 The current `feat/performance-cost-and-search-optimizations` branch now contains
 `origin/main`; it is 0 commits behind. The post-main history consists of the ten
 original performance/provider/UI commits, two focused finishing commits, the
-synchronization merge, and this documentation correction when committed.
+synchronization merge, the documentation reconciliation, and one integration
+cleanup commit: 15 commits ahead in total at this snapshot.
 
 The review delta is approximately 3.3k insertions and 1.3k deletions across 24
 tracked files. The largest areas are the TypeScript desktop interface, its

@@ -14,9 +14,8 @@ without presenting MediaIndex as a browser-hosted product.
 - Active branch: `feat/performance-cost-and-search-optimizations`
 - Integration target: fetched `origin/main` at `79e2626`
 - Local `main` is stale at `78cb453`. Merge commit `6ef9655` synchronized the
-  feature branch with `origin/main`; the branch is 13 commits ahead and 0 behind
-  before the final documentation correction (14 ahead after it is committed).
-  Read
+  feature branch with `origin/main`; the branch is 15 commits ahead and 0 behind
+  at this snapshot. Read
   [main-integration-review.md](main-integration-review.md) before changing Git
   history.
 - Preserve user-owned `.idea/` files and unrelated working-tree changes.
@@ -100,7 +99,7 @@ Use the executable or NSIS-installed app, not the Vite browser preview.
 
 ## GitHub reconciliation
 
-When authenticated, list all open and closed issues/PRs and map the 14
+When authenticated, list all open and closed issues/PRs and map the 15
 post-`origin/main` commits to them. The foundation stack is already merged
 through PR #39, so use one focused follow-up PR rather than recreating that
 stack. The follow-up PR should include:
