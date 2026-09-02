@@ -6,17 +6,26 @@ MediaIndex is a local-first media indexing and search platform for large video p
 
 ## Current status
 
-The repository is being bootstrapped from the project plan. The first implementation target is the local desktop MVP:
+The current integration branch contains a working Windows desktop MVP packaged
+with Tauri. MediaIndex is not a browser-hosted product: the TypeScript interface
+runs inside the native desktop shell and works with the local filesystem through
+the Rust backend.
 
-- folder scanning and media discovery
-- FFprobe/FFmpeg metadata extraction
-- SQLite local index
-- stable content hashing
-- metadata and keyword search
-- opening the original local clip
-- detection of new, modified, moved, and deleted files
+- recursive folder scanning, stable hashing, and change detection;
+- cached FFprobe metadata and a machine-local SQLite index;
+- contact sheets grouped by the footage's real source folders;
+- deterministic search, filters, local preview, and opening the original clip;
+- explicit sampled-frame AI analysis through OpenAI, Gemini, or local Ollama;
+- per-video timestamped visual search with duplicate-moment suppression;
+- background analysis progress, cancellation, and bounded cloud cost preflight.
 
-The cloud roadmap follows after the local workflow is useful on its own.
+The API, worker, migration, and Terraform foundations are present, but no AWS
+infrastructure is applied by this repository. GitHub's `origin/main` now
+contains the merged foundation, scanner, metadata, local-index, responsive
+preview, and AI-search stack through PR #39. The current branch is a divergent
+performance, provider, and interface follow-up; review the exact integration
+state in [docs/main-integration-review.md](docs/main-integration-review.md)
+before merging.
 
 ## Product principles
 
@@ -50,6 +59,8 @@ The full architecture and the reasoning behind each component live in [docs/arch
 
 | Path | Purpose |
 | --- | --- |
+| `PRODUCT.md` | product brief and desktop delivery boundary |
+| `DESIGN.md` | canonical desktop visual system |
 | `desktop/` | Tauri + TypeScript desktop client |
 | `api/` | FastAPI service |
 | `worker/` | asynchronous processing worker |
@@ -71,6 +82,8 @@ All work should start from a GitHub issue and land through a pull request:
 6. Merge only after the PR checklist and CI are green.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/development-workflow.md](docs/development-workflow.md).
+The detailed continuation checklist is in
+[docs/next-agent-plan.md](docs/next-agent-plan.md).
 
 ## Scope boundaries
 
