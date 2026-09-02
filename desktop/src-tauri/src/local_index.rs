@@ -184,6 +184,7 @@ pub struct SearchResult {
     pub status: LocalFileStatus,
     pub available: bool,
     pub metadata: Option<MediaMetadata>,
+    pub ai_annotation_count: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -617,7 +618,8 @@ impl SqliteIndex {
     pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>, IndexError> {
         let mut statement = self.connection.prepare(
             "SELECT local_files.path, local_files.content_hash, local_files.size_bytes,
-                    local_files.modified_unix_ms, local_files.status, media_assets.metadata_json
+                    local_files.modified_unix_ms, local_files.status, media_assets.metadata_json,
+                    (SELECT COUNT(*) FROM ai_annotations WHERE ai_annotations.content_hash = local_files.content_hash) AS ai_count
              FROM local_files
              JOIN media_assets ON media_assets.content_hash = local_files.content_hash
              ORDER BY local_files.path",
@@ -632,6 +634,7 @@ impl SqliteIndex {
             let modified_unix_ms: Option<u64> = row.get(3)?;
             let status: LocalFileStatus = parse_status(&row.get::<_, String>(4)?);
             let metadata_json: Option<String> = row.get(5)?;
+            let ai_annotation_count: u64 = row.get(6)?;
             let metadata = metadata_json
                 .map(|value| serde_json::from_str(&value))
                 .transpose()?;
@@ -643,6 +646,7 @@ impl SqliteIndex {
                 modified_unix_ms,
                 status,
                 metadata,
+                ai_annotation_count,
             };
 
             if matches_query(&result, query) {
