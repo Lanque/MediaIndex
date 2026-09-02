@@ -32,7 +32,7 @@ pull request.
   `78cb453`; use `origin/main` for comparisons.
 - `feat/performance-cost-and-search-optimizations` is the current desktop MVP
   follow-up branch. Commit `6ef9655` merged `origin/main`, so the branch now
-  contains the fetched baseline and is 15 commits ahead, 0 behind at this
+  contains the fetched baseline and is 16 commits ahead, 0 behind at this
   snapshot.
 - The merge strategy and live GitHub reconciliation are documented in
   [main-integration-review.md](main-integration-review.md).

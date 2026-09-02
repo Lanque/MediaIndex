@@ -14,8 +14,9 @@ must not be used for review statistics.
 The current `feat/performance-cost-and-search-optimizations` branch now contains
 `origin/main`; it is 0 commits behind. The post-main history consists of the ten
 original performance/provider/UI commits, two focused finishing commits, the
-synchronization merge, the documentation reconciliation, and one integration
-cleanup commit: 15 commits ahead in total at this snapshot.
+synchronization merge, the documentation reconciliation, one integration
+cleanup commit, and this published-state update: 16 commits ahead in total at
+this snapshot.
 
 The review delta is approximately 3.3k insertions and 1.3k deletions across 24
 tracked files. The largest areas are the TypeScript desktop interface, its
@@ -58,8 +59,9 @@ installer produced by `tauri build`.
    genuinely new remote commits.
 2. After GitHub authentication, audit open/closed issues and PRs. Do not guess
    their state from local refs.
-3. Push this branch and open one follow-up PR named **Improve MediaIndex
-   performance, providers, and desktop library UX**.
+3. The branch is already published as
+   `origin/feat/performance-cost-and-search-optimizations`; open one follow-up PR
+   named **Improve MediaIndex performance, providers, and desktop library UX**.
 4. Link the still-relevant issues and state that the foundation stack is already
    merged through PR #39.
 5. Review the PR by subsystem and attach the packaged-app verification evidence.
