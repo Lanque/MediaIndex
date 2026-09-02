@@ -22,10 +22,11 @@ the Rust backend.
 The API, worker, migration, and Terraform foundations are present, but no AWS
 infrastructure is applied by this repository. GitHub's `origin/main` now
 contains the merged foundation, scanner, metadata, local-index, responsive
-preview, and AI-search stack through PR #39. The current branch is a divergent
-performance, provider, and interface follow-up; review the exact integration
-state in [docs/main-integration-review.md](docs/main-integration-review.md)
-before merging.
+preview, and AI-search stack through PR #39. The current branch is synchronized
+with that baseline and adds the performance, provider, and interface follow-up;
+review the exact delta in
+[docs/main-integration-review.md](docs/main-integration-review.md) before
+merging.
 
 ## Product principles
 
