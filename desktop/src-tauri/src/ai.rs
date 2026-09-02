@@ -13,10 +13,10 @@ use crate::metadata::MediaMetadata;
 const DEFAULT_OPENAI_VISION_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_OPENAI_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_GEMINI_VISION_MODEL: &str = "gemini-3.6-flash";
-const DEFAULT_GEMINI_EMBEDDING_MODEL: &str = "embedding-001";
+const DEFAULT_GEMINI_VISION_MODEL: &str = "gemini-3.8-flash";
+const DEFAULT_GEMINI_EMBEDDING_MODEL: &str = "gemini-embedding-2";
 const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
-const DEFAULT_LOCAL_VISION_MODEL: &str = "gemma4";
+const DEFAULT_LOCAL_VISION_MODEL: &str = "gemma4:e2b";
 const DEFAULT_LOCAL_EMBEDDING_MODEL: &str = "embeddinggemma";
 const DEFAULT_LOCAL_BASE_URL: &str = "http://127.0.0.1:11434";
 const REMOTE_PARALLEL_FILE_LIMIT: usize = 2;
@@ -134,12 +134,16 @@ fn sanitize_api_key(raw: &str) -> String {
     } else if let Some(stripped) = key.strip_prefix("bearer ") {
         key = stripped.trim();
     }
-    if (key.starts_with('"') && key.ends_with('"')) || (key.starts_with('\'') && key.ends_with('\'')) {
+    if (key.starts_with('"') && key.ends_with('"'))
+        || (key.starts_with('\'') && key.ends_with('\''))
+    {
         if key.len() >= 2 {
             key = key[1..key.len() - 1].trim();
         }
     }
-    key.chars().filter(|c| !c.is_whitespace() && !c.is_control()).collect::<String>()
+    key.chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .collect::<String>()
 }
 
 impl AiSettings {
@@ -217,13 +221,19 @@ impl AiSettings {
             .to_owned();
 
         match provider {
-            AiProvider::OpenAI if base_url.contains("googleapis.com") || base_url.contains("11434") => {
+            AiProvider::OpenAI
+                if base_url.contains("googleapis.com") || base_url.contains("11434") =>
+            {
                 base_url = DEFAULT_OPENAI_BASE_URL.to_owned();
             }
-            AiProvider::Gemini if base_url.contains("api.openai.com") || base_url.contains("11434") => {
+            AiProvider::Gemini
+                if base_url.contains("api.openai.com") || base_url.contains("11434") =>
+            {
                 base_url = DEFAULT_GEMINI_BASE_URL.to_owned();
             }
-            AiProvider::Local if base_url.contains("googleapis.com") || base_url.contains("api.openai.com") => {
+            AiProvider::Local
+                if base_url.contains("googleapis.com") || base_url.contains("api.openai.com") =>
+            {
                 base_url = DEFAULT_LOCAL_BASE_URL.to_owned();
             }
             _ => {}
@@ -493,6 +503,7 @@ pub fn embed_query(query: &str, settings: &AiSettings) -> Result<Vec<f32>, Strin
 
 pub fn test_connection(settings: &AiSettings) -> Result<AiConnectionReport, String> {
     let client = build_http_client()?;
+    validate_vision_model(&client, settings)?;
     let embedding = create_embedding(
         &client,
         "MediaIndex connection test",
@@ -505,6 +516,39 @@ pub fn test_connection(settings: &AiSettings) -> Result<AiConnectionReport, Stri
         embedding_model: settings.embedding_model.clone(),
         embedding_dimensions: embedding.len(),
     })
+}
+
+fn validate_vision_model(client: &Client, settings: &AiSettings) -> Result<(), String> {
+    let clean_model = settings.vision_model.trim_start_matches("models/").trim();
+    let response = match settings.provider {
+        AiProvider::OpenAI => execute_with_retry("OpenAI vision model check", || {
+            client
+                .get(format!("{}/models/{clean_model}", settings.base_url))
+                .bearer_auth(&settings.api_key)
+                .send()
+        })?,
+        AiProvider::Gemini => execute_with_retry("Gemini vision model check", || {
+            client
+                .get(format!("{}/models/{clean_model}", settings.base_url))
+                .header("x-goog-api-key", &settings.api_key)
+                .send()
+        })?,
+        AiProvider::Local => execute_with_retry("Local AI vision model check", || {
+            client
+                .post(format!("{}/api/show", settings.base_url))
+                .json(&json!({"model": clean_model}))
+                .send()
+        })?,
+    };
+    read_json_response(
+        response,
+        match settings.provider {
+            AiProvider::OpenAI => "OpenAI vision model check",
+            AiProvider::Gemini => "Gemini vision model check",
+            AiProvider::Local => "Local AI vision model check",
+        },
+    )?;
+    Ok(())
 }
 
 fn environment_u64(name: &str, default: u64) -> Result<u64, String> {
@@ -567,6 +611,47 @@ fn request_failure(operation: &str, error: &reqwest::Error) -> String {
         "{operation} request failed ({category}): {root_cause}. Details: {}",
         chain.join(" -> ")
     )
+}
+
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+        || status == reqwest::StatusCode::BAD_GATEWAY
+        || status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
+}
+
+fn execute_with_retry<F>(operation_name: &str, mut make_request: F) -> Result<Response, String>
+where
+    F: FnMut() -> Result<Response, reqwest::Error>,
+{
+    const MAX_ATTEMPTS: usize = 4;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match make_request() {
+            Ok(response) => {
+                let status = response.status();
+                if is_transient_status(status) && attempt < MAX_ATTEMPTS {
+                    let delay_ms = match attempt {
+                        1 => 1_500,
+                        2 => 3_500,
+                        _ => 6_000,
+                    };
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(error) => {
+                if (error.is_timeout() || error.is_connect()) && attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(1_500 * attempt as u64));
+                    continue;
+                }
+                return Err(request_failure(operation_name, &error));
+            }
+        }
+    }
 }
 
 fn provider_from_environment() -> Option<AiProvider> {
@@ -865,12 +950,13 @@ fn describe_openai(
     if let Some(effort) = openai_reasoning_effort(&settings.vision_model) {
         request["reasoning"] = json!({"effort": effort});
     }
-    let response = client
-        .post(format!("{}/responses", settings.base_url))
-        .bearer_auth(&settings.api_key)
-        .json(&request)
-        .send()
-        .map_err(|error| request_failure("OpenAI vision", &error))?;
+    let response = execute_with_retry("OpenAI vision", || {
+        client
+            .post(format!("{}/responses", settings.base_url))
+            .bearer_auth(&settings.api_key)
+            .json(&request)
+            .send()
+    })?;
     let body = read_json_response(response, "OpenAI vision")?;
     response_text(&body).ok_or_else(|| "OpenAI vision returned no output text".to_owned())
 }
@@ -899,23 +985,24 @@ fn describe_gemini(
             |(_, encoded)| json!({"inline_data": {"mime_type": "image/jpeg", "data": encoded}}),
         ),
     );
-    let url = if settings.base_url.contains('?') {
-        format!("{}/models/{}:generateContent&key={}", settings.base_url, clean_model, settings.api_key)
-    } else {
-        format!("{}/models/{}:generateContent?key={}", settings.base_url, clean_model, settings.api_key)
-    };
-    let response = client
-        .post(&url)
-        .header("x-goog-api-key", &settings.api_key)
-        .json(&json!({
-            "contents": [{
-                "role": "user",
-                "parts": parts
-            }],
-            "generationConfig": {"responseMimeType": "application/json"}
-        }))
-        .send()
-        .map_err(|error| request_failure("Gemini vision", &error))?;
+    let url = format!(
+        "{}/models/{}:generateContent",
+        settings.base_url, clean_model
+    );
+    let payload = json!({
+        "contents": [{
+            "role": "user",
+            "parts": parts
+        }],
+        "generationConfig": {"responseMimeType": "application/json"}
+    });
+    let response = execute_with_retry("Gemini vision", || {
+        client
+            .post(&url)
+            .header("x-goog-api-key", &settings.api_key)
+            .json(&payload)
+            .send()
+    })?;
     let body = read_json_response(response, "Gemini vision")?;
     response_text(&body).ok_or_else(|| "Gemini vision returned no candidate text".to_owned())
 }
@@ -926,20 +1013,22 @@ fn describe_local(
     prompt: &str,
     settings: &AiSettings,
 ) -> Result<String, String> {
-    let response = client
-        .post(format!("{}/api/chat", settings.base_url))
-        .json(&json!({
-            "model": settings.vision_model,
-            "messages": [{
-                "role": "user",
-                "content": prompt,
-                "images": encoded_frames.iter().map(|(_, encoded)| encoded).collect::<Vec<_>>()
-            }],
-            "format": "json",
-            "stream": false
-        }))
-        .send()
-        .map_err(|error| request_failure("Local AI vision", &error))?;
+    let payload = json!({
+        "model": settings.vision_model,
+        "messages": [{
+            "role": "user",
+            "content": prompt,
+            "images": encoded_frames.iter().map(|(_, encoded)| encoded).collect::<Vec<_>>()
+        }],
+        "format": "json",
+        "stream": false
+    });
+    let response = execute_with_retry("Local AI vision", || {
+        client
+            .post(format!("{}/api/chat", settings.base_url))
+            .json(&payload)
+            .send()
+    })?;
     let body = read_json_response(response, "Local AI vision")?;
     response_text(&body).ok_or_else(|| "Local AI returned no message content".to_owned())
 }
@@ -1004,15 +1093,17 @@ fn create_embeddings(
 
     let embeddings = match settings.provider {
         AiProvider::OpenAI => {
-            let response = client
-                .post(format!("{}/embeddings", settings.base_url))
-                .bearer_auth(&settings.api_key)
-                .json(&json!({
-                    "model": settings.embedding_model,
-                    "input": texts
-                }))
-                .send()
-                .map_err(|error| request_failure("OpenAI embedding", &error))?;
+            let payload = json!({
+                "model": settings.embedding_model,
+                "input": texts
+            });
+            let response = execute_with_retry("OpenAI embedding", || {
+                client
+                    .post(format!("{}/embeddings", settings.base_url))
+                    .bearer_auth(&settings.api_key)
+                    .json(&payload)
+                    .send()
+            })?;
             let body = read_json_response(response, "OpenAI embedding")?;
             body.get("data")
                 .and_then(Value::as_array)
@@ -1030,14 +1121,16 @@ fn create_embeddings(
             .map(|text| create_gemini_embedding(client, text, settings, kind))
             .collect::<Result<Vec<_>, _>>()?,
         AiProvider::Local => {
-            let response = client
-                .post(format!("{}/api/embed", settings.base_url))
-                .json(&json!({
-                    "model": settings.embedding_model,
-                    "input": texts
-                }))
-                .send()
-                .map_err(|error| request_failure("Local AI embedding", &error))?;
+            let payload = json!({
+                "model": settings.embedding_model,
+                "input": texts
+            });
+            let response = execute_with_retry("Local AI embedding", || {
+                client
+                    .post(format!("{}/api/embed", settings.base_url))
+                    .json(&payload)
+                    .send()
+            })?;
             let body = read_json_response(response, "Local AI embedding")?;
             body.get("embeddings")
                 .and_then(Value::as_array)
@@ -1070,23 +1163,36 @@ fn request_single_gemini_embedding(
     task_type: &str,
 ) -> Result<Vec<f32>, (bool, String)> {
     let clean_model = model.trim_start_matches("models/").trim();
-    let url = if settings.base_url.contains('?') {
-        format!("{}/models/{}:embedContent&key={}", settings.base_url, clean_model, settings.api_key)
+    let url = format!("{}/models/{}:embedContent", settings.base_url, clean_model);
+    let is_embedding_2 = clean_model.eq_ignore_ascii_case("gemini-embedding-2");
+    let prepared_text = if is_embedding_2 {
+        match task_type {
+            "RETRIEVAL_DOCUMENT" => format!("title: none | text: {text}"),
+            _ => format!("task: search result | query: {text}"),
+        }
     } else {
-        format!("{}/models/{}:embedContent?key={}", settings.base_url, clean_model, settings.api_key)
+        text.to_owned()
     };
-    let response = client
-        .post(&url)
-        .header("x-goog-api-key", &settings.api_key)
-        .json(&json!({
-            "model": format!("models/{}", clean_model),
-            "content": {"parts": [{"text": text}]},
-            "taskType": task_type
-        }))
-        .send()
-        .map_err(|error| (false, request_failure("Gemini embedding", &error)))?;
+    let mut payload = json!({
+        "model": format!("models/{}", clean_model),
+        "content": {"parts": [{"text": prepared_text}]}
+    });
+    if is_embedding_2 {
+        payload["output_dimensionality"] = json!(768);
+    } else {
+        payload["taskType"] = json!(task_type);
+    }
+    let response = execute_with_retry("Gemini embedding", || {
+        client
+            .post(&url)
+            .header("x-goog-api-key", &settings.api_key)
+            .json(&payload)
+            .send()
+    })
+    .map_err(|err| (false, err))?;
     let is_not_found = response.status() == reqwest::StatusCode::NOT_FOUND;
-    let body = read_json_response(response, "Gemini embedding").map_err(|err| (is_not_found, err))?;
+    let body =
+        read_json_response(response, "Gemini embedding").map_err(|err| (is_not_found, err))?;
     let embedding = body
         .get("embedding")
         .and_then(|embedding| embedding.get("values"))
@@ -1115,22 +1221,8 @@ fn create_gemini_embedding(
         EmbeddingKind::Document => "RETRIEVAL_DOCUMENT",
         EmbeddingKind::Query => "RETRIEVAL_QUERY",
     };
-    match request_single_gemini_embedding(client, &settings.embedding_model, text, settings, task_type) {
-        Ok(vec) => Ok(vec),
-        Err((true, _)) => {
-            let fallbacks = ["gemini-embedding-001", "text-embedding-004", "embedding-001"];
-            for alt in fallbacks {
-                if alt != settings.embedding_model.trim_start_matches("models/").trim() {
-                    if let Ok(vec) = request_single_gemini_embedding(client, alt, text, settings, task_type) {
-                        return Ok(vec);
-                    }
-                }
-            }
-            request_single_gemini_embedding(client, &settings.embedding_model, text, settings, task_type)
-                .map_err(|(_, err)| err)
-        }
-        Err((_, err)) => Err(err),
-    }
+    request_single_gemini_embedding(client, &settings.embedding_model, text, settings, task_type)
+        .map_err(|(_, err)| err)
 }
 
 fn values_to_embedding(values: &Vec<Value>) -> Vec<f32> {
@@ -1153,18 +1245,50 @@ fn read_json_response(response: Response, operation: &str) -> Result<Value, Stri
         )
     })?;
     if !status.is_success() {
-        return Err(format!(
-            "{operation} failed (HTTP {status}): {}",
-            api_error_detail(&body)
+        return Err(api_failure_message(
+            operation,
+            status,
+            &api_error_detail(&body),
         ));
     }
     if response_body_reports_error(&body) {
-        return Err(format!(
-            "{operation} failed (HTTP {status}): {}",
-            api_error_detail(&body)
+        return Err(api_failure_message(
+            operation,
+            status,
+            &api_error_detail(&body),
         ));
     }
     Ok(body)
+}
+
+fn api_failure_message(operation: &str, status: reqwest::StatusCode, detail: &str) -> String {
+    let mut message = format!("{operation} failed (HTTP {status}): {detail}");
+    if operation.starts_with("Gemini") {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            message.push_str(
+                ". Create a current auth key in Google AI Studio. Unrestricted standard keys are rejected, and Google announced the remaining standard-key shutdown for September 2026",
+            );
+        } else if status == reqwest::StatusCode::NOT_FOUND {
+            message.push_str(
+                ". Check the exact Gemini model name; removed embedding models such as text-embedding-004 and embedding-001 no longer work",
+            );
+        }
+    } else if operation.starts_with("OpenAI") {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            message.push_str(
+                ". Check that this is an active OpenAI API key and that its project can use the selected model",
+            );
+        } else if status == reqwest::StatusCode::NOT_FOUND {
+            message.push_str(
+                ". Check that the selected OpenAI model exists and is available to this project",
+            );
+        }
+    } else if operation.starts_with("Local AI") && status == reqwest::StatusCode::NOT_FOUND {
+        message.push_str(
+            ". Pull the exact vision or embedding model shown in settings with `ollama pull <model>`",
+        );
+    }
+    message
 }
 
 fn response_body_reports_error(body: &Value) -> bool {
@@ -1302,7 +1426,7 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn read_stub_request(stream: &mut std::net::TcpStream) -> (String, Value) {
+    fn read_stub_request(stream: &mut std::net::TcpStream) -> (String, Vec<String>, Value) {
         use std::io::Read;
 
         let mut request = Vec::new();
@@ -1333,14 +1457,26 @@ mod tests {
             request.extend_from_slice(&buffer[..read]);
         }
 
-        let request_line = String::from_utf8_lossy(&request[..header_end])
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned();
-        let body = serde_json::from_slice(&request[header_end..header_end + content_length])
-            .expect("stub request body should be JSON");
-        (request_line, body)
+        let header_text = String::from_utf8_lossy(&request[..header_end]);
+        let mut header_lines = header_text.lines();
+        let request_line = header_lines.next().unwrap_or_default().to_owned();
+        let headers = header_lines.map(str::to_owned).collect::<Vec<_>>();
+        let body = if content_length == 0 {
+            Value::Null
+        } else {
+            serde_json::from_slice(&request[header_end..header_end + content_length])
+                .expect("stub request body should be JSON")
+        };
+        (request_line, headers, body)
+    }
+
+    fn stub_header<'a>(headers: &'a [String], name: &str) -> Option<&'a str> {
+        headers.iter().find_map(|line| {
+            let (header_name, value) = line.split_once(':')?;
+            header_name
+                .eq_ignore_ascii_case(name)
+                .then_some(value.trim())
+        })
     }
 
     fn write_stub_response(stream: &mut std::net::TcpStream, body: &Value) {
@@ -1362,7 +1498,7 @@ mod tests {
         let address = listener.local_addr().expect("stub should have an address");
         let handle = std::thread::spawn(move || loop {
             let (mut stream, _) = listener.accept().expect("stub should accept a request");
-            let (request_line, request) = read_stub_request(&mut stream);
+            let (request_line, _headers, request) = read_stub_request(&mut stream);
             if request_line.starts_with("POST /responses ") {
                 let image_count = request
                     .pointer("/input/0/content")
@@ -1435,6 +1571,96 @@ mod tests {
             } else {
                 panic!("unexpected stub request: {request_line}");
             }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn spawn_openai_connection_stub() -> (String, std::thread::JoinHandle<()>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let handle = std::thread::spawn(move || {
+            let (mut model_stream, _) = listener.accept().expect("model check should connect");
+            let (request_line, headers, body) = read_stub_request(&mut model_stream);
+            assert!(request_line.starts_with("GET /models/gpt-5.6-luna "));
+            assert!(!request_line.contains("?key="));
+            assert_eq!(
+                stub_header(&headers, "authorization"),
+                Some("Bearer openai-test-key")
+            );
+            assert_eq!(body, Value::Null);
+            write_stub_response(&mut model_stream, &json!({"id": "gpt-5.6-luna"}));
+
+            let (mut embedding_stream, _) =
+                listener.accept().expect("embedding check should connect");
+            let (request_line, headers, body) = read_stub_request(&mut embedding_stream);
+            assert!(request_line.starts_with("POST /embeddings "));
+            assert_eq!(
+                stub_header(&headers, "authorization"),
+                Some("Bearer openai-test-key")
+            );
+            assert_eq!(
+                body.get("model").and_then(Value::as_str),
+                Some("text-embedding-3-small")
+            );
+            assert_eq!(
+                body.get("input").and_then(Value::as_array).map(Vec::len),
+                Some(1)
+            );
+            write_stub_response(
+                &mut embedding_stream,
+                &json!({"data": [{"index": 0, "embedding": [0.5, 0.25, 0.125]}]}),
+            );
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn spawn_gemini_connection_stub() -> (String, std::thread::JoinHandle<()>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let handle = std::thread::spawn(move || {
+            let (mut model_stream, _) = listener.accept().expect("model check should connect");
+            let (request_line, headers, body) = read_stub_request(&mut model_stream);
+            assert!(request_line.starts_with("GET /models/gemini-3.8-flash "));
+            assert!(!request_line.contains("?key="));
+            assert_eq!(
+                stub_header(&headers, "x-goog-api-key"),
+                Some("gemini-test-key")
+            );
+            assert_eq!(body, Value::Null);
+            write_stub_response(
+                &mut model_stream,
+                &json!({"name": "models/gemini-3.8-flash"}),
+            );
+
+            let (mut embedding_stream, _) =
+                listener.accept().expect("embedding check should connect");
+            let (request_line, headers, body) = read_stub_request(&mut embedding_stream);
+            assert!(request_line.starts_with("POST /models/gemini-embedding-2:embedContent "));
+            assert!(!request_line.contains("?key="));
+            assert_eq!(
+                stub_header(&headers, "x-goog-api-key"),
+                Some("gemini-test-key")
+            );
+            assert_eq!(
+                body.get("model").and_then(Value::as_str),
+                Some("models/gemini-embedding-2")
+            );
+            assert_eq!(
+                body.get("output_dimensionality").and_then(Value::as_u64),
+                Some(768)
+            );
+            assert!(body.get("taskType").is_none());
+            assert_eq!(
+                body.pointer("/content/parts/0/text")
+                    .and_then(Value::as_str),
+                Some("task: search result | query: MediaIndex connection test")
+            );
+            write_stub_response(
+                &mut embedding_stream,
+                &json!({"embedding": {"values": [0.75, 0.5, 0.25]}}),
+            );
         });
         (format!("http://{address}"), handle)
     }
@@ -1538,7 +1764,79 @@ mod tests {
         assert_eq!(settings.provider, AiProvider::Local);
         assert_eq!(settings.vision_model, DEFAULT_LOCAL_VISION_MODEL);
         assert_eq!(settings.embedding_model, DEFAULT_LOCAL_EMBEDDING_MODEL);
-        assert_eq!(settings.model_namespace(), "local:gemma4:embeddinggemma");
+        assert_eq!(
+            settings.model_namespace(),
+            "local:gemma4:e2b:embeddinggemma"
+        );
+    }
+
+    #[test]
+    fn uses_supported_gemini_defaults() {
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::Gemini),
+            api_key: Some("test-key".to_owned()),
+            ..Default::default()
+        }))
+        .expect("Gemini settings should be valid");
+
+        assert_eq!(settings.vision_model, "gemini-3.8-flash");
+        assert_eq!(settings.embedding_model, "gemini-embedding-2");
+    }
+
+    #[test]
+    fn validates_openai_vision_and_embedding_connection_contract() {
+        let (base_url, server) = spawn_openai_connection_stub();
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::OpenAI),
+            api_key: Some("openai-test-key".to_owned()),
+            base_url: Some(base_url),
+            ..Default::default()
+        }))
+        .expect("OpenAI settings should be valid");
+
+        let report = test_connection(&settings).expect("OpenAI connection should validate");
+        server.join().expect("OpenAI stub should finish");
+        assert_eq!(report.provider, "openai");
+        assert_eq!(report.vision_model, "gpt-5.6-luna");
+        assert_eq!(report.embedding_model, "text-embedding-3-small");
+        assert_eq!(report.embedding_dimensions, 3);
+    }
+
+    #[test]
+    fn validates_gemini_auth_header_and_embedding_2_contract() {
+        let (base_url, server) = spawn_gemini_connection_stub();
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::Gemini),
+            api_key: Some("gemini-test-key".to_owned()),
+            base_url: Some(base_url),
+            ..Default::default()
+        }))
+        .expect("Gemini settings should be valid");
+
+        let report = test_connection(&settings).expect("Gemini connection should validate");
+        server.join().expect("Gemini stub should finish");
+        assert_eq!(report.provider, "gemini");
+        assert_eq!(report.vision_model, "gemini-3.8-flash");
+        assert_eq!(report.embedding_model, "gemini-embedding-2");
+        assert_eq!(report.embedding_dimensions, 3);
+    }
+
+    #[test]
+    fn api_errors_name_provider_specific_recovery() {
+        let gemini = api_failure_message(
+            "Gemini vision model check",
+            reqwest::StatusCode::FORBIDDEN,
+            "permission denied",
+        );
+        assert!(gemini.contains("auth key"));
+        assert!(gemini.contains("September 2026"));
+
+        let local = api_failure_message(
+            "Local AI vision model check",
+            reqwest::StatusCode::NOT_FOUND,
+            "model not found",
+        );
+        assert!(local.contains("ollama pull <model>"));
     }
 
     #[test]

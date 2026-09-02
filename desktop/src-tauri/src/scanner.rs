@@ -16,7 +16,10 @@ pub struct ScanOptions {
 
 impl Default for ScanOptions {
     fn default() -> Self {
-        Self::with_extensions(["mp4", "mov", "mkv", "avi", "mxf", "webm"])
+        Self::with_extensions([
+            "mp4", "mov", "mkv", "avi", "mxf", "webm", "m4v", "flv", "wmv", "ts", "mts", "m2ts",
+            "3gp", "ogv",
+        ])
     }
 }
 

@@ -39,17 +39,20 @@ if (!app) {
 app.innerHTML = `
   <main class="shell">
     <header class="topbar">
-      <div>
-        <p class="eyebrow">LOCAL-FIRST MEDIA INDEX</p>
-        <h1>Find the right shot.</h1>
-        <p class="lede">
-          Start with a local folder. MediaIndex will keep the original footage
-          where it already lives.
-        </p>
+      <div class="topbar-brand">
+        <div class="topbar-logo">
+          <span class="topbar-logo-icon">M</span>
+          <span class="topbar-product">MediaIndex</span>
+          <span class="desktop-product-mark">Windows desktop</span>
+        </div>
+        <div class="topbar-breadcrumb" id="topbar-breadcrumb">
+          <span class="topbar-breadcrumb-sep">/</span>
+          <span id="header-folder-name">No folder selected</span>
+        </div>
       </div>
       <div class="topbar-actions">
         <button class="primary-button" id="select-folder" type="button">
-          Select footage folder
+          Select Footage Folder
         </button>
         <button class="secondary-button" id="analyze-ai" type="button" disabled>
           Analyze with AI
@@ -61,45 +64,45 @@ app.innerHTML = `
       <aside class="sidebar">
         <p class="section-label">Library</p>
         <div class="library-card">
-          <span class="status-dot" aria-hidden="true"></span>
-          <div class="library-card-copy">
-            <strong id="library-status">No folder indexed</strong>
-            <span id="library-path">Choose a local folder to begin</span>
-            <div class="analysis-progress" id="analysis-progress" hidden>
-              <div class="analysis-progress-heading">
-                <span id="analysis-progress-label">Preparing clips</span>
-                <strong id="analysis-progress-percent">0%</strong>
-              </div>
-              <div
-                class="analysis-progress-track"
-                id="analysis-progress-track"
-                role="progressbar"
-                aria-label="AI analysis progress"
-                aria-valuemin="0"
-                aria-valuemax="100"
-                aria-valuenow="0"
-              >
-                <span id="analysis-progress-fill"></span>
-              </div>
+          <div class="library-card-header">
+            <span class="status-dot" aria-hidden="true"></span>
+            <strong class="library-card-title" id="library-status">No folder indexed</strong>
+          </div>
+          <p class="library-card-path" id="library-path">Choose a local folder to begin</p>
+          <div class="analysis-progress" id="analysis-progress" hidden>
+            <div class="analysis-progress-heading">
+              <span id="analysis-progress-label">Preparing clips</span>
+              <strong id="analysis-progress-percent">0%</strong>
+            </div>
+            <div
+              class="analysis-progress-track"
+              id="analysis-progress-track"
+              role="progressbar"
+              aria-label="AI analysis progress"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="0"
+            >
+              <span id="analysis-progress-fill"></span>
             </div>
           </div>
         </div>
 
         <details class="ai-settings" open>
-          <summary>AI Connection & Model</summary>
+          <summary>AI Vision & Embeddings</summary>
           <p class="settings-help">
-            Choose a cloud or local vision model. Media footage always stays on your computer.
+            Original videos stay on your computer. Cloud providers receive only the sampled frame images used for analysis; Local Ollama sends nothing off-device.
           </p>
 
           <div class="active-model-card" id="active-model-card">
-            <div class="active-model-header">
-              <span class="eyebrow" style="margin: 0; font-size: 0.68rem;">Selected Model</span>
+            <div class="active-model-top">
+              <span class="model-card-provider">Current Model</span>
               <span class="model-badge badge-recommended" id="active-model-badge">Recommended</span>
             </div>
-            <div class="active-model-title" id="active-model-title">
-              <strong id="active-model-name">Gemini 1.5 Flash</strong>
+            <div class="active-model-name" id="active-model-title">
+              <strong id="active-model-name">Gemini 3.8 Flash</strong>
             </div>
-            <p id="active-model-cost" style="margin: 0; font-size: 0.72rem; color: #a8bfeb;">Free tier / $0.075 per 1M tokens</p>
+            <p class="active-model-cost" id="active-model-cost">Input $0.75 · output $3.75 / 1M tokens</p>
             <button class="open-model-hub-btn" id="open-model-hub" type="button">
               Change Model & View Pricing...
             </button>
@@ -107,11 +110,11 @@ app.innerHTML = `
 
           <form class="settings-form" id="ai-settings-form">
             <label id="ai-api-key-label">API Key
-              <input id="ai-api-key" name="api-key" type="password" autocomplete="off" placeholder="Enter Gemini or OpenAI API key" />
+              <input id="ai-api-key" name="api-key" type="password" autocomplete="off" placeholder="Enter Gemini (AIza...) or OpenAI (sk-...) API key" />
             </label>
 
             <details class="advanced-ai-settings" style="margin-top: 4px;">
-              <summary style="font-size: 0.72rem; color: #8fa6d8; cursor: pointer;">Advanced Configuration</summary>
+              <summary style="font-size: 11px; color: var(--text-muted); cursor: pointer;">Advanced Configuration</summary>
               <div style="display: grid; gap: 8px; margin-top: 8px;">
                 <label>Provider
                   <select id="ai-provider" name="provider">
@@ -121,31 +124,31 @@ app.innerHTML = `
                   </select>
                 </label>
                 <label>Vision model
-                  <input id="ai-vision-model" name="vision-model" placeholder="gemini-1.5-flash" />
+                  <input id="ai-vision-model" name="vision-model" placeholder="gemini-3.8-flash" />
                 </label>
                 <label>Embedding model
-                  <input id="ai-embedding-model" name="embedding-model" placeholder="text-embedding-004" />
+                  <input id="ai-embedding-model" name="embedding-model" placeholder="gemini-embedding-2" />
                 </label>
                 <label>Base URL
-                  <input id="ai-base-url" name="base-url" placeholder="http://127.0.0.1:11434" />
+                  <input id="ai-base-url" name="base-url" placeholder="https://generativelanguage.googleapis.com/v1beta" />
                 </label>
                 <label>FFmpeg path <span class="optional-label">(optional)</span>
-                  <input id="ai-ffmpeg-path" name="ffmpeg-path" placeholder="Uses PATH if empty" />
+                  <input id="ai-ffmpeg-path" name="ffmpeg-path" placeholder="Uses system PATH if empty" />
                 </label>
                 <label>Library context <span class="optional-label">(optional)</span>
-                  <input id="ai-context-hint" name="context-hint" placeholder="Project, franchise, characters, location..." />
+                  <input id="ai-context-hint" name="context-hint" placeholder="Project name, subjects, landmarks, location..." />
                 </label>
                 <div class="settings-grid">
-                  <label>Every (s)
+                  <label>Sample every (s)
                     <input id="ai-sample-seconds" name="sample-seconds" min="1" type="number" />
                   </label>
-                  <label>Max frames
+                  <label>Max frames / video
                     <input id="ai-max-frames" name="max-frames" min="1" type="number" />
                   </label>
                 </div>
                 <label class="checkbox-field">
                   <input id="ai-reanalyze-existing" name="reanalyze-existing" type="checkbox" />
-                  Reanalyze existing clips <span class="optional-label">(uses API credits)</span>
+                  Reanalyze existing clips
                 </label>
               </div>
             </details>
@@ -158,64 +161,67 @@ app.innerHTML = `
           </form>
         </details>
 
-        <p class="section-label">Filters</p>
+        <p class="section-label">Metadata Filters</p>
         <form class="filter-form" id="filter-form">
-          <label>Folder<input id="filter-folder" name="folder" placeholder="day-one" /></label>
+          <label class="filter-full-width">Folder<input id="filter-folder" name="folder" placeholder="e.g. B-Roll" /></label>
           <label>Date from<input id="filter-date-from" name="date-from" type="date" /></label>
           <label>Date to<input id="filter-date-to" name="date-to" type="date" /></label>
           <label>Resolution<input id="filter-resolution" name="resolution" placeholder="1920x1080" /></label>
           <label>FPS<input id="filter-frame-rate" name="frame-rate" placeholder="29.97" /></label>
-          <label>Duration min (s)<input id="filter-duration-min" name="duration-min" min="0" type="number" /></label>
-          <label>Duration max (s)<input id="filter-duration-max" name="duration-max" min="0" type="number" /></label>
-          <label>Codec<input id="filter-codec" name="codec" placeholder="h264" /></label>
-          <button class="secondary-button" id="filter-submit" type="submit">Apply filters</button>
+          <label>Min duration (s)<input id="filter-duration-min" name="duration-min" min="0" type="number" /></label>
+          <label>Max duration (s)<input id="filter-duration-max" name="duration-max" min="0" type="number" /></label>
+          <label class="filter-full-width">Codec<input id="filter-codec" name="codec" placeholder="h264, hevc, prores" /></label>
+          <button class="secondary-button filter-full-width" id="filter-submit" type="submit">Apply Filters</button>
         </form>
       </aside>
 
       <section class="content-panel">
-        <div class="panel-heading">
+        <div class="panel-header">
           <div>
-            <p class="section-label">Local library</p>
-            <h2>Ready when you are</h2>
+            <h1 class="panel-title">Footage library</h1>
+            <p class="panel-subtitle">Grouped by source folder · originals remain untouched</p>
           </div>
           <span class="count-badge" id="clip-count">0 clips</span>
         </div>
-        <form class="search-form" id="search-form">
-          <input id="search-input" name="keyword" placeholder="Search file names and technical metadata" />
-          <select id="sort-by" aria-label="Sort results">
-            <option value="name">Name</option>
-            <option value="duration">Duration</option>
-            <option value="size">File size</option>
-            <option value="modified">Modified date</option>
-            <option value="resolution">Resolution</option>
-          </select>
-          <select id="sort-direction" aria-label="Sort direction">
-            <option value="asc">Ascending</option>
-            <option value="desc">Descending</option>
-          </select>
-          <button class="secondary-button" id="search-submit" type="submit">Search</button>
-        </form>
-        <form class="ai-search-form" id="ai-search-form">
-          <input id="ai-search-input" name="ai-query" placeholder="AI search: character, action, setting, event, visible text" />
-          <select id="ai-search-focus" aria-label="AI search relevance">
-            <option value="focused">Focused</option>
-            <option value="balanced">Balanced</option>
-            <option value="broad">Broad</option>
-          </select>
-          <button class="secondary-button" id="ai-search-submit" type="submit">AI Search</button>
-        </form>
+        <div class="search-container">
+          <form class="search-form" id="search-form">
+            <div class="search-input-wrapper">
+              <input id="search-input" name="keyword" placeholder="Filter by filename or technical metadata…" />
+            </div>
+            <select id="sort-by" aria-label="Sort results">
+              <option value="name">Name</option>
+              <option value="duration">Duration</option>
+              <option value="size">Size</option>
+              <option value="modified">Date</option>
+              <option value="resolution">Resolution</option>
+            </select>
+            <select id="sort-direction" aria-label="Sort direction">
+              <option value="asc">Asc</option>
+              <option value="desc">Desc</option>
+            </select>
+            <button class="secondary-button" id="search-submit" type="submit">Filter</button>
+          </form>
+          <form class="ai-search-form" id="ai-search-form">
+            <div class="search-input-wrapper">
+              <input id="ai-search-input" name="ai-query" placeholder="AI Visual Search: character, action, scenery, event, visible text…" />
+            </div>
+            <select id="ai-search-focus" aria-label="AI search relevance">
+              <option value="focused">Focused</option>
+              <option value="balanced">Balanced</option>
+              <option value="broad">Broad</option>
+            </select>
+            <button class="primary-button" id="ai-search-submit" type="submit">AI Search</button>
+          </form>
+        </div>
         <p class="search-status" id="ai-search-status" role="status"></p>
         <div class="empty-state" id="empty-state">
-          <div class="empty-icon" aria-hidden="true">⌁</div>
-          <h3>Your footage stays on your machine</h3>
-          <p>
-            Select a folder to scan videos locally. MediaIndex reads technical
-            metadata, stores it in SQLite, and lets you search and sort without
-            uploading the original footage.
+          <div class="empty-icon" aria-hidden="true">
+            <svg viewBox="0 0 32 32" role="presentation"><path d="M3.5 8.5h9l2.5 3h13.5v14H3.5z"/><path d="M3.5 11.5v-5h8l2 2"/><path d="m14 15.5 6 3.5-6 3.5z"/></svg>
+          </div>
+          <h3 id="empty-title">No footage indexed yet</h3>
+          <p id="empty-copy">
+            Select a folder containing your video files. MediaIndex indexes metadata and visual scenes locally, keeping original files safe on your computer.
           </p>
-          <button class="secondary-button" id="learn-more" type="button">
-            View the MVP plan
-          </button>
         </div>
         <div class="result-list" id="result-list" hidden></div>
         <p class="results-note" id="results-note" hidden></p>
@@ -228,10 +234,10 @@ app.innerHTML = `
     <section class="model-hub-modal" role="dialog" aria-modal="true" aria-labelledby="model-hub-title">
       <div class="preview-header">
         <div>
-          <p class="eyebrow" style="margin-bottom: 4px;">AI MODEL SELECTION & COMPARISON</p>
+          <p class="eyebrow" style="margin-bottom: 4px;">AI MODEL SELECTION & PRICING</p>
           <h2 id="model-hub-title" style="font-size: 1.35rem;">Choose a Vision Model</h2>
-          <p class="lede" style="font-size: 0.85rem; margin-top: 4px; color: #8fa6d8;">
-            Select a model based on cost, speed, and accuracy requirements.
+          <p class="lede" style="font-size: 0.85rem; margin-top: 4px; color: var(--text-muted);">
+            Current stable Gemini, OpenAI GPT-5.6, and local Ollama options. Pricing checked September 2026.
           </p>
         </div>
         <button class="secondary-button" id="close-model-hub" type="button">Close</button>
@@ -361,7 +367,7 @@ function aiDefaults(provider: AiProvider): AiConfig {
     return {
       provider,
       apiKey: "",
-      visionModel: "gpt-4o-mini",
+      visionModel: "gpt-5.6-luna",
       embeddingModel: "text-embedding-3-small",
       baseUrl: "https://api.openai.com/v1",
       ffmpegPath: "",
@@ -375,8 +381,8 @@ function aiDefaults(provider: AiProvider): AiConfig {
     return {
       provider,
       apiKey: "",
-      visionModel: "gemini-3.7-flash",
-      embeddingModel: "text-embedding-004",
+      visionModel: "gemini-3.8-flash",
+      embeddingModel: "gemini-embedding-2",
       baseUrl: "https://generativelanguage.googleapis.com/v1beta",
       ffmpegPath: "",
       sampleIntervalSeconds: 5,
@@ -388,8 +394,8 @@ function aiDefaults(provider: AiProvider): AiConfig {
   return {
     provider: "local",
     apiKey: "",
-    visionModel: "llava",
-    embeddingModel: "nomic-embed-text",
+    visionModel: "gemma4:e2b",
+    embeddingModel: "embeddinggemma",
     baseUrl: "http://127.0.0.1:11434",
     ffmpegPath: "",
     sampleIntervalSeconds: 5,
@@ -541,7 +547,7 @@ function selectModelPreset(presetId: string): void {
   if (aiVisionModel) aiVisionModel.value = preset.visionModel;
   if (aiEmbeddingModel) aiEmbeddingModel.value = preset.embeddingModel;
   if (aiBaseUrl) aiBaseUrl.value = defaults.baseUrl;
-  if (preset.id === "gpt-4o-mini" || preset.id.includes("flash")) {
+  if (preset.provider !== "local") {
     if (aiMaxFrames && Number(aiMaxFrames.value) > 60) aiMaxFrames.value = "60";
   }
   if (aiApiKey) {
@@ -589,23 +595,23 @@ function updateAiProviderFields(): void {
       provider === "local"
         ? "Not needed for Local (Ollama)"
         : provider === "gemini"
-          ? "Google Gemini API key (starts with AIza...)"
+          ? "Gemini auth key from Google AI Studio"
           : "OpenAI API key (starts with sk-...)";
   }
   if (aiVisionModel) {
     aiVisionModel.placeholder =
       provider === "local"
-        ? "llava"
+        ? "gemma4:e2b"
         : provider === "gemini"
-          ? "gemini-3.7-flash"
-          : "gpt-4o-mini";
+          ? "gemini-3.8-flash"
+          : "gpt-5.6-luna";
   }
   if (aiEmbeddingModel) {
     aiEmbeddingModel.placeholder =
       provider === "local"
-        ? "nomic-embed-text"
+        ? "embeddinggemma"
         : provider === "gemini"
-          ? "text-embedding-004"
+          ? "gemini-embedding-2"
           : "text-embedding-3-small";
   }
   if (aiBaseUrl) {
@@ -631,6 +637,16 @@ function loadAiConfig(): void {
         : fallback.provider;
     const sessionApiKey = getSessionApiKey(provider);
     const defaults = aiDefaults(provider);
+    let visionModel = saved?.visionModel?.trim() || defaults.visionModel;
+    let embeddingModel = saved?.embeddingModel?.trim() || defaults.embeddingModel;
+    if (provider === "gemini") {
+      if (visionModel === "gemini-1.5-flash" || visionModel === "gemini-3.1-pro") {
+        visionModel = defaults.visionModel;
+      }
+      if (["text-embedding-004", "embedding-001"].includes(embeddingModel)) {
+        embeddingModel = defaults.embeddingModel;
+      }
+    }
     let baseUrl = saved?.baseUrl?.trim() || defaults.baseUrl;
     if (provider === "openai" && (baseUrl.includes("googleapis.com") || baseUrl.includes("11434"))) {
       baseUrl = defaults.baseUrl;
@@ -647,6 +663,8 @@ function loadAiConfig(): void {
       ...defaults,
       ...saved,
       provider,
+      visionModel,
+      embeddingModel,
       baseUrl,
       apiKey: sessionApiKey,
       reanalyzeExisting: false,
@@ -683,6 +701,7 @@ async function restoreSelectedLibrary(): Promise<void> {
     }
     if (!savedPath) return;
     selectedLibraryPath = savedPath;
+    updateHeaderFolder(savedPath);
     if (analyzeAiButton) analyzeAiButton.disabled = false;
     if (libraryStatus) libraryStatus.textContent = "Restoring saved library…";
     if (libraryPath) libraryPath.textContent = savedPath;
@@ -704,7 +723,7 @@ function showAiProgress(percent: number, label: string, isError = false): void {
   if (analysisProgressPercent) analysisProgressPercent.textContent = `${safePercent}%`;
   if (analysisProgressTrack)
     analysisProgressTrack.setAttribute("aria-valuenow", String(safePercent));
-  if (analysisProgressFill) analysisProgressFill.style.width = `${safePercent}%`;
+  if (analysisProgressFill) analysisProgressFill.style.transform = `scaleX(${safePercent / 100})`;
 }
 
 void listen<AiProgress>("ai-progress", ({ payload }) => {
@@ -721,12 +740,36 @@ void listen<AiProgress>("ai-progress", ({ payload }) => {
   }
 });
 
+function updateHeaderFolder(path: string): void {
+  const headerFolder = document.querySelector<HTMLElement>("#header-folder-name");
+  if (!headerFolder) return;
+  if (!path) {
+    headerFolder.textContent = "No folder selected";
+  } else {
+    const parts = path.split(/[\\/]/).filter(Boolean);
+    const folderName = parts.pop() ?? path;
+    headerFolder.textContent = folderName;
+    headerFolder.title = path;
+  }
+}
+
 function summarizeAiWarnings(warnings: AiIndexReport["warnings"]): string {
   if (warnings.length === 0) return "";
+  const count = warnings.length;
   const first = warnings[0];
   const fileName = first.path.split(/[\\/]/).pop() ?? first.path;
-  const remaining = warnings.length > 1 ? ` · ${warnings.length - 1} more` : "";
-  return `${fileName}: ${conciseMessage(first.message)}${remaining}`;
+  let reason = "temporary API error";
+  const msg = first.message.toLowerCase();
+  if (msg.includes("503") || msg.includes("high demand") || msg.includes("service unavailable")) {
+    reason = "Google service demand spike (503)";
+  } else if (msg.includes("429") || msg.includes("quota") || msg.includes("rate limit")) {
+    reason = "Rate limit reached (429)";
+  } else if (msg.includes("no usable frames") || msg.includes("ffmpeg")) {
+    reason = "frame extraction";
+  }
+  return count === 1
+    ? `${fileName} skipped (${reason})`
+    : `${count} clips paused (${reason}) · rerun to complete remaining clips`;
 }
 
 function readFilters(): SearchFilters {
@@ -785,30 +828,104 @@ async function openPreview(path: string, name: string, timestampMs = 0): Promise
   }
 }
 
+function formatFps(raw?: string | null): string {
+  if (!raw) return "";
+  if (raw.includes("/")) {
+    const [num, den] = raw.split("/").map(Number);
+    if (den && !isNaN(num) && !isNaN(den) && den !== 0) {
+      const fps = num / den;
+      return `${Math.round(fps * 100) / 100} fps`;
+    }
+  }
+  const num = Number(raw);
+  return !isNaN(num) ? `${Math.round(num * 100) / 100} fps` : `${raw} fps`;
+}
+
 function renderResultCard(result: SearchResult, index: number): string {
   const metadata = result.metadata;
-  const details = result.ai_description
-    ? `AI match ${Math.round((result.match_score ?? 0) * 100)}% · ${result.ai_description}`
-    : metadata
-      ? `${formatDuration(metadata.duration_ms)} · ${formatBytes(result.size_bytes)} · ${metadata.width ?? "?"}×${metadata.height ?? "?"} · ${metadata.frame_rate ?? "?"} fps · ${metadata.video_codec ?? "?"}`
-      : "Technical metadata unavailable";
-  const status = result.available ? "Available" : "Unavailable — rescan or restore this path";
   const fileName = result.path.split(/[\\/]/).pop() ?? result.path;
-  const previewLabel = result.timestamp_ms
-    ? `Preview @ ${formatDuration(result.timestamp_ms)}`
-    : "Preview";
-  return `<article class="result-card ${result.available ? "" : "result-card-unavailable"}">
-    <div>
-      <p class="result-index">${String(index + 1).padStart(2, "0")}</p>
-      <h3>${escapeHtml(fileName)}</h3>
-      <p>${escapeHtml(result.path)}</p>
-      <span>${escapeHtml(details)} · ${escapeHtml(status)}</span>
-    </div>
-    <div class="result-actions">
-      <button class="secondary-button preview-result" data-name="${escapeHtml(fileName)}" data-path="${escapeHtml(result.path)}" data-timestamp-ms="${result.timestamp_ms ?? 0}" ${result.available ? "" : "disabled"}>${escapeHtml(previewLabel)}</button>
-      <button class="secondary-button open-result" data-path="${escapeHtml(result.path)}" ${result.available ? "" : "disabled"}>Open</button>
+  const parentFolder = result.path.split(/[\\/]/).slice(0, -1).pop() ?? "Local library";
+  const durationMs = metadata?.duration_ms ?? 0;
+  const thumbnailKey = `${result.content_hash}:0`;
+  const fpsFormatted = formatFps(metadata?.frame_rate);
+  const resolution = metadata?.width && metadata?.height ? `${metadata.width}×${metadata.height}` : "";
+  const codec = metadata?.video_codec ? metadata.video_codec.toUpperCase() : "";
+  const size = formatBytes(result.size_bytes);
+  const aiCount = result.ai_annotation_count ?? 0;
+
+  const aiBadge = aiCount > 0
+    ? `<span class="relevance-badge badge-ai-indexed">AI · ${aiCount} moments</span>`
+    : `<span class="relevance-badge badge-ai-unindexed">Scan only</span>`;
+
+  const metaPills = [
+    resolution,
+    fpsFormatted,
+    codec,
+    size,
+  ].filter(Boolean).join(" · ");
+
+  return `<article class="video-result-card ${result.available ? "" : "result-card-unavailable"}">
+    <button class="video-thumbnail preview-result" type="button" data-name="${escapeHtml(fileName)}" data-path="${escapeHtml(result.path)}" data-timestamp-ms="0" data-thumbnail-key="${escapeHtml(thumbnailKey)}" ${result.available ? "" : "disabled"} aria-label="Preview ${escapeHtml(fileName)}">
+      <span class="thumbnail-placeholder">Creating thumbnail…</span>
+      <span class="thumbnail-play" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="m7 4 8 6-8 6z"/></svg></span>
+      ${durationMs > 0 ? `<span class="thumbnail-time">${escapeHtml(formatDuration(durationMs))}</span>` : ""}
+      ${aiBadge}
+    </button>
+    <div class="video-card-body">
+      <div class="video-card-heading">
+        <div class="video-card-title-group">
+          <span class="video-card-num">${String(index + 1).padStart(2, "0")}</span>
+          <h3 title="${escapeHtml(result.path)}">${escapeHtml(fileName)}</h3>
+        </div>
+        <button class="icon-button open-result" type="button" data-path="${escapeHtml(result.path)}" ${result.available ? "" : "disabled"} title="Open original file" aria-label="Open original ${escapeHtml(fileName)}"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8 5h7v7M15 5 7 13"/><path d="M12 10v5H5V8h5"/></svg></button>
+      </div>
+      <p class="video-card-folder" title="${escapeHtml(result.path)}">${escapeHtml(parentFolder)}</p>
+      <div class="video-card-meta">${escapeHtml(metaPills || "Metadata unavailable")}</div>
     </div>
   </article>`;
+}
+
+function renderLibraryGroups(results: SearchResult[]): string {
+  const groups = new Map<string, { path: string; results: SearchResult[] }>();
+  for (const result of results) {
+    const parts = result.path.split(/[\\/]/);
+    const parentPath = parts.slice(0, -1).join("\\") || "Local library";
+    const key = parentPath.toLocaleLowerCase();
+    const group = groups.get(key) ?? { path: parentPath, results: [] };
+    group.results.push(result);
+    groups.set(key, group);
+  }
+
+  let itemIndex = 0;
+  return Array.from(groups.values())
+    .map((group) => {
+      const folderName = group.path.split(/[\\/]/).pop() ?? group.path;
+      const relativePath = selectedLibraryPath && group.path.toLocaleLowerCase().startsWith(selectedLibraryPath.toLocaleLowerCase())
+        ? group.path.slice(selectedLibraryPath.length).replace(/^[\\/]+/, "") || "Selected folder"
+        : group.path;
+      const totalSize = group.results.reduce((sum, result) => sum + result.size_bytes, 0);
+      const analyzedCount = group.results.filter((result) => (result.ai_annotation_count ?? 0) > 0).length;
+      const cards = group.results.map((result) => renderResultCard(result, itemIndex++)).join("");
+
+      return `<section class="folder-group">
+        <header class="folder-group-header">
+          <div class="folder-group-identity">
+            <svg class="folder-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.75 6.25h7l2 2h9.5v10.5H2.75z"/><path d="M2.75 8.25v-4h6l2 2"/></svg>
+            <div>
+              <h2>${escapeHtml(folderName)}</h2>
+              <p title="${escapeHtml(group.path)}">${escapeHtml(relativePath)}</p>
+            </div>
+          </div>
+          <div class="folder-group-stats">
+            <span>${group.results.length} ${group.results.length === 1 ? "clip" : "clips"}</span>
+            <span>${escapeHtml(formatBytes(totalSize))}</span>
+            <span>${analyzedCount}/${group.results.length} AI ready</span>
+          </div>
+        </header>
+        <div class="folder-contact-sheet">${cards}</div>
+      </section>`;
+    })
+    .join("");
 }
 
 function renderGroupedAiResults(results: SearchResult[]): string {
@@ -833,19 +950,21 @@ function renderGroupedAiResults(results: SearchResult[]): string {
       const bestScore = Math.max(...group.map((result) => result.match_score ?? 0));
       const relevance =
         groupIndex === 0 ? "Top match" : bestScore >= topScore - 0.04 ? "Strong" : "Related";
+      const badgeClass =
+        groupIndex === 0 ? "badge-match-top" : bestScore >= topScore - 0.04 ? "badge-match-strong" : "badge-match-related";
       const timestamp = bestMatch.timestamp_ms ?? 0;
       const thumbnailKey = `${bestMatch.content_hash}:${timestamp}`;
       const otherMoments = moments.filter((moment) => moment !== bestMatch);
       const extraMoments = otherMoments.length
-        ? `<details class="video-moments">
+        ? `<details class="extra-moments-toggle">
           <summary>${otherMoments.length} more ${otherMoments.length === 1 ? "moment" : "moments"}</summary>
-          <div class="moment-list">
+          <div class="extra-moments-list">
             ${otherMoments
               .map(
                 (moment) => `<button class="moment-row preview-result" type="button" data-name="${escapeHtml(fileName)}" data-path="${escapeHtml(moment.path)}" data-timestamp-ms="${moment.timestamp_ms ?? 0}" ${moment.available ? "" : "disabled"}>
               <strong>${escapeHtml(formatDuration(moment.timestamp_ms))}</strong>
               <span>${escapeHtml(moment.ai_description ?? "Matching scene")}</span>
-              <span aria-hidden="true">▶</span>
+              <span class="moment-play" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="m7 4 8 6-8 6z"/></svg></span>
             </button>`,
               )
               .join("")}
@@ -854,20 +973,19 @@ function renderGroupedAiResults(results: SearchResult[]): string {
         : "";
       return `<article class="video-result-card ${bestMatch.available ? "" : "result-card-unavailable"}">
       <button class="video-thumbnail preview-result" type="button" data-name="${escapeHtml(fileName)}" data-path="${escapeHtml(bestMatch.path)}" data-timestamp-ms="${timestamp}" data-thumbnail-key="${escapeHtml(thumbnailKey)}" ${bestMatch.available ? "" : "disabled"} aria-label="Preview ${escapeHtml(fileName)} at ${escapeHtml(formatDuration(timestamp))}">
-        <img alt="" />
-        <span class="thumbnail-placeholder">Creating local thumbnail…</span>
-        <span class="thumbnail-play" aria-hidden="true">▶</span>
+        <span class="thumbnail-placeholder">Creating thumbnail…</span>
+        <span class="thumbnail-play" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="m7 4 8 6-8 6z"/></svg></span>
         <span class="thumbnail-time">${escapeHtml(formatDuration(timestamp))}</span>
-        <span class="relevance-badge">${escapeHtml(relevance)}</span>
+        <span class="relevance-badge ${badgeClass}">${escapeHtml(relevance)}</span>
       </button>
       <div class="video-card-body">
         <div class="video-card-heading">
-          <div>
+          <div class="video-card-title-group">
             <h3 title="${escapeHtml(fileName)}">${escapeHtml(fileName)}</h3>
-            <p>${escapeHtml(parentFolder)}</p>
           </div>
-          <button class="icon-button open-result" type="button" data-path="${escapeHtml(bestMatch.path)}" ${bestMatch.available ? "" : "disabled"} aria-label="Open original ${escapeHtml(fileName)}">↗</button>
+          <button class="icon-button open-result" type="button" data-path="${escapeHtml(bestMatch.path)}" ${bestMatch.available ? "" : "disabled"} title="Open original file" aria-label="Open original ${escapeHtml(fileName)}"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8 5h7v7M15 5 7 13"/><path d="M12 10v5H5V8h5"/></svg></button>
         </div>
+        <p class="video-card-folder">${escapeHtml(parentFolder)}</p>
         <p class="video-best-description">${escapeHtml(bestMatch.ai_description ?? "Matching scene")}</p>
         ${extraMoments}
       </div>
@@ -885,9 +1003,8 @@ async function loadAiThumbnails(ffmpegPath: string): Promise<void> {
     while (cursor < buttons.length) {
       const button = buttons[cursor++];
       const key = button.dataset.thumbnailKey ?? "";
-      const image = button.querySelector<HTMLImageElement>("img");
       const placeholder = button.querySelector<HTMLElement>(".thumbnail-placeholder");
-      if (!key || !image) continue;
+      if (!key) continue;
       try {
         let dataUrl = thumbnailCache.get(key);
         if (!dataUrl) {
@@ -899,16 +1016,23 @@ async function loadAiThumbnails(ffmpegPath: string): Promise<void> {
           thumbnailCache.set(key, dataUrl);
         }
         if (generation !== thumbnailGeneration || !button.isConnected) return;
+        let image = button.querySelector<HTMLImageElement>("img");
+        if (!image) {
+          image = document.createElement("img");
+          image.alt = button.dataset.name ? `${button.dataset.name} thumbnail` : "Thumbnail";
+          button.prepend(image);
+        }
         image.src = dataUrl;
         button.classList.add("thumbnail-loaded");
+        if (placeholder) placeholder.style.display = "none";
       } catch {
         if (generation !== thumbnailGeneration || !button.isConnected) return;
         button.classList.add("thumbnail-error");
-        if (placeholder) placeholder.textContent = "Preview image unavailable";
+        if (placeholder) placeholder.textContent = "Preview unavailable";
       }
     }
   };
-  await Promise.all(Array.from({ length: Math.min(3, buttons.length) }, () => worker()));
+  await Promise.all(Array.from({ length: Math.min(4, buttons.length) }, () => worker()));
 }
 
 function renderResults(results: SearchResult[], groupByVideo = false): void {
@@ -916,21 +1040,31 @@ function renderResults(results: SearchResult[], groupByVideo = false): void {
   if (results.length === 0) {
     resultList.hidden = true;
     resultList.classList.remove("ai-result-grid");
+    resultList.classList.remove("library-folder-list");
     if (resultsNote) resultsNote.hidden = true;
+    const emptyTitle = document.querySelector<HTMLElement>("#empty-title");
+    const emptyCopy = document.querySelector<HTMLElement>("#empty-copy");
+    if (selectedLibraryPath) {
+      if (emptyTitle) emptyTitle.textContent = groupByVideo ? "No matching visual moments" : "No clips match these filters";
+      if (emptyCopy) emptyCopy.textContent = groupByVideo
+        ? "Try a broader description, or analyze the folder again with a stronger vision model."
+        : "Clear or change the filename and metadata filters to see this library again.";
+    }
     emptyState.hidden = false;
     return;
   }
   emptyState.hidden = true;
   resultList.hidden = false;
   resultList.classList.toggle("ai-result-grid", groupByVideo);
+  resultList.classList.toggle("library-folder-list", !groupByVideo);
   const visibleResults = results.slice(0, MAX_RENDERED_RESULTS);
   if (resultsNote) {
     resultsNote.hidden = results.length <= MAX_RENDERED_RESULTS;
-    resultsNote.textContent = `Showing the first ${MAX_RENDERED_RESULTS} of ${results.length} matches. Refine your search to see a smaller set.`;
+    resultsNote.textContent = `Showing first ${MAX_RENDERED_RESULTS} of ${results.length} clips.`;
   }
   resultList.innerHTML = groupByVideo
     ? renderGroupedAiResults(visibleResults)
-    : visibleResults.map((result, index) => renderResultCard(result, index)).join("");
+    : renderLibraryGroups(visibleResults);
   resultList.querySelectorAll<HTMLButtonElement>(".preview-result").forEach((button) => {
     button.addEventListener("click", () => {
       void openPreview(
@@ -946,7 +1080,7 @@ function renderResults(results: SearchResult[], groupByVideo = false): void {
         await tauriApi.openIndexedMediaPath(button.dataset.path ?? "");
       } catch (error) {
         if (libraryStatus) libraryStatus.textContent = "Could not open clip";
-        if (libraryPath) libraryPath.textContent = String(error);
+        if (libraryPath) libraryPath.textContent = conciseMessage(error);
       }
     });
   });
@@ -956,19 +1090,31 @@ async function searchLibrary(trigger?: HTMLButtonElement): Promise<void> {
   const originalLabel = trigger?.textContent ?? "Search";
   if (trigger) {
     trigger.disabled = true;
-    trigger.textContent = "Searching…";
+    trigger.textContent = "Filtering…";
   }
-  if (libraryStatus) libraryStatus.textContent = "Searching local index…";
-  if (libraryPath) libraryPath.textContent = "Applying filters and sorting";
   try {
     const results = await tauriApi.searchMedia(readFilters());
-    renderResults(results);
-    if (clipCount) clipCount.textContent = `${results.length} matches`;
-    if (libraryStatus) libraryStatus.textContent = `${results.length} matching clips`;
-    if (libraryPath && selectedLibraryPath) libraryPath.textContent = selectedLibraryPath;
+    renderResults(results, false);
+    const config = readAiConfig();
+    void loadAiThumbnails(config.ffmpegPath);
+    const totalClips = results.length;
+    const aiIndexedClips = results.filter((r) => (r.ai_annotation_count ?? 0) > 0).length;
+    if (clipCount) {
+      clipCount.textContent = aiIndexedClips > 0
+        ? `${totalClips} clips (${aiIndexedClips} AI indexed)`
+        : `${totalClips} clips`;
+    }
+    if (libraryStatus) {
+      libraryStatus.textContent = `${totalClips} clips in library`;
+    }
+    if (libraryPath && selectedLibraryPath) {
+      libraryPath.textContent = aiIndexedClips > 0
+        ? `${selectedLibraryPath} · ${aiIndexedClips}/${totalClips} clips analyzed with AI (saved in SQLite)`
+        : `${selectedLibraryPath} · Ready for AI analysis`;
+    }
   } catch (error) {
     if (libraryStatus) libraryStatus.textContent = "Search failed";
-    if (libraryPath) libraryPath.textContent = String(error);
+    if (libraryPath) libraryPath.textContent = conciseMessage(error);
   } finally {
     if (trigger) {
       trigger.disabled = false;
@@ -1190,7 +1336,7 @@ async function testAiConnection(): Promise<void> {
     return;
   }
   if (aiConfigStatus)
-    aiConfigStatus.textContent = `Testing ${aiProviderLabel(config.provider)} · ${config.embeddingModel}…`;
+    aiConfigStatus.textContent = `Checking ${aiProviderLabel(config.provider)} vision model and ${config.embeddingModel}…`;
   try {
     const report = await tauriApi.testAiConnection(config);
     if (aiConfigStatus) {
@@ -1269,6 +1415,7 @@ selectFolderButton?.addEventListener("click", async () => {
   try {
     const report = await tauriApi.indexMediaFolder(selected);
     selectedLibraryPath = selected;
+    updateHeaderFolder(selected);
     if (analyzeAiButton) analyzeAiButton.disabled = false;
     if (libraryStatus) {
       libraryStatus.textContent =
