@@ -31,8 +31,10 @@ pull request.
   #20, #21, #22, #37, and #39. The local `main` pointer remains stale at
   `78cb453`; use `origin/main` for comparisons.
 - `feat/performance-cost-and-search-optimizations` is the current desktop MVP
-  follow-up branch. It has diverged from `origin/main`: 10 branch-only commits
-  and 9 main-only merge commits with common base `8ff8843`.
+  follow-up branch. Commit `6ef9655` merged `origin/main`, so the branch now
+  contains the fetched baseline and is 14 commits ahead, 0 behind after the
+  final documentation correction at this
+  snapshot.
 - The merge strategy and live GitHub reconciliation are documented in
   [main-integration-review.md](main-integration-review.md).
 - Exact continuation and verification steps are in

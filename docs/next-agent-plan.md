@@ -13,9 +13,10 @@ without presenting MediaIndex as a browser-hosted product.
 - Workspace: `C:\Users\grego\Documents\Playground\MediaIndex`
 - Active branch: `feat/performance-cost-and-search-optimizations`
 - Integration target: fetched `origin/main` at `79e2626`
-- Local `main` is stale at `78cb453`. The feature branch and `origin/main`
-  share base `8ff8843`; the feature is 10 commits ahead and 9 merge commits
-  behind. Read
+- Local `main` is stale at `78cb453`. Merge commit `6ef9655` synchronized the
+  feature branch with `origin/main`; the branch is 13 commits ahead and 0 behind
+  before the final documentation correction (14 ahead after it is committed).
+  Read
   [main-integration-review.md](main-integration-review.md) before changing Git
   history.
 - Preserve user-owned `.idea/` files and unrelated working-tree changes.
@@ -52,8 +53,8 @@ without presenting MediaIndex as a browser-hosted product.
    `rg -n "visual-fixture|Autumn Campaign|fixture-a" desktop/src/main.ts`.
 3. Authenticate `gh` for `Lanque/MediaIndex`, then audit live issues and pull
    requests before changing their state.
-4. Commit the reviewed product changes explicitly, then integrate
-   `origin/main`; prefer a merge unless the owner requests a history rewrite.
+4. Fetch `origin/main` again immediately before publishing and merge any new
+   commits without rewriting the existing issue-linked history.
 5. Compare the final branch against `origin/main` by subsystem and update
    `docs/engineering-status.md` from live GitHub evidence.
 
@@ -99,10 +100,10 @@ Use the executable or NSIS-installed app, not the Vite browser preview.
 
 ## GitHub reconciliation
 
-When authenticated, list all open and closed issues/PRs and map the 10
-feature-only commits plus the current finishing commits to them. The foundation
-stack is already merged through PR #39, so use one focused follow-up PR rather
-than recreating that stack. The follow-up PR should include:
+When authenticated, list all open and closed issues/PRs and map the 14
+post-`origin/main` commits to them. The foundation stack is already merged
+through PR #39, so use one focused follow-up PR rather than recreating that
+stack. The follow-up PR should include:
 
 - linked issues and preserved commit traceability;
 - a subsystem-oriented summary;

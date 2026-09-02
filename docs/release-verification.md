@@ -9,9 +9,12 @@ Verification snapshot: 2026-09-03, branch
 | --- | --- |
 | `python -m unittest discover -s tests -p "test_*.py"` | passed: 33 tests; infrastructure and migration checks passed |
 | `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --check` | passed |
-| `cargo test --manifest-path desktop/src-tauri/Cargo.toml` | passed: 42 tests; 1 opt-in FFmpeg/provider-pipeline smoke test ignored |
+| `cargo test --manifest-path desktop/src-tauri/Cargo.toml` | passed: 44 tests; 1 opt-in FFmpeg/provider-pipeline smoke test ignored in the default run |
+| OpenAI/Gemini connection contracts | passed: Bearer auth, `x-goog-api-key`, model checks, Embedding 2 payload, and no API key in Gemini URLs |
+| opt-in real-video pipeline smoke test | passed with a generated MP4, real FFmpeg extraction, local OpenAI HTTP stub, embeddings, SQLite persistence, and search; no provider credits used |
 | `npm.cmd run build` | passed: TypeScript and Vite production bundle |
 | `npm.cmd run tauri build` | passed: Windows executable and NSIS installer |
+| packaged executable startup | passed: process stayed alive, Windows title was `MediaIndex`, and the process reported responsive |
 | `git diff --check` | passed; Git emitted line-ending notices only |
 | production provenance check | passed: design seed `538ed156` is present in `desktop/dist/index.html` |
 
@@ -23,8 +26,8 @@ not canonicalize `C:\Users\grego`. Neither warning failed a check.
 
 | Artifact | Size | SHA-256 |
 | --- | ---: | --- |
-| `desktop/src-tauri/target/release/mediaindex.exe` | 15,184,896 bytes | `142D9FA7E988AC073D3B85F7373F9F6CE89A62996C249F9E0573C1B7580AE17E` |
-| `desktop/src-tauri/target/release/bundle/nsis/MediaIndex_0.1.0_x64-setup.exe` | 3,928,799 bytes | `5A55FE26FA4ED244B762B288B2A4DAEBC3540482920B8EAF1C8C53760FF65259` |
+| `desktop/src-tauri/target/release/mediaindex.exe` | 15,184,896 bytes | `9EF336C14947487EB0B3A8AAE2449CB004A3542B1BCEA5FC9D5046EBA2DC53A6` |
+| `desktop/src-tauri/target/release/bundle/nsis/MediaIndex_0.1.0_x64-setup.exe` | 3,925,774 bytes | `33F04F84E7DA5AD8EC759714B7EDE31663411B0FB9B82027EBEC010D50708FD0` |
 
 These local artifacts are unsigned unless a release signing certificate is
 configured. The installer is suitable for local testing; a public release
