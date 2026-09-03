@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod gemini_oauth;
 pub mod local_index;
 pub mod metadata;
 pub mod scanner;
@@ -56,11 +57,16 @@ struct AiAnalysisRunGuard {
 
 #[derive(Debug, serde::Serialize)]
 struct AiAnalysisPlan {
+    total_file_count: u64,
     analyze_file_count: u64,
     skipped_file_count: u64,
+    already_analyzed_file_count: u64,
     max_frames_per_file: u64,
     max_sampled_frames: u64,
     max_vision_requests: u64,
+    estimated_sampled_frames: u64,
+    estimated_vision_requests: u64,
+    estimated_audio_seconds: u64,
     model: String,
 }
 
@@ -147,7 +153,7 @@ fn index_media_folder_blocking(
     );
     scan.warnings.extend(metadata_warnings);
     index
-        .reconcile(&scan, &metadata_by_path)
+        .reconcile_under_root(&scan, &metadata_by_path, Path::new(&path))
         .map_err(|error| error.to_string())
 }
 
@@ -216,7 +222,7 @@ fn plan_ai_analysis(
     config: Option<ai::AiRequestConfig>,
     force: Option<bool>,
 ) -> Result<AiAnalysisPlan, String> {
-    let settings = ai::AiSettings::from_request(config)?;
+    let settings = ai_settings(&app, config)?;
     let index = open_local_index(&app)?;
     let indexed_files = unique_indexed_files_under_root(
         index.known_files().map_err(|error| error.to_string())?,
@@ -226,20 +232,63 @@ fn plan_ai_analysis(
         return Err("No indexed active clips were found in the selected folder".to_owned());
     }
     let model = settings.model_namespace();
+    let total_file_count = indexed_files.len() as u64;
+    let already_analyzed_file_count = count_already_analyzed(&index, &indexed_files, &model)?;
     let (files, skipped_file_count) =
         select_ai_files(&index, indexed_files, &model, force.unwrap_or(false))?;
     let analyze_file_count = files.len() as u64;
     let max_frames_per_file = settings.max_frames_per_file() as u64;
-    let requests_per_file = settings
-        .max_frames_per_file()
-        .div_ceil(settings.vision_batch_size()) as u64;
+    let vision_batch_size = settings.vision_batch_size() as u64;
+    let requests_per_file = max_frames_per_file.div_ceil(vision_batch_size);
+    let mut estimated_sampled_frames = 0u64;
+    let mut estimated_vision_requests = 0u64;
+    let mut estimated_audio_seconds = 0u64;
+    for file in &files {
+        let metadata = index
+            .get_asset_metadata(&file.content_hash)
+            .map_err(|error| error.to_string())?;
+        let duration_ms = metadata.as_ref().and_then(|metadata| metadata.duration_ms);
+        let sampled_frames = duration_ms
+            .map(|duration| {
+                duration
+                    .max(1)
+                    .div_ceil(settings.sample_interval_ms().max(1))
+                    .max(1)
+                    .min(max_frames_per_file)
+            })
+            .unwrap_or(max_frames_per_file);
+        estimated_sampled_frames = estimated_sampled_frames.saturating_add(sampled_frames);
+        estimated_vision_requests =
+            estimated_vision_requests.saturating_add(sampled_frames.div_ceil(vision_batch_size));
+        if settings.transcribes_audio()
+            && metadata
+                .as_ref()
+                .and_then(|metadata| metadata.audio_codec.as_deref())
+                .is_some()
+        {
+            let configured_span_ms = settings
+                .sample_interval_ms()
+                .saturating_mul(max_frames_per_file);
+            estimated_audio_seconds = estimated_audio_seconds.saturating_add(
+                duration_ms
+                    .unwrap_or(configured_span_ms)
+                    .min(configured_span_ms)
+                    .div_ceil(1_000),
+            );
+        }
+    }
 
     Ok(AiAnalysisPlan {
+        total_file_count,
         analyze_file_count,
         skipped_file_count,
+        already_analyzed_file_count,
         max_frames_per_file,
         max_sampled_frames: analyze_file_count.saturating_mul(max_frames_per_file),
         max_vision_requests: analyze_file_count.saturating_mul(requests_per_file),
+        estimated_sampled_frames,
+        estimated_vision_requests,
+        estimated_audio_seconds,
         model,
     })
 }
@@ -256,7 +305,7 @@ fn analyze_media_folder_blocking(
     force: bool,
     control: &AiAnalysisControl,
 ) -> Result<ai::AiIndexReport, String> {
-    let settings = ai::AiSettings::from_request(config)?;
+    let settings = ai_settings(&app, config)?;
     let mut index = open_local_index(&app)?;
     let root = Path::new(&path);
     let indexed_files = unique_indexed_files_under_root(
@@ -441,6 +490,23 @@ fn select_ai_files(
     Ok((files, skipped_file_count))
 }
 
+fn count_already_analyzed(
+    index: &local_index::SqliteIndex,
+    indexed_files: &[local_index::IndexedFile],
+    model: &str,
+) -> Result<u64, String> {
+    let mut count = 0u64;
+    for file in indexed_files {
+        if index
+            .has_ai_annotations_for_content_model(&file.content_hash, model)
+            .map_err(|error| error.to_string())?
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -485,10 +551,13 @@ async fn search_ai(
     query: String,
     config: Option<ai::AiRequestConfig>,
     focus: Option<local_index::AiSearchFocus>,
+    root: Option<String>,
 ) -> Result<Vec<local_index::AiSearchResult>, String> {
-    tauri::async_runtime::spawn_blocking(move || search_ai_blocking(app, query, config, focus))
-        .await
-        .map_err(|error| format!("AI search worker failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        search_ai_blocking(app, query, config, focus, root)
+    })
+    .await
+    .map_err(|error| format!("AI search worker failed: {error}"))?
 }
 
 fn search_ai_blocking(
@@ -496,12 +565,17 @@ fn search_ai_blocking(
     query: String,
     config: Option<ai::AiRequestConfig>,
     focus: Option<local_index::AiSearchFocus>,
+    root: Option<String>,
 ) -> Result<Vec<local_index::AiSearchResult>, String> {
-    let settings = ai::AiSettings::from_request(config)?;
+    let settings = ai_settings(&app, config)?;
     let model_namespace = settings.model_namespace();
     let index = open_local_index(&app)?;
+    let root_path = root
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(Path::new);
     if index
-        .ai_annotation_count_for_model(&model_namespace)
+        .ai_annotation_count_for_model_under_root(&model_namespace, root_path)
         .map_err(|error| error.to_string())?
         == 0
     {
@@ -511,14 +585,29 @@ fn search_ai_blocking(
     }
     let embedding = ai::embed_query(&query, &settings)?;
     index
-        .search_ai_with_focus(
+        .search_ai_with_focus_under_root(
             &query,
             &embedding,
             100,
             Some(&model_namespace),
             focus.unwrap_or_default(),
+            root_path,
         )
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_saved_ai_moments(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<Vec<local_index::SavedAiMoment>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        open_local_index(&app)?
+            .saved_ai_moments_for_path(&path)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("saved AI analysis worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -576,18 +665,58 @@ fn get_ai_thumbnail_blocking(
 
 #[tauri::command]
 async fn test_ai_connection(
+    app: tauri::AppHandle,
     config: Option<ai::AiRequestConfig>,
 ) -> Result<ai::AiConnectionReport, String> {
-    tauri::async_runtime::spawn_blocking(move || test_ai_connection_blocking(config))
+    tauri::async_runtime::spawn_blocking(move || test_ai_connection_blocking(app, config))
         .await
         .map_err(|error| format!("AI connection worker failed: {error}"))?
 }
 
 fn test_ai_connection_blocking(
+    app: tauri::AppHandle,
     config: Option<ai::AiRequestConfig>,
 ) -> Result<ai::AiConnectionReport, String> {
-    let settings = ai::AiSettings::from_request(config)?;
+    let settings = ai_settings(&app, config)?;
     ai::test_connection(&settings)
+}
+
+fn ai_settings(
+    app: &tauri::AppHandle,
+    config: Option<ai::AiRequestConfig>,
+) -> Result<ai::AiSettings, String> {
+    let config = app
+        .state::<gemini_oauth::GeminiOAuthSession>()
+        .resolve_config(config)?;
+    ai::AiSettings::from_request(config)
+}
+
+#[tauri::command]
+async fn login_gemini_oauth(
+    app: tauri::AppHandle,
+    client_file_path: String,
+) -> Result<gemini_oauth::GeminiOAuthStatus, String> {
+    let session = app
+        .state::<gemini_oauth::GeminiOAuthSession>()
+        .inner()
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || session.login(&app, Path::new(&client_file_path)))
+        .await
+        .map_err(|error| format!("Google login worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn get_gemini_oauth_status(
+    session: tauri::State<'_, gemini_oauth::GeminiOAuthSession>,
+) -> gemini_oauth::GeminiOAuthStatus {
+    session.status()
+}
+
+#[tauri::command]
+fn logout_gemini_oauth(
+    session: tauri::State<'_, gemini_oauth::GeminiOAuthSession>,
+) -> gemini_oauth::GeminiOAuthStatus {
+    session.logout()
 }
 
 #[tauri::command]
@@ -640,6 +769,7 @@ fn open_local_index(app: &tauri::AppHandle) -> Result<local_index::SqliteIndex, 
 pub fn run() {
     tauri::Builder::default()
         .manage(AiAnalysisControl::default())
+        .manage(gemini_oauth::GeminiOAuthSession::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -652,8 +782,12 @@ pub fn run() {
             analyze_media_folder,
             cancel_ai_analysis,
             search_ai,
+            get_saved_ai_moments,
             get_ai_thumbnail,
             test_ai_connection,
+            login_gemini_oauth,
+            get_gemini_oauth_status,
+            logout_gemini_oauth,
             open_indexed_media_path,
             prepare_indexed_media_preview
         ])

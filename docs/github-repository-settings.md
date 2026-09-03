@@ -26,8 +26,11 @@ Select `main` as the target branch and save the policy only after confirming the
 
 ## Current limitation
 
-GitHub currently returns HTTP 403 for the branch-protection and repository-rulesets APIs on this private repository with the message:
+GitHub previously returned HTTP 403 for the branch-protection and
+repository-rulesets APIs on this private repository with the message:
 
 `Upgrade to GitHub Pro or make this repository public to enable this feature.`
 
-No visibility change was made automatically. The policy is documented and tracked so it can be enabled without redesigning the workflow later.
+No visibility change was made automatically. The owner chose to defer branch
+protection. Recheck the repository plan and settings before acting because this
+limitation can change over time.
