@@ -56,6 +56,14 @@ into this view and does not mark clips from other indexed roots as missing.
 **Analyzed archive** is the explicit cross-folder view: it lists only clips with
 saved AI annotations and preserves their real source-folder grouping.
 
+An analyzed clip shows **View AI analysis** without loading every annotation up
+front. Opening it loads the saved SQLite data on demand and explains how raw
+timestamp samples become contextual AI moments. The detail view exposes each
+full, untruncated description, start/end time, confidence, all stored context
+labels, and the provider/model namespace. Each moment can be previewed at its
+starting timestamp. Analyses made with different models remain grouped
+separately; reanalysis replaces only the selected model's own rows.
+
 ## AI search
 
 AI search is a separate, explicit workflow:
@@ -93,7 +101,9 @@ splitting an otherwise continuous scene every time the words change.
 Results are displayed as visual cards ordered by the best match for each video.
 FFmpeg generates and caches a local thumbnail for the best matching timestamp;
 clicking it opens Preview at that moment. Other moments are kept in a compact
-chronological list without repeating the featured timestamp. **Focused** mode is the default and applies an adaptive
+chronological list without repeating the featured timestamp. **Full description
+& analysis** opens the same saved-analysis inspector, so clipped card text never
+hides the complete result or the surrounding moments. **Focused** mode is the default and applies an adaptive
 score window, an absolute relevance floor, and an eight-video/two-moment-per-video
 cap. Exact or inflected on-screen text and labels receive enough ranking weight
 to survive that floor, while generic embedding similarity alone is filtered.

@@ -118,6 +118,15 @@ export type AiSearchResult = {
   available: boolean;
 };
 
+export type SavedAiMoment = {
+  timestamp_ms: number;
+  end_timestamp_ms: number;
+  description: string;
+  labels: string[];
+  confidence: number | null;
+  model: string;
+};
+
 export type ModelPreset = {
   id: string;
   name: string;

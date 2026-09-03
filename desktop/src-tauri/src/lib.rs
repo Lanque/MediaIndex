@@ -597,6 +597,20 @@ fn search_ai_blocking(
 }
 
 #[tauri::command]
+async fn get_saved_ai_moments(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<Vec<local_index::SavedAiMoment>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        open_local_index(&app)?
+            .saved_ai_moments_for_path(&path)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("saved AI analysis worker failed: {error}"))?
+}
+
+#[tauri::command]
 async fn get_ai_thumbnail(
     app: tauri::AppHandle,
     path: String,
@@ -768,6 +782,7 @@ pub fn run() {
             analyze_media_folder,
             cancel_ai_analysis,
             search_ai,
+            get_saved_ai_moments,
             get_ai_thumbnail,
             test_ai_connection,
             login_gemini_oauth,

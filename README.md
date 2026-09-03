@@ -22,6 +22,8 @@ the Rust backend.
   with session-only credentials;
 - per-video visual search that combines similar adjacent frames into contextual
   time ranges;
+- a lazy, full-context AI analysis inspector for every indexed clip, including
+  complete descriptions, time ranges, labels, confidence, and model history;
 - background analysis progress, measured time estimates, cancellation, and
   bounded cloud cost preflight.
 

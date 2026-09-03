@@ -204,6 +204,16 @@ pub struct AiSearchResult {
     pub available: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct SavedAiMoment {
+    pub timestamp_ms: u64,
+    pub end_timestamp_ms: u64,
+    pub description: String,
+    pub labels: Vec<String>,
+    pub confidence: Option<f32>,
+    pub model: String,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AiSearchFocus {
@@ -447,10 +457,16 @@ impl SqliteIndex {
         annotations: &[AiAnnotation],
     ) -> Result<(), IndexError> {
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM ai_annotations WHERE content_hash = ?1",
-            params![content_hash],
-        )?;
+        let models = annotations
+            .iter()
+            .map(|annotation| annotation.model.as_str())
+            .collect::<HashSet<_>>();
+        for model in models {
+            transaction.execute(
+                "DELETE FROM ai_annotations WHERE content_hash = ?1 AND model = ?2",
+                params![content_hash, model],
+            )?;
+        }
         for annotation in annotations {
             transaction.execute(
                 "INSERT INTO ai_annotations(
@@ -724,6 +740,103 @@ impl SqliteIndex {
             }
         }
         Ok(results)
+    }
+
+    pub fn saved_ai_moments_for_path(&self, path: &str) -> Result<Vec<SavedAiMoment>, IndexError> {
+        let Some(file) = self.get_file(path)? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT timestamp_ms, description, labels_json, embedding_json,
+                    confidence, model
+             FROM ai_annotations
+             WHERE content_hash = ?1
+             ORDER BY model, timestamp_ms",
+        )?;
+        let rows = statement.query_map(params![file.content_hash], |row| {
+            let labels: Vec<String> =
+                serde_json::from_str(&row.get::<_, String>(2)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            let embedding: Vec<f32> =
+                serde_json::from_str(&row.get::<_, String>(3)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, String>(1)?,
+                labels,
+                embedding,
+                row.get::<_, Option<f32>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+
+        let mut by_model = HashMap::<String, Vec<(RankedAiAnnotation, Option<f32>)>>::new();
+        for row in rows {
+            let (timestamp_ms, description, labels, embedding, confidence, model) = row?;
+            by_model.entry(model).or_default().push((
+                RankedAiAnnotation {
+                    result: AiSearchResult {
+                        path: file.path.clone(),
+                        content_hash: file.content_hash.clone(),
+                        timestamp_ms,
+                        end_timestamp_ms: timestamp_ms,
+                        score: confidence.unwrap_or_default(),
+                        description,
+                        labels,
+                        available: file.status == LocalFileStatus::Active
+                            && Path::new(&file.path).is_file(),
+                    },
+                    embedding,
+                },
+                confidence,
+            ));
+        }
+
+        let mut moments = Vec::new();
+        for (model, annotations) in by_model {
+            let confidence_by_timestamp = annotations
+                .iter()
+                .map(|(annotation, confidence)| (annotation.result.timestamp_ms, *confidence))
+                .collect::<HashMap<_, _>>();
+            for result in coalesce_contextual_ai_moments(
+                annotations
+                    .into_iter()
+                    .map(|(annotation, _)| annotation)
+                    .collect(),
+            ) {
+                moments.push(SavedAiMoment {
+                    timestamp_ms: result.timestamp_ms,
+                    end_timestamp_ms: result.end_timestamp_ms,
+                    confidence: confidence_by_timestamp
+                        .iter()
+                        .filter(|(timestamp_ms, _)| {
+                            **timestamp_ms >= result.timestamp_ms
+                                && **timestamp_ms <= result.end_timestamp_ms
+                        })
+                        .filter_map(|(_, confidence)| *confidence)
+                        .max_by(f32::total_cmp),
+                    description: result.description,
+                    labels: result.labels,
+                    model: model.clone(),
+                });
+            }
+        }
+        moments.sort_by(|left, right| {
+            left.model
+                .cmp(&right.model)
+                .then_with(|| left.timestamp_ms.cmp(&right.timestamp_ms))
+        });
+        Ok(moments)
     }
 
     pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>, IndexError> {
@@ -1596,6 +1709,121 @@ mod tests {
             .labels
             .iter()
             .any(|label| label == "dialogue: watch the river"));
+    }
+
+    #[test]
+    fn exposes_saved_analysis_as_contextual_moments_without_an_ai_query() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/ceremony.mp4", "hash-ceremony")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        let annotation = |timestamp_ms, dialogue: &str, model: &str| AiAnnotation {
+            timestamp_ms,
+            description: format!("Guests listen during a ceremony. Dialogue: {dialogue}"),
+            labels: vec![
+                "action: listening".to_owned(),
+                "setting: outdoor ceremony".to_owned(),
+                "situation: wedding".to_owned(),
+                format!("dialogue: {dialogue}"),
+            ],
+            embedding: vec![1.0, 0.0],
+            confidence: Some(if timestamp_ms == 10_000 { 0.95 } else { 0.8 }),
+            model: model.to_owned(),
+        };
+        index
+            .replace_ai_annotations(
+                "hash-ceremony",
+                &[
+                    annotation(0, "welcome everyone", "openai:model-a:embed-a"),
+                    annotation(10_000, "please take your seats", "openai:model-a:embed-a"),
+                ],
+            )
+            .expect("first model annotations should persist");
+        index
+            .replace_ai_annotations(
+                "hash-ceremony",
+                &[annotation(0, "welcome everyone", "gemini:model-b:embed-b")],
+            )
+            .expect("second model should not delete the first model");
+
+        let moments = index
+            .saved_ai_moments_for_path("/library/ceremony.mp4")
+            .expect("saved moments should load");
+
+        assert_eq!(moments.len(), 2);
+        let openai = moments
+            .iter()
+            .find(|moment| moment.model.starts_with("openai:"))
+            .expect("OpenAI analysis should be present");
+        assert_eq!((openai.timestamp_ms, openai.end_timestamp_ms), (0, 10_000));
+        assert_eq!(openai.confidence, Some(0.95));
+        assert!(openai
+            .labels
+            .contains(&"dialogue: please take your seats".to_owned()));
+    }
+
+    #[test]
+    fn reanalysis_replaces_only_the_selected_model_history() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/scene.mp4", "hash-scene")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        let annotation = |timestamp_ms, description: &str, model: &str| AiAnnotation {
+            timestamp_ms,
+            description: description.to_owned(),
+            labels: vec![format!("description: {description}")],
+            embedding: vec![1.0, 0.0],
+            confidence: Some(0.9),
+            model: model.to_owned(),
+        };
+        index
+            .replace_ai_annotations(
+                "hash-scene",
+                &[
+                    annotation(0, "old first scene", "openai:model-a:embed-a"),
+                    annotation(10_000, "old second scene", "openai:model-a:embed-a"),
+                ],
+            )
+            .expect("first model history should persist");
+        index
+            .replace_ai_annotations(
+                "hash-scene",
+                &[annotation(
+                    5_000,
+                    "other provider scene",
+                    "gemini:model-b:embed-b",
+                )],
+            )
+            .expect("second model history should persist");
+        index
+            .replace_ai_annotations(
+                "hash-scene",
+                &[annotation(20_000, "fresh scene", "openai:model-a:embed-a")],
+            )
+            .expect("reanalysis should replace the selected model");
+
+        let moments = index
+            .saved_ai_moments_for_path("/library/scene.mp4")
+            .expect("saved moments should load");
+
+        assert_eq!(moments.len(), 2);
+        assert!(moments.iter().any(|moment| {
+            moment.model.starts_with("openai:")
+                && moment.timestamp_ms == 20_000
+                && moment.description == "fresh scene"
+        }));
+        assert!(moments.iter().any(|moment| {
+            moment.model.starts_with("gemini:") && moment.description == "other provider scene"
+        }));
+        assert!(!moments
+            .iter()
+            .any(|moment| moment.description.starts_with("old")));
     }
 
     #[test]
