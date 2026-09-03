@@ -2,7 +2,7 @@
 
 Status snapshot: 2026-09-03.
 
-The local integration branch contains the implementation areas below. GitHub
+The local `main` branch contains the implementation areas below. GitHub
 issue and PR state is deliberately not labeled open, closed, draft, or merged in
 this snapshot: the local GitHub CLI is not authenticated for the private
 repository and returns HTTP 401. Verify live status before changing any issue or
@@ -10,7 +10,7 @@ pull request.
 
 | Area | Local issue/PR references | Local implementation state |
 | --- | --- | --- |
-| Tauri shell and CI foundation | #2, #7 / #16–#18 | present on integration branch |
+| Tauri shell and CI foundation | #2, #7 / #16–#18 | present on `main` |
 | Discovery and change detection | #3 / #20 | implemented and covered by Rust tests |
 | FFprobe metadata | #4 / #21 | implemented with cached metadata and errors |
 | SQLite local index | #5 / #22 | implemented with per-root reconciliation and saved cross-folder AI data |
@@ -20,20 +20,21 @@ pull request.
 | Worker retries and dead letters | #11 / #26 | implementation present |
 | Security guardrails | #13 / #27 | static safeguards and documentation present |
 | AWS/Terraform scaffold | #12 / #28 | scaffold only; not applied |
-| Documentation maintenance | #14 | updated in the integration branch |
+| Documentation maintenance | #14 | updated on `main` |
 | Selected-media preview job | #30 / #32 | implementation present |
 | FastAPI sync runtime | #31 | implementation and tests present |
 | Desktop AI visual index and search | #38 / #39 | implemented with provider compatibility fixes, contextual time ranges, lazy full-analysis inspection, per-model history preservation, timestamped OpenAI speech, Gemini Desktop OAuth, reanalysis confirmation, and first-run/calibrated ETA |
 
 ## Integration state
 
-- Fetched `origin/main` is `79e2626` and contains merged PRs #16, #17, #18,
-  #20, #21, #22, #37, and #39. The local `main` pointer remains stale at
-  `78cb453`; use `origin/main` for comparisons.
-- `feat/performance-cost-and-search-optimizations` is the current desktop MVP
-  follow-up branch. Commit `6ef9655` merged `origin/main`, so the branch now
-  contains the fetched baseline and is 19 commits ahead, 0 behind after this
-  snapshot.
+- Fetched `origin/main` was `79e2626` and contains merged PRs #16, #17, #18,
+  #20, #21, #22, #37, and #39.
+- The 19-commit `feat/performance-cost-and-search-optimizations` desktop MVP
+  follow-up was merged into local `main` by merge commit `8bdcc78` after a
+  final fetch confirmed it was 0 commits behind the remote baseline.
+- The merge and this status update are intended to be pushed directly to
+  `origin/main` at the owner's request; the published feature branch remains as
+  a reviewable implementation record.
 - The merge strategy and live GitHub reconciliation are documented in
   [main-integration-review.md](main-integration-review.md).
 - Exact continuation and verification steps are in

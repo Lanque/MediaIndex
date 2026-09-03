@@ -1,22 +1,22 @@
 # Main integration review
 
-Review snapshot: 2026-09-03 after `git fetch origin main` and synchronization
-merge `6ef9655`.
+Review snapshot: 2026-09-03 after the final `git fetch origin main` and local
+integration merge `8bdcc78`.
 
 ## Outcome
 
-The authoritative remote-tracking baseline is `origin/main` at `79e2626`.
+The fetched remote-tracking baseline was `origin/main` at `79e2626`.
 It contains merged PRs #16, #17, #18, #20, #21, #22, #37, and #39, including
 the Tauri shell, scanner, metadata, SQLite index, responsive preview, and first
-AI-search implementation. The local `main` pointer is stale at `78cb453` and
-must not be used for review statistics.
+AI-search implementation.
 
-The current `feat/performance-cost-and-search-optimizations` branch now contains
-`origin/main`; it is 0 commits behind. The post-main history consists of the ten
+The `feat/performance-cost-and-search-optimizations` branch was 0 commits behind
+that baseline before integration. Its post-main history consists of the ten
 original performance/provider/UI commits, two focused finishing commits, the
 synchronization merge, documentation reconciliation, integration cleanup,
 published-state update, selected-folder/context-range work, speech/OAuth, and
-the saved-analysis inspector pass: 19 commits ahead in total at this snapshot.
+the saved-analysis inspector pass: 19 commits in total. Merge commit `8bdcc78`
+now integrates that history into local `main` without rewriting it.
 
 The review delta is approximately 5.2k insertions and 1.4k deletions across 29
 tracked files. The largest areas are the TypeScript desktop interface, its
@@ -42,8 +42,7 @@ installer produced by `tauri build`.
 
 ## Integration risks
 
-- The local `main` pointer is far behind. Review and PR operations must compare
-  with fetched `origin/main`.
+- Live issue and pull-request state still requires authenticated GitHub access.
 - The working directory still contains untracked local Impeccable tooling. Do
   not sweep it into a product commit with `git add .`.
 - AI model IDs, prices, and authentication rules are provider-controlled and
@@ -55,16 +54,14 @@ installer produced by `tauri build`.
 
 ## Recommended GitHub workflow
 
-1. Fetch `origin/main` once more immediately before publication and merge only
-   genuinely new remote commits.
-2. After GitHub authentication, audit open/closed issues and PRs. Do not guess
+1. Push the tested local `main` integration and verify the remote branch points
+   at the resulting documentation commit.
+2. After GitHub CLI authentication, audit open/closed issues and PRs. Do not guess
    their state from local refs.
-3. The branch is already published as
-   `origin/feat/performance-cost-and-search-optimizations`; open one follow-up PR
-   named **Improve MediaIndex performance, providers, and desktop library UX**.
-4. Link the still-relevant issues and state that the foundation stack is already
-   merged through PR #39.
-5. Review the PR by subsystem and attach the packaged-app verification evidence.
+3. Keep `origin/feat/performance-cost-and-search-optimizations` as the reviewable
+   source history for this owner-requested merge.
+4. Link or close still-relevant issues only after their live state is verified.
+5. Attach packaged-app verification evidence to the next tagged release.
 
 The local GitHub CLI and available browser session are not authenticated for
 this private repository (`gh` returns HTTP 401 and the logged-out page returns

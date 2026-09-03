@@ -11,12 +11,12 @@ without presenting MediaIndex as a browser-hosted product.
 ## Repository state
 
 - Workspace: `C:\Users\grego\Documents\Playground\MediaIndex`
-- Active branch: `feat/performance-cost-and-search-optimizations`
+- Active branch: `main`
 - Published branch: `origin/feat/performance-cost-and-search-optimizations`
-- Integration target: fetched `origin/main` at `79e2626`
-- Local `main` is stale at `78cb453`. Merge commit `6ef9655` synchronized the
-  feature branch with `origin/main`; the branch is 19 commits ahead and 0 behind
-  at this snapshot. Read
+- Integration baseline: fetched `origin/main` at `79e2626`
+- Merge commit `8bdcc78` integrated the 19-commit feature history into local
+  `main` after a final fetch confirmed the feature branch was 0 commits behind.
+  Read
   [main-integration-review.md](main-integration-review.md) before changing Git
   history.
 - Preserve user-owned `.idea/` files and unrelated working-tree changes.
@@ -71,10 +71,9 @@ without presenting MediaIndex as a browser-hosted product.
    `rg -n "visual-fixture|Autumn Campaign|fixture-a" desktop/src/main.ts`.
 3. Authenticate `gh` for `Lanque/MediaIndex`, then audit live issues and pull
    requests before changing their state.
-4. Fetch `origin/main` again immediately before publishing and merge any new
-   commits without rewriting the existing issue-linked history.
-5. Compare the final branch against `origin/main` by subsystem and update
-   `docs/engineering-status.md` from live GitHub evidence.
+4. Confirm local and remote `main` point at the completed integration history.
+5. Update `docs/engineering-status.md` from live GitHub issue/PR evidence when
+   CLI authentication is restored.
 
 ## Automated verification
 
@@ -129,10 +128,9 @@ Use the executable or NSIS-installed app, not the Vite browser preview.
 
 ## GitHub reconciliation
 
-When authenticated, list all open and closed issues/PRs and map the 19
-post-`origin/main` commits to them. The foundation stack is already merged
-through PR #39, so use one focused follow-up PR rather than recreating that
-stack. The follow-up PR should include:
+When authenticated, list all open and closed issues/PRs and map the 19 integrated
+feature commits to them. The foundation stack is already merged through PR #39,
+so do not recreate that stack. Future release notes should include:
 
 - linked issues and preserved commit traceability;
 - a subsystem-oriented summary;
@@ -145,7 +143,6 @@ stack. The follow-up PR should include:
 
 ## Exit criteria
 
-The task is complete when the packaged Windows app passes the manual matrix,
-CI is green, documentation matches behavior, the GitHub issue/PR state is
-reconciled from authenticated evidence, and the owner can merge through the
-repository's normal review path.
+The release is ready to publish when the packaged Windows app passes the manual
+matrix, CI is green, documentation matches behavior, and the GitHub issue/PR
+state is reconciled from authenticated evidence.
