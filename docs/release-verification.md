@@ -9,12 +9,12 @@ Verification snapshot: 2026-09-03, branch
 | --- | --- |
 | `python -m unittest discover -s tests -p "test_*.py"` | passed: 33 tests; infrastructure and migration checks passed |
 | `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --check` | passed |
-| `cargo test --manifest-path desktop/src-tauri/Cargo.toml` | passed: 44 tests; 1 opt-in FFmpeg/provider-pipeline smoke test ignored in the default run |
+| `cargo test --manifest-path desktop/src-tauri/Cargo.toml` | passed: 52 tests; 1 opt-in FFmpeg/provider-pipeline smoke test ignored in the default run |
 | OpenAI/Gemini connection contracts | passed: Bearer auth, `x-goog-api-key`, model checks, Embedding 2 payload, and no API key in Gemini URLs |
 | opt-in real-video pipeline smoke test | passed with a generated MP4, real FFmpeg extraction, local OpenAI HTTP stub, embeddings, SQLite persistence, and search; no provider credits used |
 | `npm.cmd run build` | passed: TypeScript and Vite production bundle |
 | `npm.cmd run tauri build` | passed: Windows executable and NSIS installer |
-| packaged executable startup | passed: process stayed alive, Windows title was `MediaIndex`, and the process reported responsive |
+| packaged executable startup | passed: the final release process stayed alive and reported responsive before clean shutdown |
 | `git diff --check` | passed; Git emitted line-ending notices only |
 | production provenance check | passed: design seed `538ed156` is present in `desktop/dist/index.html` |
 
@@ -26,8 +26,8 @@ not canonicalize `C:\Users\grego`. Neither warning failed a check.
 
 | Artifact | Size | SHA-256 |
 | --- | ---: | --- |
-| `desktop/src-tauri/target/release/mediaindex.exe` | 15,184,896 bytes | `9EF336C14947487EB0B3A8AAE2449CB004A3542B1BCEA5FC9D5046EBA2DC53A6` |
-| `desktop/src-tauri/target/release/bundle/nsis/MediaIndex_0.1.0_x64-setup.exe` | 3,925,774 bytes | `33F04F84E7DA5AD8EC759714B7EDE31663411B0FB9B82027EBEC010D50708FD0` |
+| `desktop/src-tauri/target/release/mediaindex.exe` | 15,260,160 bytes | `60988FC17540200B3CAE895AB4D1E25CAD205255B4BC4C0832A2E850B39BFE6E` |
+| `desktop/src-tauri/target/release/bundle/nsis/MediaIndex_0.1.0_x64-setup.exe` | 3,937,846 bytes | `B36479841F9D11C40FEFFC3FDA1776147F8198FC801273480380E907CB25A0AB` |
 
 These local artifacts are unsigned unless a release signing certificate is
 configured. The installer is suitable for local testing; a public release

@@ -13,8 +13,8 @@ pull request.
 | Tauri shell and CI foundation | #2, #7 / #16–#18 | present on integration branch |
 | Discovery and change detection | #3 / #20 | implemented and covered by Rust tests |
 | FFprobe metadata | #4 / #21 | implemented with cached metadata and errors |
-| SQLite local index | #5 / #22 | implemented with restart restoration |
-| Offline search, grouping, preview, and opening | #6 / #23 | implemented in the Tauri desktop app |
+| SQLite local index | #5 / #22 | implemented with per-root reconciliation and saved cross-folder AI data |
+| Offline search, grouping, preview, and opening | #6 / #23 | implemented with separate current-folder and analyzed-archive views |
 | Cloud contracts and PostgreSQL model | #9 / #24 | scaffold and contract checks present |
 | Cursor/idempotent sync | #10 / #25 | implementation present |
 | Worker retries and dead letters | #11 / #26 | implementation present |
@@ -23,7 +23,7 @@ pull request.
 | Documentation maintenance | #14 | updated in the integration branch |
 | Selected-media preview job | #30 / #32 | implementation present |
 | FastAPI sync runtime | #31 | implementation and tests present |
-| Desktop AI visual index and search | #38 / #39 | implemented with provider compatibility fixes |
+| Desktop AI visual index and search | #38 / #39 | implemented with provider compatibility fixes, contextual time ranges, reanalysis confirmation, and measured ETA |
 
 ## Integration state
 
@@ -32,7 +32,7 @@ pull request.
   `78cb453`; use `origin/main` for comparisons.
 - `feat/performance-cost-and-search-optimizations` is the current desktop MVP
   follow-up branch. Commit `6ef9655` merged `origin/main`, so the branch now
-  contains the fetched baseline and is 16 commits ahead, 0 behind at this
+  contains the fetched baseline and is 17 commits ahead, 0 behind after this
   snapshot.
 - The merge strategy and live GitHub reconciliation are documented in
   [main-integration-review.md](main-integration-review.md).

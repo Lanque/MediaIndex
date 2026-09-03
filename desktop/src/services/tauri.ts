@@ -43,8 +43,9 @@ export async function searchAi(
   query: string,
   config: AiConfig,
   focus: AiSearchFocus,
+  root?: string,
 ): Promise<AiSearchResult[]> {
-  return invoke<AiSearchResult[]>("search_ai", { query, config, focus });
+  return invoke<AiSearchResult[]>("search_ai", { query, config, focus, root: root || null });
 }
 
 export async function getAiThumbnail(

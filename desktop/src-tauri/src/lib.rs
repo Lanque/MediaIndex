@@ -56,11 +56,15 @@ struct AiAnalysisRunGuard {
 
 #[derive(Debug, serde::Serialize)]
 struct AiAnalysisPlan {
+    total_file_count: u64,
     analyze_file_count: u64,
     skipped_file_count: u64,
+    already_analyzed_file_count: u64,
     max_frames_per_file: u64,
     max_sampled_frames: u64,
     max_vision_requests: u64,
+    estimated_sampled_frames: u64,
+    estimated_vision_requests: u64,
     model: String,
 }
 
@@ -147,7 +151,7 @@ fn index_media_folder_blocking(
     );
     scan.warnings.extend(metadata_warnings);
     index
-        .reconcile(&scan, &metadata_by_path)
+        .reconcile_under_root(&scan, &metadata_by_path, Path::new(&path))
         .map_err(|error| error.to_string())
 }
 
@@ -226,20 +230,45 @@ fn plan_ai_analysis(
         return Err("No indexed active clips were found in the selected folder".to_owned());
     }
     let model = settings.model_namespace();
+    let total_file_count = indexed_files.len() as u64;
+    let already_analyzed_file_count = count_already_analyzed(&index, &indexed_files, &model)?;
     let (files, skipped_file_count) =
         select_ai_files(&index, indexed_files, &model, force.unwrap_or(false))?;
     let analyze_file_count = files.len() as u64;
     let max_frames_per_file = settings.max_frames_per_file() as u64;
-    let requests_per_file = settings
-        .max_frames_per_file()
-        .div_ceil(settings.vision_batch_size()) as u64;
+    let vision_batch_size = settings.vision_batch_size() as u64;
+    let requests_per_file = max_frames_per_file.div_ceil(vision_batch_size);
+    let mut estimated_sampled_frames = 0u64;
+    let mut estimated_vision_requests = 0u64;
+    for file in &files {
+        let duration_ms = index
+            .get_asset_metadata(&file.content_hash)
+            .map_err(|error| error.to_string())?
+            .and_then(|metadata| metadata.duration_ms);
+        let sampled_frames = duration_ms
+            .map(|duration| {
+                duration
+                    .max(1)
+                    .div_ceil(settings.sample_interval_ms().max(1))
+                    .max(1)
+                    .min(max_frames_per_file)
+            })
+            .unwrap_or(max_frames_per_file);
+        estimated_sampled_frames = estimated_sampled_frames.saturating_add(sampled_frames);
+        estimated_vision_requests =
+            estimated_vision_requests.saturating_add(sampled_frames.div_ceil(vision_batch_size));
+    }
 
     Ok(AiAnalysisPlan {
+        total_file_count,
         analyze_file_count,
         skipped_file_count,
+        already_analyzed_file_count,
         max_frames_per_file,
         max_sampled_frames: analyze_file_count.saturating_mul(max_frames_per_file),
         max_vision_requests: analyze_file_count.saturating_mul(requests_per_file),
+        estimated_sampled_frames,
+        estimated_vision_requests,
         model,
     })
 }
@@ -441,6 +470,23 @@ fn select_ai_files(
     Ok((files, skipped_file_count))
 }
 
+fn count_already_analyzed(
+    index: &local_index::SqliteIndex,
+    indexed_files: &[local_index::IndexedFile],
+    model: &str,
+) -> Result<u64, String> {
+    let mut count = 0u64;
+    for file in indexed_files {
+        if index
+            .has_ai_annotations_for_content_model(&file.content_hash, model)
+            .map_err(|error| error.to_string())?
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -485,10 +531,13 @@ async fn search_ai(
     query: String,
     config: Option<ai::AiRequestConfig>,
     focus: Option<local_index::AiSearchFocus>,
+    root: Option<String>,
 ) -> Result<Vec<local_index::AiSearchResult>, String> {
-    tauri::async_runtime::spawn_blocking(move || search_ai_blocking(app, query, config, focus))
-        .await
-        .map_err(|error| format!("AI search worker failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        search_ai_blocking(app, query, config, focus, root)
+    })
+    .await
+    .map_err(|error| format!("AI search worker failed: {error}"))?
 }
 
 fn search_ai_blocking(
@@ -496,12 +545,17 @@ fn search_ai_blocking(
     query: String,
     config: Option<ai::AiRequestConfig>,
     focus: Option<local_index::AiSearchFocus>,
+    root: Option<String>,
 ) -> Result<Vec<local_index::AiSearchResult>, String> {
     let settings = ai::AiSettings::from_request(config)?;
     let model_namespace = settings.model_namespace();
     let index = open_local_index(&app)?;
+    let root_path = root
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(Path::new);
     if index
-        .ai_annotation_count_for_model(&model_namespace)
+        .ai_annotation_count_for_model_under_root(&model_namespace, root_path)
         .map_err(|error| error.to_string())?
         == 0
     {
@@ -511,12 +565,13 @@ fn search_ai_blocking(
     }
     let embedding = ai::embed_query(&query, &settings)?;
     index
-        .search_ai_with_focus(
+        .search_ai_with_focus_under_root(
             &query,
             &embedding,
             100,
             Some(&model_namespace),
             focus.unwrap_or_default(),
+            root_path,
         )
         .map_err(|error| error.to_string())
 }

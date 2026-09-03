@@ -50,11 +50,17 @@ and AI connection tests run on background workers rather than the Tauri UI
 thread. Selecting a new folder keeps **Analyze with AI** disabled until that
 folder has been indexed successfully.
 
+**Current folder** is always scoped to the folder most recently chosen with
+**Select Footage Folder**. Selecting another folder does not mix earlier clips
+into this view and does not mark clips from other indexed roots as missing.
+**Analyzed archive** is the explicit cross-folder view: it lists only clips with
+saved AI annotations and preserves their real source-folder grouping.
+
 ## AI search
 
 AI search is a separate, explicit workflow:
 
-1. Open **AI connection** and choose **Local (Ollama)**, **OpenAI (ChatGPT API)**,
+1. Open **AI connection** and choose **Local (Ollama)**, **OpenAI API**,
    or **Google Gemini API**. Add the cloud API key when needed, verify the
    models/base URL, press **Test connection**, and save the settings. For
    OpenAI, choose GPT-5.6 Luna as the budget default or GPT-5.6 Terra only when
@@ -64,18 +70,24 @@ AI search is a separate, explicit workflow:
    **Library context** is optional: use it to list a project/franchise, setting,
    or possible fictional characters for an unfamiliar collection. The model is
    instructed to use this only when it agrees with the visible evidence.
+   The catalog also includes `gpt-4o-mini` and legacy `o4-mini`. A saved
+   `04-mini` typo is normalized to the real `o4-mini` model ID.
 2. Select a footage folder and wait for deterministic indexing to finish.
 3. Press **Analyze with AI**. MediaIndex samples frames, stores descriptions
    and embeddings locally, and reports any per-file failures. Clips already
    analyzed with the selected provider/models are skipped by default so repeat
-   clicks do not spend credits again. **Reanalyze existing clips** is an
-   explicit one-run override.
+   clicks do not spend credits again. If every clip is already analyzed, the
+   app asks before replacing anything. **Reanalyze existing clips** is an
+   explicit one-run override and always warns that same-model annotations will
+   be replaced and cloud requests may incur new cost.
 4. Enter a natural-language query in the **AI Search** field, for example
    `Fortnite kill`, `enemy elimination`, or `player victory`.
 
 AI results are ranked by embedding similarity and include the matching clip
-timestamp. Adjacent annotations from the same video within three seconds are
-coalesced after ranking, retaining the best-scoring timestamp for that event.
+time range. The index derives an adaptive merge window from that video's frame
+sampling cadence. Semantically similar adjacent frames become one range, while
+changes in action, setting, situation, visible dialogue, or other on-screen text
+start a new moment.
 Results are displayed as visual cards ordered by the best match for each video.
 FFmpeg generates and caches a local thumbnail for the best matching timestamp;
 clicking it opens Preview at that moment. Other moments are kept in a compact
@@ -97,14 +109,21 @@ Ollama analysis remains sequential. The provider and model name are stored with
 each annotation, so embeddings from incompatible models are not mixed in one
 search.
 
-Before a cloud analysis, MediaIndex performs a local preflight and asks for
-confirmation with the unique-video count, maximum sampled-frame count, and
-maximum vision-batch count. Identical content found at multiple paths is counted
-and analyzed once. Cancelling this confirmation sends no API request.
+Before any analysis, MediaIndex performs a local preflight and asks for
+confirmation with the unique-video count, duration-based estimated sampled
+frames/vision requests, and configured upper bounds. Identical content found at
+multiple paths is counted and analyzed once. Cloud preflights also show the
+upload/request bounds. The first completed run calibrates
+a machine-local per-model timing estimate; later preflights show that estimate,
+and an in-progress run shows a live ETA. Cancelling confirmation sends no API
+request.
 
 The vision prompt requests recognizable fictional characters and franchises,
 other visible entities, actions and interactions, the setting, the broader
-situation, and readable text from HUDs, subtitles, signs, and overlays. It does
+situation, and readable text from HUDs, subtitles, signs, and overlays. Visible
+subtitle/caption dialogue is indexed separately. Frame-only analysis cannot
+hear speech that is absent from the image; audio transcription is a separate
+future pipeline. It does
 not identify a real person from their face alone. Search ranking combines
 semantic similarity with keyword matching and light inflection handling
 (`kill`/`killed`, `elimination`/`eliminated`). For short-lived events, set

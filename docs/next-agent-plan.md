@@ -44,6 +44,14 @@ without presenting MediaIndex as a browser-hosted product.
     review documentation.
 11. Clarified that localhost/Vite is development infrastructure only; the
     product is the packaged Tauri app.
+12. Scoped the main library and AI search to the explicitly selected root while
+    keeping a separate cross-folder **Analyzed archive**.
+13. Made per-root reconciliation preserve other folders and retained missing
+    clips as discoverable saved AI results.
+14. Replaced fixed timestamp suppression with context-aware time ranges and
+    action/setting/situation/dialogue boundaries.
+15. Added reanalysis replacement warnings, duration-based request estimates,
+    measured per-model timing, live ETA, `gpt-4o-mini`, and legacy `o4-mini`.
 
 ## First actions in the next session
 
@@ -86,6 +94,8 @@ Use the executable or NSIS-installed app, not the Vite browser preview.
 
 - select a small folder and a large nested footage folder;
 - confirm the window remains responsive and folder groups populate;
+- select a second folder and confirm **Current folder** contains no clips from
+  the first while **Analyzed archive** retains earlier analyzed clips;
 - repeat the scan and confirm unchanged metadata/hashes are reused;
 - search by filename and filters, then clear and repeat;
 - preview clips with spaces and non-ASCII characters in their paths;
@@ -94,13 +104,16 @@ Use the executable or NSIS-installed app, not the Vite browser preview.
 - test connection for the selected provider/model pair;
 - run bounded AI analysis, watch progress, cancel midway, and resume;
 - search visible text, an action, an entity, and a general situation;
-- confirm adjacent seconds from one event appear as one featured moment;
+- confirm adjacent seconds from one event appear as one time range and a real
+  action/setting/dialogue change starts a new range;
+- confirm repeated analysis warns before replacing same-model moments and the
+  preflight/live progress show an honest calibrated estimate;
 - change embedding model and confirm the UI requires reanalysis;
 - verify no command-prompt window appears during FFmpeg/FFprobe work.
 
 ## GitHub reconciliation
 
-When authenticated, list all open and closed issues/PRs and map the 16
+When authenticated, list all open and closed issues/PRs and map the 17
 post-`origin/main` commits to them. The foundation stack is already merged
 through PR #39, so use one focused follow-up PR rather than recreating that
 stack. The follow-up PR should include:

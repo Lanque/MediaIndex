@@ -203,9 +203,12 @@ impl AiSettings {
             ),
         };
 
-        let vision_model = non_empty(request.vision_model)
+        let mut vision_model = non_empty(request.vision_model)
             .or_else(|| env_non_empty("MEDIAINDEX_AI_MODEL"))
             .unwrap_or_else(|| default_vision_model.to_owned());
+        if provider == AiProvider::OpenAI && vision_model.eq_ignore_ascii_case("04-mini") {
+            vision_model = "o4-mini".to_owned();
+        }
         let embedding_model = non_empty(request.embedding_model)
             .or_else(|| env_non_empty("MEDIAINDEX_AI_EMBEDDING_MODEL"))
             .unwrap_or_else(|| default_embedding_model.to_owned());
@@ -292,6 +295,10 @@ impl AiSettings {
 
     pub(crate) fn max_frames_per_file(&self) -> usize {
         self.max_frames_per_file
+    }
+
+    pub(crate) fn sample_interval_ms(&self) -> u64 {
+        self.sample_interval_ms
     }
 }
 
@@ -394,12 +401,13 @@ where
         .iter()
         .map(|(_, analysis)| {
             format!(
-                "{}\nEntities: {}\nActions: {}\nSetting: {}\nSituation: {}\nLabels: {}\nOn-screen text: {}",
+                "{}\nEntities: {}\nActions: {}\nSetting: {}\nSituation: {}\nDialogue: {}\nLabels: {}\nOn-screen text: {}",
                 analysis.description,
                 analysis.entities.join(", "),
                 analysis.actions.join(", "),
                 analysis.setting.as_deref().unwrap_or_default(),
                 analysis.situation.as_deref().unwrap_or_default(),
+                analysis.dialogue.join(" | "),
                 analysis.labels.join(", "),
                 analysis.visible_text.join(" | ")
             )
@@ -426,11 +434,13 @@ where
         let visible_text = normalize_labels(analysis.visible_text);
         let entities = normalize_labels(analysis.entities);
         let actions = normalize_labels(analysis.actions);
+        let dialogue = normalize_labels(analysis.dialogue);
         let setting = normalize_optional_text(analysis.setting);
         let situation = normalize_optional_text(analysis.situation);
         let mut labels = normalize_labels(analysis.labels);
         labels.extend(entities.iter().map(|entity| format!("entity: {entity}")));
         labels.extend(actions.iter().map(|action| format!("action: {action}")));
+        labels.extend(dialogue.iter().map(|line| format!("dialogue: {line}")));
         if let Some(setting) = &setting {
             labels.push(format!("setting: {setting}"));
         }
@@ -450,6 +460,9 @@ where
         }
         if !actions.is_empty() {
             details.push(format!("Actions: {}", actions.join(", ")));
+        }
+        if !dialogue.is_empty() {
+            details.push(format!("Dialogue: {}", dialogue.join(" | ")));
         }
         if let Some(setting) = setting {
             details.push(format!("Setting: {setting}"));
@@ -677,8 +690,9 @@ fn extract_frames(path: &Path, settings: &AiSettings) -> Result<Vec<(u64, Vec<u8
         .map_err(|error| format!("cannot create temporary AI frame directory: {error}"))?;
     let output_pattern = output_directory.join("frame-%06d.jpg");
     let sample_seconds = (settings.sample_interval_ms / 1_000).max(1);
-    let filter =
-        format!("fps=1/{sample_seconds},scale=w='min({MAX_EXTRACTED_FRAME_WIDTH},iw)':h=-2");
+    let filter = format!(
+        "fps=1/{sample_seconds},scale=w='min({MAX_EXTRACTED_FRAME_WIDTH},iw)':h=-2,format=yuvj420p"
+    );
     let mut command = Command::new(&settings.ffmpeg_executable);
     configure_hidden_process(&mut command);
     let output = command
@@ -737,7 +751,7 @@ pub fn extract_thumbnail(
     timestamp_ms: u64,
     ffmpeg_executable: &Path,
 ) -> Result<Vec<u8>, String> {
-    let filter = format!("scale=w='min({MAX_THUMBNAIL_WIDTH},iw)':h=-2");
+    let filter = format!("scale=w='min({MAX_THUMBNAIL_WIDTH},iw)':h=-2,format=yuvj420p");
     let mut command = Command::new(ffmpeg_executable);
     configure_hidden_process(&mut command);
     let output = command
@@ -813,6 +827,8 @@ struct FrameAnalysis {
     #[serde(default)]
     actions: Vec<String>,
     #[serde(default)]
+    dialogue: Vec<String>,
+    #[serde(default)]
     setting: Option<String>,
     #[serde(default)]
     situation: Option<String>,
@@ -853,7 +869,7 @@ fn describe_frames(
         },
     );
     let prompt = format!(
-        "Analyze these ordered video frames for a general-purpose searchable media library. The frame timestamps, in order, are: {timestamps}. {library_context} Use adjacent frames as temporal context so recurring subjects stay consistent and an ongoing action or situation is understood as a sequence. Return only a JSON object with a frames array containing exactly one object per input frame, in the same order. Each frame object must contain: description (one concise factual sentence covering who or what is visible, what is happening, and the important context); entities (lowercase array of confidently recognizable fictional characters, game characters, creatures, teams, franchises, products, vehicles, landmarks, or named objects); actions (lowercase array of concrete actions and interactions); setting (short lowercase location or environment, or an empty string); situation (short lowercase event or circumstance such as conversation, ceremony, chase, battle, tutorial, performance, sports play, accident, travel, gameplay event, or an empty string); labels (lowercase array covering useful subjects, objects, genre, visual style, mood, shot type, and concepts); visible_text (array of exact readable words or short phrases from subtitles, signs, titles, HUD, menus, score overlays, or logos); and confidence (number from 0 to 1). Name a well-known fictional character or franchise only when distinctive visual evidence supports it; otherwise describe appearance and role precisely. Never identify a real person from their face alone—use a real person's name only when readable on-screen text establishes it. Inspect the full frame, including background details and small UI text. Add useful search synonyms only when supported by the image. Do not invent identities, actions, relationships, locations, events, or text. Use empty arrays or strings when evidence is insufficient."
+        "Analyze these ordered video frames for a general-purpose searchable media library. The frame timestamps, in order, are: {timestamps}. {library_context} Use adjacent frames as temporal context so recurring subjects stay consistent and an ongoing action or situation is understood as a sequence. Return only a JSON object with a frames array containing exactly one object per input frame, in the same order. Each frame object must contain: description (one concise factual sentence covering who or what is visible, what is happening, and the important context); entities (lowercase array of confidently recognizable fictional characters, game characters, creatures, teams, franchises, products, vehicles, landmarks, or named objects); actions (lowercase array of concrete actions and interactions); setting (short lowercase location or environment, or an empty string); situation (short lowercase event or circumstance such as conversation, ceremony, chase, battle, tutorial, performance, sports play, accident, travel, gameplay event, or an empty string); dialogue (array of exact dialogue that is visibly shown in subtitles, captions, or speech bubbles; never infer unheard audio); labels (lowercase array covering useful subjects, objects, genre, visual style, mood, shot type, and concepts); visible_text (array of exact readable words or short phrases from subtitles, signs, titles, HUD, menus, score overlays, or logos); and confidence (number from 0 to 1). Name a well-known fictional character or franchise only when distinctive visual evidence supports it; otherwise describe appearance and role precisely. Never identify a real person from their face alone—use a real person's name only when readable on-screen text establishes it. Inspect the full frame, including background details and small UI text. Add useful search synonyms only when supported by the image. Do not invent identities, actions, relationships, locations, events, audio, or text. Use empty arrays or strings when evidence is insufficient."
     );
     let text = match settings.provider {
         AiProvider::OpenAI => describe_openai(client, &encoded_frames, &prompt, settings)?,
@@ -915,6 +931,10 @@ fn describe_openai(
                                         "type": "array",
                                         "items": {"type": "string"}
                                     },
+                                    "dialogue": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    },
                                     "setting": {"type": "string"},
                                     "situation": {"type": "string"},
                                     "confidence": {
@@ -929,6 +949,7 @@ fn describe_openai(
                                     "visible_text",
                                     "entities",
                                     "actions",
+                                    "dialogue",
                                     "setting",
                                     "situation",
                                     "confidence"
@@ -1063,6 +1084,7 @@ fn normalize_frame_analysis(parsed: FrameAnalysis) -> Result<FrameAnalysis, Stri
         visible_text: normalize_labels(parsed.visible_text),
         entities: normalize_labels(parsed.entities),
         actions: normalize_labels(parsed.actions),
+        dialogue: normalize_labels(parsed.dialogue),
         setting: normalize_optional_text(parsed.setting),
         situation: normalize_optional_text(parsed.situation),
         confidence: parsed.confidence.map(|value| value.clamp(0.0, 1.0)),
@@ -1875,6 +1897,19 @@ mod tests {
         );
         assert_eq!(openai_reasoning_effort("gpt-5.6-terra"), Some("low"));
         assert_eq!(openai_reasoning_effort("gpt-4.1-mini"), None);
+    }
+
+    #[test]
+    fn corrects_the_common_zero_four_mini_model_typo() {
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::OpenAI),
+            api_key: Some("test-key".to_owned()),
+            vision_model: Some("04-mini".to_owned()),
+            ..Default::default()
+        }))
+        .expect("OpenAI settings should be valid");
+
+        assert_eq!(settings.vision_model, "o4-mini");
     }
 
     #[test]

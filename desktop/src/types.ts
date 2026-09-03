@@ -7,6 +7,8 @@ export type IndexReport = {
 export type SearchFilters = {
   keyword?: string;
   folder?: string;
+  root?: string;
+  ai_only?: boolean;
   date_from_unix_ms?: number;
   date_to_unix_ms?: number;
   resolution?: string;
@@ -26,6 +28,7 @@ export type SearchResult = {
   status: "ACTIVE" | "MISSING";
   available: boolean;
   timestamp_ms?: number;
+  end_timestamp_ms?: number;
   ai_description?: string;
   match_score?: number;
   ai_annotation_count?: number;
@@ -49,11 +52,15 @@ export type AiIndexReport = {
 };
 
 export type AiAnalysisPlan = {
+  total_file_count: number;
   analyze_file_count: number;
   skipped_file_count: number;
+  already_analyzed_file_count: number;
   max_frames_per_file: number;
   max_sampled_frames: number;
   max_vision_requests: number;
+  estimated_sampled_frames: number;
+  estimated_vision_requests: number;
   model: string;
 };
 
@@ -93,6 +100,7 @@ export type AiSearchResult = {
   path: string;
   content_hash: string;
   timestamp_ms: number;
+  end_timestamp_ms: number;
   score: number;
   description: string;
   labels: string[];
@@ -211,6 +219,34 @@ export const ALL_MODEL_PRESETS: ModelPreset[] = [
     speed: "Slower",
     accuracy: "Maximum",
     summary: "Highest-quality OpenAI option in the catalog for difficult footage where recognition quality matters most.",
+    requirements: "OpenAI API key",
+  },
+  {
+    id: "gpt-4o-mini",
+    name: "GPT-4o Mini",
+    provider: "openai",
+    visionModel: "gpt-4o-mini",
+    embeddingModel: "text-embedding-3-small",
+    badge: "Low Cost",
+    badgeType: "default",
+    pricing: "Input $0.15 · output $0.60 / 1M tokens",
+    speed: "Fast",
+    accuracy: "Standard",
+    summary: "Low-cost established OpenAI model with image input for broad visual indexing.",
+    requirements: "OpenAI API key",
+  },
+  {
+    id: "o4-mini",
+    name: "o4-mini",
+    provider: "openai",
+    visionModel: "o4-mini",
+    embeddingModel: "text-embedding-3-small",
+    badge: "Legacy",
+    badgeType: "default",
+    pricing: "Input $1.10 · output $4.40 / 1M tokens",
+    speed: "Moderate",
+    accuracy: "High reasoning",
+    summary: "Older reasoning model with image input. Kept for existing indexes; OpenAI recommends newer successors for new work.",
     requirements: "OpenAI API key",
   },
   {

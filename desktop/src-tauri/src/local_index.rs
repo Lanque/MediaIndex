@@ -8,7 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
-const AI_RESULT_MERGE_WINDOW_MS: u64 = 3_000;
+const AI_MIN_CONTEXT_MERGE_GAP_MS: u64 = 3_000;
+const AI_MAX_CONTEXT_MERGE_GAP_MS: u64 = 60_000;
+const AI_CONTEXT_SEMANTIC_SIMILARITY: f32 = 0.90;
+const AI_CONTEXT_LABEL_SIMILARITY: f32 = 0.50;
 const AI_FOCUSED_SCORE_WINDOW: f32 = 0.08;
 const AI_BALANCED_SCORE_WINDOW: f32 = 0.14;
 const AI_FOCUSED_SCORE_FLOOR: f32 = 0.46;
@@ -143,6 +146,8 @@ pub struct IndexedFile {
 pub struct SearchQuery {
     pub keyword: Option<String>,
     pub folder: Option<String>,
+    pub root: Option<String>,
+    pub ai_only: Option<bool>,
     pub date_from_unix_ms: Option<u64>,
     pub date_to_unix_ms: Option<u64>,
     pub resolution: Option<String>,
@@ -192,6 +197,7 @@ pub struct AiSearchResult {
     pub path: String,
     pub content_hash: String,
     pub timestamp_ms: u64,
+    pub end_timestamp_ms: u64,
     pub score: f32,
     pub description: String,
     pub labels: Vec<String>,
@@ -211,6 +217,12 @@ pub enum AiSearchFocus {
 struct ExistingFile {
     path: String,
     content_hash: String,
+}
+
+#[derive(Clone, Debug)]
+struct RankedAiAnnotation {
+    result: AiSearchResult,
+    embedding: Vec<f32>,
 }
 
 pub struct SqliteIndex {
@@ -241,7 +253,29 @@ impl SqliteIndex {
         report: &ScanReport,
         metadata_by_path: &HashMap<String, MediaMetadata>,
     ) -> Result<IndexReport, IndexError> {
-        let existing = self.active_files()?;
+        self.reconcile_with_root(report, metadata_by_path, None)
+    }
+
+    pub fn reconcile_under_root(
+        &mut self,
+        report: &ScanReport,
+        metadata_by_path: &HashMap<String, MediaMetadata>,
+        root: &Path,
+    ) -> Result<IndexReport, IndexError> {
+        self.reconcile_with_root(report, metadata_by_path, Some(root))
+    }
+
+    fn reconcile_with_root(
+        &mut self,
+        report: &ScanReport,
+        metadata_by_path: &HashMap<String, MediaMetadata>,
+        root: Option<&Path>,
+    ) -> Result<IndexReport, IndexError> {
+        let existing = self
+            .active_files()?
+            .into_iter()
+            .filter(|file| root.map_or(true, |root| Path::new(&file.path).starts_with(root)))
+            .collect::<Vec<_>>();
         let mut previous_by_path: HashMap<String, ExistingFile> = existing
             .iter()
             .map(|file| (file.path.clone(), file.clone()))
@@ -315,10 +349,18 @@ impl SqliteIndex {
         }
 
         transaction.commit()?;
+        let active_file_count = match root {
+            Some(root) => self
+                .active_files()?
+                .into_iter()
+                .filter(|file| Path::new(&file.path).starts_with(root))
+                .count() as u64,
+            None => self.active_file_count()?,
+        };
         Ok(IndexReport {
             changes,
             warnings: report.warnings.clone(),
-            active_file_count: self.active_file_count()?,
+            active_file_count,
         })
     }
 
@@ -444,6 +486,38 @@ impl SqliteIndex {
         )?)
     }
 
+    pub fn ai_annotation_count_for_model_under_root(
+        &self,
+        model_namespace: &str,
+        root: Option<&Path>,
+    ) -> Result<u64, IndexError> {
+        if root.is_none() {
+            return self.ai_annotation_count_for_model(model_namespace);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT local_files.path, local_files.content_hash, ai_annotations.timestamp_ms
+             FROM ai_annotations
+             JOIN local_files ON local_files.content_hash = ai_annotations.content_hash
+             WHERE ai_annotations.model = ?1",
+        )?;
+        let rows = statement.query_map(params![model_namespace], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        })?;
+        let root = root.expect("root was checked above");
+        let mut unique_annotations = HashSet::new();
+        for row in rows {
+            let (path, content_hash, timestamp_ms) = row?;
+            if Path::new(&path).starts_with(root) {
+                unique_annotations.insert((content_hash, timestamp_ms));
+            }
+        }
+        Ok(unique_annotations.len() as u64)
+    }
+
     pub fn has_ai_annotations_for_content_model(
         &self,
         content_hash: &str,
@@ -483,14 +557,32 @@ impl SqliteIndex {
         model_namespace: Option<&str>,
         focus: AiSearchFocus,
     ) -> Result<Vec<AiSearchResult>, IndexError> {
+        self.search_ai_with_focus_under_root(
+            query_text,
+            query_embedding,
+            limit,
+            model_namespace,
+            focus,
+            None,
+        )
+    }
+
+    pub fn search_ai_with_focus_under_root(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        limit: usize,
+        model_namespace: Option<&str>,
+        focus: AiSearchFocus,
+        root: Option<&Path>,
+    ) -> Result<Vec<AiSearchResult>, IndexError> {
         let mut statement = self.connection.prepare(
             "SELECT ai_annotations.timestamp_ms, ai_annotations.description,
                     ai_annotations.labels_json, ai_annotations.embedding_json,
                     local_files.path, local_files.content_hash, local_files.status
              FROM ai_annotations
              JOIN local_files ON local_files.content_hash = ai_annotations.content_hash
-             WHERE local_files.status = 'ACTIVE'
-               AND (?1 IS NULL OR ai_annotations.model = ?1)",
+             WHERE (?1 IS NULL OR ai_annotations.model = ?1)",
         )?;
         let rows = statement.query_map(params![model_namespace], |row| {
             let timestamp_ms: u64 = row.get(0)?;
@@ -528,32 +620,59 @@ impl SqliteIndex {
         let query_norm_sq: f32 = query_embedding.iter().map(|v| v * v).sum();
         let query_norm = query_norm_sq.sqrt();
 
-        let mut ranked = rows
-            .filter_map(Result::ok)
-            .filter_map(
-                |(
+        let mut unique_annotations = HashMap::<(String, u64), RankedAiAnnotation>::new();
+        for row in rows.filter_map(Result::ok) {
+            let (timestamp_ms, description, labels, stored_embedding, path, content_hash, status) =
+                row;
+            if root.is_some_and(|root| !Path::new(&path).starts_with(root)) {
+                continue;
+            }
+            let Some(semantic_score) =
+                cosine_similarity_fast(query_embedding, query_norm, &stored_embedding)
+            else {
+                continue;
+            };
+            let keyword_score = lexical_relevance(query_text, &description, &labels);
+            let candidate = RankedAiAnnotation {
+                result: AiSearchResult {
                     timestamp_ms,
+                    end_timestamp_ms: timestamp_ms,
+                    score: (semantic_score * 0.70 + keyword_score * 0.30).max(0.0),
                     description,
                     labels,
-                    stored_embedding,
+                    available: status == "ACTIVE" && Path::new(&path).is_file(),
                     path,
-                    content_hash,
-                    status,
-                )| {
-                    let semantic_score =
-                        cosine_similarity_fast(query_embedding, query_norm, &stored_embedding)?;
-                    let keyword_score = lexical_relevance(query_text, &description, &labels);
-                    Some(AiSearchResult {
-                        timestamp_ms,
-                        score: (semantic_score * 0.70 + keyword_score * 0.30).max(0.0),
-                        description,
-                        labels,
-                        available: status == "ACTIVE" && Path::new(&path).is_file(),
-                        path,
-                        content_hash,
-                    })
+                    content_hash: content_hash.clone(),
                 },
-            )
+                embedding: stored_embedding,
+            };
+            let key = (content_hash, timestamp_ms);
+            match unique_annotations.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(candidate);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let existing = entry.get();
+                    if (candidate.result.available && !existing.result.available)
+                        || (candidate.result.available == existing.result.available
+                            && path_key(&candidate.result.path) < path_key(&existing.result.path))
+                    {
+                        entry.insert(candidate);
+                    }
+                }
+            }
+        }
+
+        let mut annotations_by_video = HashMap::<String, Vec<RankedAiAnnotation>>::new();
+        for annotation in unique_annotations.into_values() {
+            annotations_by_video
+                .entry(annotation.result.content_hash.clone())
+                .or_default()
+                .push(annotation);
+        }
+        let mut ranked = annotations_by_video
+            .into_values()
+            .flat_map(coalesce_contextual_ai_moments)
             .collect::<Vec<_>>();
         ranked.sort_by(|left, right| {
             right
@@ -586,14 +705,6 @@ impl SqliteIndex {
         let mut video_counts = HashMap::<String, usize>::new();
         for candidate in ranked {
             if candidate.score < score_floor {
-                continue;
-            }
-            let repeats_existing_moment = results.iter().any(|existing| {
-                existing.content_hash == candidate.content_hash
-                    && existing.timestamp_ms.abs_diff(candidate.timestamp_ms)
-                        <= AI_RESULT_MERGE_WINDOW_MS
-            });
-            if repeats_existing_moment {
                 continue;
             }
             let is_new_video = !video_counts.contains_key(&candidate.content_hash);
@@ -780,6 +891,112 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
     cosine_similarity_fast(left, left_norm, right)
 }
 
+fn coalesce_contextual_ai_moments(mut annotations: Vec<RankedAiAnnotation>) -> Vec<AiSearchResult> {
+    annotations.sort_by_key(|annotation| annotation.result.timestamp_ms);
+    let mut gaps = annotations
+        .windows(2)
+        .filter_map(|window| {
+            let gap = window[1]
+                .result
+                .timestamp_ms
+                .saturating_sub(window[0].result.timestamp_ms);
+            (gap > 0).then_some(gap)
+        })
+        .collect::<Vec<_>>();
+    gaps.sort_unstable();
+    let typical_gap = gaps.get(gaps.len() / 2).copied().unwrap_or(0);
+    let merge_gap = typical_gap
+        .saturating_mul(2)
+        .clamp(AI_MIN_CONTEXT_MERGE_GAP_MS, AI_MAX_CONTEXT_MERGE_GAP_MS);
+
+    let mut annotations = annotations.into_iter();
+    let Some(mut current) = annotations.next() else {
+        return Vec::new();
+    };
+    let mut previous_embedding = current.embedding.clone();
+    let mut previous_labels = current.result.labels.clone();
+    let mut moments = Vec::new();
+
+    for candidate in annotations {
+        let gap = candidate
+            .result
+            .timestamp_ms
+            .saturating_sub(current.result.end_timestamp_ms);
+        if gap <= merge_gap
+            && ai_context_is_similar(
+                &previous_embedding,
+                &candidate.embedding,
+                &previous_labels,
+                &candidate.result.labels,
+            )
+        {
+            current.result.end_timestamp_ms = candidate.result.timestamp_ms;
+            if candidate.result.score > current.result.score {
+                current.result.score = candidate.result.score;
+                current.result.description = candidate.result.description.clone();
+            }
+            for label in &candidate.result.labels {
+                if !current.result.labels.contains(label) {
+                    current.result.labels.push(label.clone());
+                }
+            }
+            current.result.labels.sort();
+            previous_embedding = candidate.embedding;
+            previous_labels = candidate.result.labels;
+        } else {
+            moments.push(current.result);
+            current = candidate;
+            previous_embedding = current.embedding.clone();
+            previous_labels = current.result.labels.clone();
+        }
+    }
+    moments.push(current.result);
+    moments
+}
+
+fn ai_context_is_similar(
+    left_embedding: &[f32],
+    right_embedding: &[f32],
+    left_labels: &[String],
+    right_labels: &[String],
+) -> bool {
+    for prefix in [
+        "action: ",
+        "setting: ",
+        "situation: ",
+        "dialogue: ",
+        "on-screen text: ",
+    ] {
+        let left = labels_with_prefix(left_labels, prefix);
+        let right = labels_with_prefix(right_labels, prefix);
+        if !left.is_empty() && !right.is_empty() && left.is_disjoint(&right) {
+            return false;
+        }
+    }
+
+    let semantic_similarity =
+        cosine_similarity(left_embedding, right_embedding).unwrap_or_default();
+    if semantic_similarity >= AI_CONTEXT_SEMANTIC_SIMILARITY {
+        return true;
+    }
+
+    let left = left_labels.iter().collect::<HashSet<_>>();
+    let right = right_labels.iter().collect::<HashSet<_>>();
+    let union = left.union(&right).count();
+    if union == 0 {
+        return false;
+    }
+    let similarity = left.intersection(&right).count() as f32 / union as f32;
+    similarity >= AI_CONTEXT_LABEL_SIMILARITY
+}
+
+fn labels_with_prefix<'a>(labels: &'a [String], prefix: &str) -> HashSet<&'a str> {
+    labels
+        .iter()
+        .filter_map(|label| label.strip_prefix(prefix))
+        .collect()
+}
+
 fn lexical_relevance(query: &str, description: &str, labels: &[String]) -> f32 {
     let query_terms = search_terms(query);
     if query_terms.is_empty() {
@@ -834,6 +1051,16 @@ fn search_stem(term: &str) -> String {
 }
 
 fn matches_query(result: &SearchResult, query: &SearchQuery) -> bool {
+    if let Some(root) = query.root.as_deref().filter(|root| !root.trim().is_empty()) {
+        if !Path::new(&result.path).starts_with(Path::new(root)) {
+            return false;
+        }
+    }
+
+    if query.ai_only.unwrap_or(false) && result.ai_annotation_count == 0 {
+        return false;
+    }
+
     if let Some(keyword) = non_empty_lowercase(query.keyword.as_deref()) {
         let searchable = format!(
             "{} {}",
@@ -1100,6 +1327,31 @@ mod tests {
     }
 
     #[test]
+    fn reconciling_one_folder_keeps_other_folder_entries_active() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile_under_root(
+                &report(vec![file("/library/alpha/a.mp4", "hash-a")]),
+                &HashMap::new(),
+                Path::new("/library/alpha"),
+            )
+            .expect("first folder should persist");
+        index
+            .reconcile_under_root(
+                &report(vec![file("/library/beta/b.mp4", "hash-b")]),
+                &HashMap::new(),
+                Path::new("/library/beta"),
+            )
+            .expect("second folder should persist");
+
+        let files = index.known_files().expect("known files should load");
+        assert_eq!(files.len(), 2);
+        assert!(files
+            .iter()
+            .all(|file| file.status == LocalFileStatus::Active));
+    }
+
+    #[test]
     fn duplicate_copies_share_one_logical_asset() {
         let mut index = SqliteIndex::open_in_memory().expect("index should open");
         index
@@ -1267,10 +1519,249 @@ mod tests {
         assert_eq!(
             results
                 .iter()
-                .map(|result| result.timestamp_ms)
+                .map(|result| (result.timestamp_ms, result.end_timestamp_ms))
                 .collect::<Vec<_>>(),
-            vec![4_000, 10_000]
+            vec![(4_000, 6_000), (10_000, 10_000)]
         );
+    }
+
+    #[test]
+    fn coalesces_a_long_unchanged_scene_into_one_time_range() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/forest.mp4", "hash-forest")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        let annotations = (0..=12)
+            .map(|step| AiAnnotation {
+                timestamp_ms: step * 10_000,
+                description: "A man walks through a forest".to_owned(),
+                labels: vec!["action: walking".to_owned(), "setting: forest".to_owned()],
+                embedding: vec![1.0, 0.0],
+                confidence: Some(0.9),
+                model: "fixture".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        index
+            .replace_ai_annotations("hash-forest", &annotations)
+            .expect("annotations should persist");
+
+        let results = index
+            .search_ai("walking in forest", &[1.0, 0.0], 20, Some("fixture"))
+            .expect("AI search should work");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].timestamp_ms, 0);
+        assert_eq!(results[0].end_timestamp_ms, 120_000);
+    }
+
+    #[test]
+    fn starts_a_new_moment_when_the_action_changes() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/forest.mp4", "hash-forest")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        let annotation = |timestamp_ms, action: &str| AiAnnotation {
+            timestamp_ms,
+            description: format!("A person is {action} in a forest"),
+            labels: vec![format!("action: {action}"), "setting: forest".to_owned()],
+            embedding: vec![1.0, 0.0],
+            confidence: Some(0.9),
+            model: "fixture".to_owned(),
+        };
+        index
+            .replace_ai_annotations(
+                "hash-forest",
+                &[
+                    annotation(0, "walking"),
+                    annotation(10_000, "walking"),
+                    annotation(20_000, "running"),
+                    annotation(30_000, "running"),
+                ],
+            )
+            .expect("annotations should persist");
+
+        let results = index
+            .search_ai("person in forest", &[1.0, 0.0], 20, Some("fixture"))
+            .expect("AI search should work");
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (result.timestamp_ms, result.end_timestamp_ms))
+                .collect::<Vec<_>>(),
+            vec![(0, 10_000), (20_000, 30_000)]
+        );
+    }
+
+    #[test]
+    fn scopes_ai_search_and_annotation_counts_to_the_selected_root() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![
+                    file("/library/alpha/one.mp4", "hash-one"),
+                    file("/library/beta/two.mp4", "hash-two"),
+                ]),
+                &HashMap::new(),
+            )
+            .expect("fixtures should be indexed");
+        for content_hash in ["hash-one", "hash-two"] {
+            index
+                .replace_ai_annotations(
+                    content_hash,
+                    &[AiAnnotation {
+                        timestamp_ms: 1_000,
+                        description: "A person waves".to_owned(),
+                        labels: vec!["action: waving".to_owned()],
+                        embedding: vec![1.0, 0.0],
+                        confidence: Some(0.9),
+                        model: "fixture".to_owned(),
+                    }],
+                )
+                .expect("annotation should persist");
+        }
+
+        let results = index
+            .search_ai_with_focus_under_root(
+                "waving",
+                &[1.0, 0.0],
+                20,
+                Some("fixture"),
+                AiSearchFocus::Broad,
+                Some(Path::new("/library/alpha")),
+            )
+            .expect("scoped AI search should work");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content_hash, "hash-one");
+        assert_eq!(
+            index
+                .ai_annotation_count_for_model_under_root(
+                    "fixture",
+                    Some(Path::new("/library/alpha")),
+                )
+                .expect("scoped count should work"),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_file_locations_do_not_duplicate_ai_moments() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![
+                    file("/library/copy-b.mp4", "same-hash"),
+                    file("/library/copy-a.mp4", "same-hash"),
+                ]),
+                &HashMap::new(),
+            )
+            .expect("fixtures should be indexed");
+        index
+            .replace_ai_annotations(
+                "same-hash",
+                &[AiAnnotation {
+                    timestamp_ms: 1_000,
+                    description: "A car drives past".to_owned(),
+                    labels: vec!["action: driving".to_owned()],
+                    embedding: vec![1.0, 0.0],
+                    confidence: Some(0.9),
+                    model: "fixture".to_owned(),
+                }],
+            )
+            .expect("annotation should persist");
+
+        let results = index
+            .search_ai("driving", &[1.0, 0.0], 20, Some("fixture"))
+            .expect("AI search should work");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "/library/copy-a.mp4");
+    }
+
+    #[test]
+    fn normal_search_supports_current_folder_and_analyzed_archive_views() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![
+                    file("/library/alpha/one.mp4", "hash-one"),
+                    file("/library/beta/two.mp4", "hash-two"),
+                ]),
+                &HashMap::new(),
+            )
+            .expect("fixtures should be indexed");
+        index
+            .replace_ai_annotations(
+                "hash-two",
+                &[AiAnnotation {
+                    timestamp_ms: 1_000,
+                    description: "A saved analyzed scene".to_owned(),
+                    labels: Vec::new(),
+                    embedding: vec![1.0, 0.0],
+                    confidence: Some(0.9),
+                    model: "fixture".to_owned(),
+                }],
+            )
+            .expect("annotation should persist");
+
+        let current = index
+            .search(&SearchQuery {
+                root: Some("/library/alpha".to_owned()),
+                ..SearchQuery::default()
+            })
+            .expect("current-folder search should work");
+        let archive = index
+            .search(&SearchQuery {
+                ai_only: Some(true),
+                ..SearchQuery::default()
+            })
+            .expect("archive search should work");
+
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].content_hash, "hash-one");
+        assert_eq!(archive.len(), 1);
+        assert_eq!(archive[0].content_hash, "hash-two");
+    }
+
+    #[test]
+    fn analyzed_archive_search_keeps_missing_clips_discoverable() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/old.mp4", "hash-old")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        index
+            .replace_ai_annotations(
+                "hash-old",
+                &[AiAnnotation {
+                    timestamp_ms: 2_000,
+                    description: "A person rides a bicycle".to_owned(),
+                    labels: vec!["action: cycling".to_owned()],
+                    embedding: vec![1.0, 0.0],
+                    confidence: Some(0.9),
+                    model: "fixture".to_owned(),
+                }],
+            )
+            .expect("annotation should persist");
+        index
+            .reconcile(&report(Vec::new()), &HashMap::new())
+            .expect("empty complete scan should mark the path missing");
+
+        let results = index
+            .search_ai("cycling", &[1.0, 0.0], 20, Some("fixture"))
+            .expect("saved AI search should work");
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].available);
     }
 
     #[test]
@@ -1460,6 +1951,8 @@ mod tests {
             .search(&SearchQuery {
                 keyword: Some("h264".to_owned()),
                 folder: Some("day-one".to_owned()),
+                root: None,
+                ai_only: None,
                 date_from_unix_ms: Some(900),
                 date_to_unix_ms: Some(1_100),
                 resolution: Some("1920x1080".to_owned()),

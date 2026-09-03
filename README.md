@@ -13,11 +13,14 @@ the Rust backend.
 
 - recursive folder scanning, stable hashing, and change detection;
 - cached FFprobe metadata and a machine-local SQLite index;
-- contact sheets grouped by the footage's real source folders;
+- a selected-folder view plus a separate saved AI-analysis archive, both grouped
+  by the footage's real source folders;
 - deterministic search, filters, local preview, and opening the original clip;
 - explicit sampled-frame AI analysis through OpenAI, Gemini, or local Ollama;
-- per-video timestamped visual search with duplicate-moment suppression;
-- background analysis progress, cancellation, and bounded cloud cost preflight.
+- per-video visual search that combines similar adjacent frames into contextual
+  time ranges;
+- background analysis progress, measured time estimates, cancellation, and
+  bounded cloud cost preflight.
 
 The API, worker, migration, and Terraform foundations are present, but no AWS
 infrastructure is applied by this repository. GitHub's `origin/main` now
