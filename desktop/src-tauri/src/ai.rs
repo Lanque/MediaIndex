@@ -1,5 +1,5 @@
 use base64::Engine;
-use reqwest::blocking::{Client, Response};
+use reqwest::blocking::{multipart, Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::error::Error as StdError;
@@ -12,11 +12,12 @@ use crate::metadata::MediaMetadata;
 
 const DEFAULT_OPENAI_VISION_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_OPENAI_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+const DEFAULT_OPENAI_TRANSCRIPTION_MODEL: &str = "whisper-1";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_GEMINI_VISION_MODEL: &str = "gemini-3.6-flash";
-const DEFAULT_GEMINI_EMBEDDING_MODEL: &str = "gemini-embedding-001";
+const DEFAULT_GEMINI_VISION_MODEL: &str = "gemini-3.8-flash";
+const DEFAULT_GEMINI_EMBEDDING_MODEL: &str = "gemini-embedding-2";
 const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
-const DEFAULT_LOCAL_VISION_MODEL: &str = "gemma4";
+const DEFAULT_LOCAL_VISION_MODEL: &str = "gemma4:e2b";
 const DEFAULT_LOCAL_EMBEDDING_MODEL: &str = "embeddinggemma";
 const DEFAULT_LOCAL_BASE_URL: &str = "http://127.0.0.1:11434";
 const REMOTE_PARALLEL_FILE_LIMIT: usize = 2;
@@ -63,6 +64,10 @@ pub struct AiRequestConfig {
     pub sample_interval_seconds: Option<u64>,
     pub max_frames: Option<u64>,
     pub context_hint: Option<String>,
+    pub transcribe_audio: Option<bool>,
+    pub transcription_model: Option<String>,
+    pub auth_mode: Option<String>,
+    pub google_project_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -125,6 +130,29 @@ pub struct AiSettings {
     sample_interval_ms: u64,
     max_frames_per_file: usize,
     context_hint: Option<String>,
+    transcribe_audio: bool,
+    transcription_model: String,
+    gemini_uses_oauth: bool,
+    google_project_id: Option<String>,
+}
+
+fn sanitize_api_key(raw: &str) -> String {
+    let mut key = raw.trim();
+    if let Some(stripped) = key.strip_prefix("Bearer ") {
+        key = stripped.trim();
+    } else if let Some(stripped) = key.strip_prefix("bearer ") {
+        key = stripped.trim();
+    }
+    if (key.starts_with('"') && key.ends_with('"'))
+        || (key.starts_with('\'') && key.ends_with('\''))
+    {
+        if key.len() >= 2 {
+            key = key[1..key.len() - 1].trim();
+        }
+    }
+    key.chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .collect::<String>()
 }
 
 impl AiSettings {
@@ -143,6 +171,9 @@ impl AiSettings {
                     AiProvider::Local
                 }
             });
+        let gemini_uses_oauth =
+            provider == AiProvider::Gemini && request.auth_mode.as_deref() == Some("oauth");
+        let google_project_id = non_empty(request.google_project_id.clone());
 
         let api_key = non_empty(request.api_key).or_else(|| match provider {
             AiProvider::OpenAI => env_non_empty("MEDIAINDEX_OPENAI_API_KEY")
@@ -151,7 +182,7 @@ impl AiSettings {
                 .or_else(|| env_non_empty("GEMINI_API_KEY")),
             AiProvider::Local => None,
         });
-        let api_key = api_key.unwrap_or_default();
+        let api_key = sanitize_api_key(&api_key.unwrap_or_default());
         if provider.is_remote() && api_key.is_empty() {
             return Err(match provider {
                 AiProvider::OpenAI => {
@@ -159,11 +190,19 @@ impl AiSettings {
                         .to_owned()
                 }
                 AiProvider::Gemini => {
-                    "Gemini needs an API key. Add it under AI connection or set MEDIAINDEX_GEMINI_API_KEY."
-                        .to_owned()
+                    if gemini_uses_oauth {
+                        "Google login is missing or expired. Press Login with Google and try again."
+                            .to_owned()
+                    } else {
+                        "Gemini needs an API key or Google login. Add one under AI connection or set MEDIAINDEX_GEMINI_API_KEY."
+                            .to_owned()
+                    }
                 }
                 AiProvider::Local => unreachable!(),
             });
+        }
+        if gemini_uses_oauth && google_project_id.is_none() {
+            return Err("Google login did not provide a Cloud project ID. Log in again with a Desktop OAuth client JSON that contains project_id.".to_owned());
         }
 
         let (default_vision_model, default_embedding_model, default_base_url) = match provider {
@@ -184,13 +223,16 @@ impl AiSettings {
             ),
         };
 
-        let vision_model = non_empty(request.vision_model)
+        let mut vision_model = non_empty(request.vision_model)
             .or_else(|| env_non_empty("MEDIAINDEX_AI_MODEL"))
             .unwrap_or_else(|| default_vision_model.to_owned());
+        if provider == AiProvider::OpenAI && vision_model.eq_ignore_ascii_case("04-mini") {
+            vision_model = "o4-mini".to_owned();
+        }
         let embedding_model = non_empty(request.embedding_model)
             .or_else(|| env_non_empty("MEDIAINDEX_AI_EMBEDDING_MODEL"))
             .unwrap_or_else(|| default_embedding_model.to_owned());
-        let base_url = non_empty(request.base_url)
+        let mut base_url = non_empty(request.base_url)
             .or_else(|| env_non_empty("MEDIAINDEX_AI_BASE_URL"))
             .or_else(|| match provider {
                 AiProvider::OpenAI => env_non_empty("MEDIAINDEX_OPENAI_BASE_URL"),
@@ -200,6 +242,25 @@ impl AiSettings {
             .unwrap_or_else(|| default_base_url.to_owned())
             .trim_end_matches('/')
             .to_owned();
+
+        match provider {
+            AiProvider::OpenAI
+                if base_url.contains("googleapis.com") || base_url.contains("11434") =>
+            {
+                base_url = DEFAULT_OPENAI_BASE_URL.to_owned();
+            }
+            AiProvider::Gemini
+                if base_url.contains("api.openai.com") || base_url.contains("11434") =>
+            {
+                base_url = DEFAULT_GEMINI_BASE_URL.to_owned();
+            }
+            AiProvider::Local
+                if base_url.contains("googleapis.com") || base_url.contains("api.openai.com") =>
+            {
+                base_url = DEFAULT_LOCAL_BASE_URL.to_owned();
+            }
+            _ => {}
+        }
 
         let sample_interval_seconds = match request.sample_interval_seconds {
             Some(value) => value,
@@ -213,6 +274,10 @@ impl AiSettings {
         let ffmpeg_executable = resolve_ffmpeg_executable(request.ffmpeg_path);
         let context_hint =
             non_empty(request.context_hint).or_else(|| env_non_empty("MEDIAINDEX_AI_CONTEXT"));
+        let transcribe_audio =
+            provider == AiProvider::OpenAI && request.transcribe_audio.unwrap_or(false);
+        let transcription_model = non_empty(request.transcription_model)
+            .unwrap_or_else(|| DEFAULT_OPENAI_TRANSCRIPTION_MODEL.to_owned());
 
         Ok(Self {
             provider,
@@ -224,16 +289,25 @@ impl AiSettings {
             sample_interval_ms: sample_interval_seconds.saturating_mul(1_000),
             max_frames_per_file,
             context_hint,
+            transcribe_audio,
+            transcription_model,
+            gemini_uses_oauth,
+            google_project_id,
         })
     }
 
     pub fn model_namespace(&self) -> String {
-        format!(
+        let base = format!(
             "{}:{}:{}",
             self.provider.name(),
             self.vision_model,
             self.embedding_model
-        )
+        );
+        if self.transcribe_audio {
+            format!("{base}:speech-{}", self.transcription_model)
+        } else {
+            base
+        }
     }
 
     pub fn parallel_file_limit(&self) -> usize {
@@ -255,6 +329,25 @@ impl AiSettings {
     pub(crate) fn max_frames_per_file(&self) -> usize {
         self.max_frames_per_file
     }
+
+    pub(crate) fn sample_interval_ms(&self) -> u64 {
+        self.sample_interval_ms
+    }
+
+    pub(crate) fn transcribes_audio(&self) -> bool {
+        self.transcribe_audio
+    }
+}
+
+fn authorize_gemini(request: RequestBuilder, settings: &AiSettings) -> RequestBuilder {
+    if settings.gemini_uses_oauth {
+        request.bearer_auth(&settings.api_key).header(
+            "x-goog-user-project",
+            settings.google_project_id.as_deref().unwrap_or_default(),
+        )
+    } else {
+        request.header("x-goog-api-key", &settings.api_key)
+    }
 }
 
 pub fn resolve_ffmpeg_executable(configured_path: Option<String>) -> PathBuf {
@@ -267,27 +360,27 @@ pub fn resolve_ffmpeg_executable(configured_path: Option<String>) -> PathBuf {
 
 pub fn analyze_file(
     path: &Path,
-    _metadata: Option<&MediaMetadata>,
+    metadata: Option<&MediaMetadata>,
     settings: &AiSettings,
 ) -> Result<Vec<AiAnnotation>, String> {
-    analyze_file_with_progress(path, _metadata, settings, |_| {})
+    analyze_file_with_progress(path, metadata, settings, |_| {})
 }
 
 pub fn analyze_file_with_progress<F>(
     path: &Path,
-    _metadata: Option<&MediaMetadata>,
+    metadata: Option<&MediaMetadata>,
     settings: &AiSettings,
     progress: F,
 ) -> Result<Vec<AiAnnotation>, String>
 where
     F: Fn(AiFileProgress),
 {
-    analyze_file_with_progress_and_cancel(path, _metadata, settings, progress, || false)
+    analyze_file_with_progress_and_cancel(path, metadata, settings, progress, || false)
 }
 
 pub fn analyze_file_with_progress_and_cancel<F, C>(
     path: &Path,
-    _metadata: Option<&MediaMetadata>,
+    metadata: Option<&MediaMetadata>,
     settings: &AiSettings,
     progress: F,
     is_cancelled: C,
@@ -308,6 +401,11 @@ where
         percent: 10,
         phase: "Analyzing frames",
     });
+    let should_transcribe_audio = settings.transcribe_audio
+        && metadata
+            .and_then(|metadata| metadata.audio_codec.as_deref())
+            .is_some();
+    let vision_percent_span = if should_transcribe_audio { 60 } else { 80 };
     let mut analyses = Vec::with_capacity(frames.len());
     let mut frame_errors = Vec::new();
     let mut processed_frames = 0usize;
@@ -335,9 +433,9 @@ where
         }
         ensure_analysis_not_cancelled(&is_cancelled)?;
         processed_frames += frame_batch.len();
-        let vision_percent = 10 + ((processed_frames * 80) / frames.len()) as u8;
+        let vision_percent = 10 + ((processed_frames * vision_percent_span) / frames.len()) as u8;
         progress(AiFileProgress {
-            percent: vision_percent.min(90),
+            percent: vision_percent.min(10 + vision_percent_span as u8),
             phase: "Analyzing frames",
         });
     }
@@ -352,16 +450,39 @@ where
         ));
     }
 
+    if should_transcribe_audio {
+        progress(AiFileProgress {
+            percent: 72,
+            phase: "Extracting speech audio",
+        });
+        ensure_analysis_not_cancelled(&is_cancelled)?;
+        let audio_path = extract_audio_track(path, settings)?;
+        progress(AiFileProgress {
+            percent: 78,
+            phase: "Transcribing speech",
+        });
+        let transcription = transcribe_openai_audio(&client, &audio_path, settings);
+        let _ = fs::remove_file(&audio_path);
+        let transcript_segments = transcription?;
+        ensure_analysis_not_cancelled(&is_cancelled)?;
+        attach_transcript_segments(&mut analyses, &transcript_segments);
+        progress(AiFileProgress {
+            percent: 90,
+            phase: "Speech indexed",
+        });
+    }
+
     let embedding_texts = analyses
         .iter()
         .map(|(_, analysis)| {
             format!(
-                "{}\nEntities: {}\nActions: {}\nSetting: {}\nSituation: {}\nLabels: {}\nOn-screen text: {}",
+                "{}\nEntities: {}\nActions: {}\nSetting: {}\nSituation: {}\nDialogue: {}\nLabels: {}\nOn-screen text: {}",
                 analysis.description,
                 analysis.entities.join(", "),
                 analysis.actions.join(", "),
                 analysis.setting.as_deref().unwrap_or_default(),
                 analysis.situation.as_deref().unwrap_or_default(),
+                analysis.dialogue.join(" | "),
                 analysis.labels.join(", "),
                 analysis.visible_text.join(" | ")
             )
@@ -388,11 +509,13 @@ where
         let visible_text = normalize_labels(analysis.visible_text);
         let entities = normalize_labels(analysis.entities);
         let actions = normalize_labels(analysis.actions);
+        let dialogue = normalize_labels(analysis.dialogue);
         let setting = normalize_optional_text(analysis.setting);
         let situation = normalize_optional_text(analysis.situation);
         let mut labels = normalize_labels(analysis.labels);
         labels.extend(entities.iter().map(|entity| format!("entity: {entity}")));
         labels.extend(actions.iter().map(|action| format!("action: {action}")));
+        labels.extend(dialogue.iter().map(|line| format!("dialogue: {line}")));
         if let Some(setting) = &setting {
             labels.push(format!("setting: {setting}"));
         }
@@ -412,6 +535,9 @@ where
         }
         if !actions.is_empty() {
             details.push(format!("Actions: {}", actions.join(", ")));
+        }
+        if !dialogue.is_empty() {
+            details.push(format!("Dialogue: {}", dialogue.join(" | ")));
         }
         if let Some(setting) = setting {
             details.push(format!("Setting: {setting}"));
@@ -444,6 +570,147 @@ where
     Ok(annotations)
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct TranscriptSegment {
+    start: f64,
+    end: f64,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TimestampedTranscript {
+    #[serde(default)]
+    segments: Vec<TranscriptSegment>,
+}
+
+fn extract_audio_track(path: &Path, settings: &AiSettings) -> Result<PathBuf, String> {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    let output_path = std::env::temp_dir().join(format!(
+        "mediaindex-speech-{}-{unique}.mp3",
+        std::process::id()
+    ));
+    let maximum_seconds = settings
+        .sample_interval_ms
+        .saturating_mul(settings.max_frames_per_file as u64)
+        .div_ceil(1_000)
+        .max(1);
+    let mut command = Command::new(&settings.ffmpeg_executable);
+    configure_hidden_process(&mut command);
+    let output = command
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", "-t",
+        ])
+        .arg(maximum_seconds.to_string())
+        .args(["-f", "mp3", "-y"])
+        .arg(&output_path)
+        .output()
+        .map_err(|error| {
+            format!(
+                "FFmpeg could not extract speech audio from {}: {error}",
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&output_path);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!(
+                "FFmpeg could not extract speech audio from {}",
+                path.display()
+            )
+        } else {
+            format!(
+                "FFmpeg could not extract speech audio from {}: {stderr}",
+                path.display()
+            )
+        });
+    }
+    if !output_path.is_file()
+        || fs::metadata(&output_path)
+            .map(|value| value.len())
+            .unwrap_or(0)
+            == 0
+    {
+        let _ = fs::remove_file(&output_path);
+        return Err(format!(
+            "FFmpeg produced no speech audio for {}",
+            path.display()
+        ));
+    }
+    Ok(output_path)
+}
+
+fn transcribe_openai_audio(
+    client: &Client,
+    audio_path: &Path,
+    settings: &AiSettings,
+) -> Result<Vec<TranscriptSegment>, String> {
+    if settings.provider != AiProvider::OpenAI {
+        return Ok(Vec::new());
+    }
+    let audio = fs::read(audio_path).map_err(|error| {
+        format!(
+            "cannot read extracted speech audio {}: {error}",
+            audio_path.display()
+        )
+    })?;
+    let response = execute_with_retry("OpenAI speech transcription", || {
+        let part = multipart::Part::bytes(audio.clone())
+            .file_name("speech.mp3")
+            .mime_str("audio/mpeg")?;
+        let form = multipart::Form::new()
+            .text("model", settings.transcription_model.clone())
+            .text("response_format", "verbose_json")
+            .text("timestamp_granularities[]", "segment")
+            .part("file", part);
+        client
+            .post(format!("{}/audio/transcriptions", settings.base_url))
+            .bearer_auth(&settings.api_key)
+            .multipart(form)
+            .send()
+    })?;
+    let body = read_json_response(response, "OpenAI speech transcription")?;
+    let transcript: TimestampedTranscript = serde_json::from_value(body).map_err(|error| {
+        format!("OpenAI speech transcription returned invalid timestamps: {error}")
+    })?;
+    Ok(transcript
+        .segments
+        .into_iter()
+        .filter_map(|segment| {
+            let text = segment.text.trim().to_owned();
+            (!text.is_empty() && segment.start.is_finite() && segment.end.is_finite()).then_some(
+                TranscriptSegment {
+                    start: segment.start.max(0.0),
+                    end: segment.end.max(segment.start).max(0.0),
+                    text,
+                },
+            )
+        })
+        .collect())
+}
+
+fn attach_transcript_segments(
+    analyses: &mut [(u64, FrameAnalysis)],
+    segments: &[TranscriptSegment],
+) {
+    if analyses.is_empty() {
+        return;
+    }
+    for segment in segments {
+        let midpoint_ms = (((segment.start + segment.end) / 2.0) * 1_000.0).max(0.0) as u64;
+        let target = analyses
+            .partition_point(|(timestamp_ms, _)| *timestamp_ms <= midpoint_ms)
+            .saturating_sub(1)
+            .min(analyses.len() - 1);
+        analyses[target].1.dialogue.push(segment.text.clone());
+    }
+}
+
 fn ensure_analysis_not_cancelled<C>(is_cancelled: &C) -> Result<(), String>
 where
     C: Fn() -> bool,
@@ -465,6 +732,7 @@ pub fn embed_query(query: &str, settings: &AiSettings) -> Result<Vec<f32>, Strin
 
 pub fn test_connection(settings: &AiSettings) -> Result<AiConnectionReport, String> {
     let client = build_http_client()?;
+    validate_vision_model(&client, settings)?;
     let embedding = create_embedding(
         &client,
         "MediaIndex connection test",
@@ -477,6 +745,40 @@ pub fn test_connection(settings: &AiSettings) -> Result<AiConnectionReport, Stri
         embedding_model: settings.embedding_model.clone(),
         embedding_dimensions: embedding.len(),
     })
+}
+
+fn validate_vision_model(client: &Client, settings: &AiSettings) -> Result<(), String> {
+    let clean_model = settings.vision_model.trim_start_matches("models/").trim();
+    let response = match settings.provider {
+        AiProvider::OpenAI => execute_with_retry("OpenAI vision model check", || {
+            client
+                .get(format!("{}/models/{clean_model}", settings.base_url))
+                .bearer_auth(&settings.api_key)
+                .send()
+        })?,
+        AiProvider::Gemini => execute_with_retry("Gemini vision model check", || {
+            authorize_gemini(
+                client.get(format!("{}/models/{clean_model}", settings.base_url)),
+                settings,
+            )
+            .send()
+        })?,
+        AiProvider::Local => execute_with_retry("Local AI vision model check", || {
+            client
+                .post(format!("{}/api/show", settings.base_url))
+                .json(&json!({"model": clean_model}))
+                .send()
+        })?,
+    };
+    read_json_response(
+        response,
+        match settings.provider {
+            AiProvider::OpenAI => "OpenAI vision model check",
+            AiProvider::Gemini => "Gemini vision model check",
+            AiProvider::Local => "Local AI vision model check",
+        },
+    )?;
+    Ok(())
 }
 
 fn environment_u64(name: &str, default: u64) -> Result<u64, String> {
@@ -541,6 +843,47 @@ fn request_failure(operation: &str, error: &reqwest::Error) -> String {
     )
 }
 
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+        || status == reqwest::StatusCode::BAD_GATEWAY
+        || status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
+}
+
+fn execute_with_retry<F>(operation_name: &str, mut make_request: F) -> Result<Response, String>
+where
+    F: FnMut() -> Result<Response, reqwest::Error>,
+{
+    const MAX_ATTEMPTS: usize = 4;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match make_request() {
+            Ok(response) => {
+                let status = response.status();
+                if is_transient_status(status) && attempt < MAX_ATTEMPTS {
+                    let delay_ms = match attempt {
+                        1 => 1_500,
+                        2 => 3_500,
+                        _ => 6_000,
+                    };
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(error) => {
+                if (error.is_timeout() || error.is_connect()) && attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(1_500 * attempt as u64));
+                    continue;
+                }
+                return Err(request_failure(operation_name, &error));
+            }
+        }
+    }
+}
+
 fn provider_from_environment() -> Option<AiProvider> {
     match env_non_empty("MEDIAINDEX_AI_PROVIDER")?
         .to_ascii_lowercase()
@@ -564,8 +907,9 @@ fn extract_frames(path: &Path, settings: &AiSettings) -> Result<Vec<(u64, Vec<u8
         .map_err(|error| format!("cannot create temporary AI frame directory: {error}"))?;
     let output_pattern = output_directory.join("frame-%06d.jpg");
     let sample_seconds = (settings.sample_interval_ms / 1_000).max(1);
-    let filter =
-        format!("fps=1/{sample_seconds},scale=w='min({MAX_EXTRACTED_FRAME_WIDTH},iw)':h=-2");
+    let filter = format!(
+        "fps=1/{sample_seconds},scale=w='min({MAX_EXTRACTED_FRAME_WIDTH},iw)':h=-2,format=yuvj420p"
+    );
     let mut command = Command::new(&settings.ffmpeg_executable);
     configure_hidden_process(&mut command);
     let output = command
@@ -624,7 +968,7 @@ pub fn extract_thumbnail(
     timestamp_ms: u64,
     ffmpeg_executable: &Path,
 ) -> Result<Vec<u8>, String> {
-    let filter = format!("scale=w='min({MAX_THUMBNAIL_WIDTH},iw)':h=-2");
+    let filter = format!("scale=w='min({MAX_THUMBNAIL_WIDTH},iw)':h=-2,format=yuvj420p");
     let mut command = Command::new(ffmpeg_executable);
     configure_hidden_process(&mut command);
     let output = command
@@ -700,6 +1044,8 @@ struct FrameAnalysis {
     #[serde(default)]
     actions: Vec<String>,
     #[serde(default)]
+    dialogue: Vec<String>,
+    #[serde(default)]
     setting: Option<String>,
     #[serde(default)]
     situation: Option<String>,
@@ -740,7 +1086,7 @@ fn describe_frames(
         },
     );
     let prompt = format!(
-        "Analyze these ordered video frames for a general-purpose searchable media library. The frame timestamps, in order, are: {timestamps}. {library_context} Use adjacent frames as temporal context so recurring subjects stay consistent and an ongoing action or situation is understood as a sequence. Return only a JSON object with a frames array containing exactly one object per input frame, in the same order. Each frame object must contain: description (one concise factual sentence covering who or what is visible, what is happening, and the important context); entities (lowercase array of confidently recognizable fictional characters, game characters, creatures, teams, franchises, products, vehicles, landmarks, or named objects); actions (lowercase array of concrete actions and interactions); setting (short lowercase location or environment, or an empty string); situation (short lowercase event or circumstance such as conversation, ceremony, chase, battle, tutorial, performance, sports play, accident, travel, gameplay event, or an empty string); labels (lowercase array covering useful subjects, objects, genre, visual style, mood, shot type, and concepts); visible_text (array of exact readable words or short phrases from subtitles, signs, titles, HUD, menus, score overlays, or logos); and confidence (number from 0 to 1). Name a well-known fictional character or franchise only when distinctive visual evidence supports it; otherwise describe appearance and role precisely. Never identify a real person from their face alone—use a real person's name only when readable on-screen text establishes it. Inspect the full frame, including background details and small UI text. Add useful search synonyms only when supported by the image. Do not invent identities, actions, relationships, locations, events, or text. Use empty arrays or strings when evidence is insufficient."
+        "Analyze these ordered video frames for a general-purpose searchable media library. The frame timestamps, in order, are: {timestamps}. {library_context} Use adjacent frames as temporal context so recurring subjects stay consistent and an ongoing action or situation is understood as a sequence. Return only a JSON object with a frames array containing exactly one object per input frame, in the same order. Each frame object must contain: description (one concise factual sentence covering who or what is visible, what is happening, and the important context); entities (lowercase array of confidently recognizable fictional characters, game characters, creatures, teams, franchises, products, vehicles, landmarks, or named objects); actions (lowercase array of concrete actions and interactions); setting (short lowercase location or environment, or an empty string); situation (short lowercase event or circumstance such as conversation, ceremony, chase, battle, tutorial, performance, sports play, accident, travel, gameplay event, or an empty string); dialogue (array of exact dialogue that is visibly shown in subtitles, captions, or speech bubbles; never infer unheard audio); labels (lowercase array covering useful subjects, objects, genre, visual style, mood, shot type, and concepts); visible_text (array of exact readable words or short phrases from subtitles, signs, titles, HUD, menus, score overlays, or logos); and confidence (number from 0 to 1). Name a well-known fictional character or franchise only when distinctive visual evidence supports it; otherwise describe appearance and role precisely. Never identify a real person from their face alone—use a real person's name only when readable on-screen text establishes it. Inspect the full frame, including background details and small UI text. Add useful search synonyms only when supported by the image. Do not invent identities, actions, relationships, locations, events, audio, or text. Use empty arrays or strings when evidence is insufficient."
     );
     let text = match settings.provider {
         AiProvider::OpenAI => describe_openai(client, &encoded_frames, &prompt, settings)?,
@@ -802,6 +1148,10 @@ fn describe_openai(
                                         "type": "array",
                                         "items": {"type": "string"}
                                     },
+                                    "dialogue": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    },
                                     "setting": {"type": "string"},
                                     "situation": {"type": "string"},
                                     "confidence": {
@@ -816,6 +1166,7 @@ fn describe_openai(
                                     "visible_text",
                                     "entities",
                                     "actions",
+                                    "dialogue",
                                     "setting",
                                     "situation",
                                     "confidence"
@@ -837,12 +1188,13 @@ fn describe_openai(
     if let Some(effort) = openai_reasoning_effort(&settings.vision_model) {
         request["reasoning"] = json!({"effort": effort});
     }
-    let response = client
-        .post(format!("{}/responses", settings.base_url))
-        .bearer_auth(&settings.api_key)
-        .json(&request)
-        .send()
-        .map_err(|error| request_failure("OpenAI vision", &error))?;
+    let response = execute_with_retry("OpenAI vision", || {
+        client
+            .post(format!("{}/responses", settings.base_url))
+            .bearer_auth(&settings.api_key)
+            .json(&request)
+            .send()
+    })?;
     let body = read_json_response(response, "OpenAI vision")?;
     response_text(&body).ok_or_else(|| "OpenAI vision returned no output text".to_owned())
 }
@@ -864,27 +1216,29 @@ fn describe_gemini(
     prompt: &str,
     settings: &AiSettings,
 ) -> Result<String, String> {
+    let clean_model = settings.vision_model.trim_start_matches("models/").trim();
     let mut parts = vec![json!({"text": prompt})];
     parts.extend(
         encoded_frames.iter().map(
             |(_, encoded)| json!({"inline_data": {"mime_type": "image/jpeg", "data": encoded}}),
         ),
     );
-    let response = client
-        .post(format!(
-            "{}/models/{}:generateContent",
-            settings.base_url, settings.vision_model
-        ))
-        .header("x-goog-api-key", &settings.api_key)
-        .json(&json!({
-            "contents": [{
-                "role": "user",
-                "parts": parts
-            }],
-            "generationConfig": {"responseMimeType": "application/json"}
-        }))
-        .send()
-        .map_err(|error| request_failure("Gemini vision", &error))?;
+    let url = format!(
+        "{}/models/{}:generateContent",
+        settings.base_url, clean_model
+    );
+    let payload = json!({
+        "contents": [{
+            "role": "user",
+            "parts": parts
+        }],
+        "generationConfig": {"responseMimeType": "application/json"}
+    });
+    let response = execute_with_retry("Gemini vision", || {
+        authorize_gemini(client.post(&url), settings)
+            .json(&payload)
+            .send()
+    })?;
     let body = read_json_response(response, "Gemini vision")?;
     response_text(&body).ok_or_else(|| "Gemini vision returned no candidate text".to_owned())
 }
@@ -895,20 +1249,22 @@ fn describe_local(
     prompt: &str,
     settings: &AiSettings,
 ) -> Result<String, String> {
-    let response = client
-        .post(format!("{}/api/chat", settings.base_url))
-        .json(&json!({
-            "model": settings.vision_model,
-            "messages": [{
-                "role": "user",
-                "content": prompt,
-                "images": encoded_frames.iter().map(|(_, encoded)| encoded).collect::<Vec<_>>()
-            }],
-            "format": "json",
-            "stream": false
-        }))
-        .send()
-        .map_err(|error| request_failure("Local AI vision", &error))?;
+    let payload = json!({
+        "model": settings.vision_model,
+        "messages": [{
+            "role": "user",
+            "content": prompt,
+            "images": encoded_frames.iter().map(|(_, encoded)| encoded).collect::<Vec<_>>()
+        }],
+        "format": "json",
+        "stream": false
+    });
+    let response = execute_with_retry("Local AI vision", || {
+        client
+            .post(format!("{}/api/chat", settings.base_url))
+            .json(&payload)
+            .send()
+    })?;
     let body = read_json_response(response, "Local AI vision")?;
     response_text(&body).ok_or_else(|| "Local AI returned no message content".to_owned())
 }
@@ -943,6 +1299,7 @@ fn normalize_frame_analysis(parsed: FrameAnalysis) -> Result<FrameAnalysis, Stri
         visible_text: normalize_labels(parsed.visible_text),
         entities: normalize_labels(parsed.entities),
         actions: normalize_labels(parsed.actions),
+        dialogue: normalize_labels(parsed.dialogue),
         setting: normalize_optional_text(parsed.setting),
         situation: normalize_optional_text(parsed.situation),
         confidence: parsed.confidence.map(|value| value.clamp(0.0, 1.0)),
@@ -973,15 +1330,17 @@ fn create_embeddings(
 
     let embeddings = match settings.provider {
         AiProvider::OpenAI => {
-            let response = client
-                .post(format!("{}/embeddings", settings.base_url))
-                .bearer_auth(&settings.api_key)
-                .json(&json!({
-                    "model": settings.embedding_model,
-                    "input": texts
-                }))
-                .send()
-                .map_err(|error| request_failure("OpenAI embedding", &error))?;
+            let payload = json!({
+                "model": settings.embedding_model,
+                "input": texts
+            });
+            let response = execute_with_retry("OpenAI embedding", || {
+                client
+                    .post(format!("{}/embeddings", settings.base_url))
+                    .bearer_auth(&settings.api_key)
+                    .json(&payload)
+                    .send()
+            })?;
             let body = read_json_response(response, "OpenAI embedding")?;
             body.get("data")
                 .and_then(Value::as_array)
@@ -999,14 +1358,16 @@ fn create_embeddings(
             .map(|text| create_gemini_embedding(client, text, settings, kind))
             .collect::<Result<Vec<_>, _>>()?,
         AiProvider::Local => {
-            let response = client
-                .post(format!("{}/api/embed", settings.base_url))
-                .json(&json!({
-                    "model": settings.embedding_model,
-                    "input": texts
-                }))
-                .send()
-                .map_err(|error| request_failure("Local AI embedding", &error))?;
+            let payload = json!({
+                "model": settings.embedding_model,
+                "input": texts
+            });
+            let response = execute_with_retry("Local AI embedding", || {
+                client
+                    .post(format!("{}/api/embed", settings.base_url))
+                    .json(&payload)
+                    .send()
+            })?;
             let body = read_json_response(response, "Local AI embedding")?;
             body.get("embeddings")
                 .and_then(Value::as_array)
@@ -1031,29 +1392,42 @@ fn create_embeddings(
     Ok(embeddings)
 }
 
-fn create_gemini_embedding(
+fn request_single_gemini_embedding(
     client: &Client,
+    model: &str,
     text: &str,
     settings: &AiSettings,
-    kind: EmbeddingKind,
-) -> Result<Vec<f32>, String> {
-    let task_type = match kind {
-        EmbeddingKind::Document => "RETRIEVAL_DOCUMENT",
-        EmbeddingKind::Query => "RETRIEVAL_QUERY",
+    task_type: &str,
+) -> Result<Vec<f32>, (bool, String)> {
+    let clean_model = model.trim_start_matches("models/").trim();
+    let url = format!("{}/models/{}:embedContent", settings.base_url, clean_model);
+    let is_embedding_2 = clean_model.eq_ignore_ascii_case("gemini-embedding-2");
+    let prepared_text = if is_embedding_2 {
+        match task_type {
+            "RETRIEVAL_DOCUMENT" => format!("title: none | text: {text}"),
+            _ => format!("task: search result | query: {text}"),
+        }
+    } else {
+        text.to_owned()
     };
-    let response = client
-        .post(format!(
-            "{}/models/{}:embedContent",
-            settings.base_url, settings.embedding_model
-        ))
-        .header("x-goog-api-key", &settings.api_key)
-        .json(&json!({
-            "content": {"parts": [{"text": text}]},
-            "taskType": task_type
-        }))
-        .send()
-        .map_err(|error| request_failure("Gemini embedding", &error))?;
-    let body = read_json_response(response, "Gemini embedding")?;
+    let mut payload = json!({
+        "model": format!("models/{}", clean_model),
+        "content": {"parts": [{"text": prepared_text}]}
+    });
+    if is_embedding_2 {
+        payload["output_dimensionality"] = json!(768);
+    } else {
+        payload["taskType"] = json!(task_type);
+    }
+    let response = execute_with_retry("Gemini embedding", || {
+        authorize_gemini(client.post(&url), settings)
+            .json(&payload)
+            .send()
+    })
+    .map_err(|err| (false, err))?;
+    let is_not_found = response.status() == reqwest::StatusCode::NOT_FOUND;
+    let body =
+        read_json_response(response, "Gemini embedding").map_err(|err| (is_not_found, err))?;
     let embedding = body
         .get("embedding")
         .and_then(|embedding| embedding.get("values"))
@@ -1069,7 +1443,21 @@ fn create_gemini_embedding(
         });
     embedding
         .filter(|values| !values.is_empty())
-        .ok_or_else(|| "Gemini embedding returned no vector".to_owned())
+        .ok_or_else(|| (false, "Gemini embedding returned no vector".to_owned()))
+}
+
+fn create_gemini_embedding(
+    client: &Client,
+    text: &str,
+    settings: &AiSettings,
+    kind: EmbeddingKind,
+) -> Result<Vec<f32>, String> {
+    let task_type = match kind {
+        EmbeddingKind::Document => "RETRIEVAL_DOCUMENT",
+        EmbeddingKind::Query => "RETRIEVAL_QUERY",
+    };
+    request_single_gemini_embedding(client, &settings.embedding_model, text, settings, task_type)
+        .map_err(|(_, err)| err)
 }
 
 fn values_to_embedding(values: &Vec<Value>) -> Vec<f32> {
@@ -1092,18 +1480,50 @@ fn read_json_response(response: Response, operation: &str) -> Result<Value, Stri
         )
     })?;
     if !status.is_success() {
-        return Err(format!(
-            "{operation} failed (HTTP {status}): {}",
-            api_error_detail(&body)
+        return Err(api_failure_message(
+            operation,
+            status,
+            &api_error_detail(&body),
         ));
     }
     if response_body_reports_error(&body) {
-        return Err(format!(
-            "{operation} failed (HTTP {status}): {}",
-            api_error_detail(&body)
+        return Err(api_failure_message(
+            operation,
+            status,
+            &api_error_detail(&body),
         ));
     }
     Ok(body)
+}
+
+fn api_failure_message(operation: &str, status: reqwest::StatusCode, detail: &str) -> String {
+    let mut message = format!("{operation} failed (HTTP {status}): {detail}");
+    if operation.starts_with("Gemini") {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            message.push_str(
+                ". Create a current auth key in Google AI Studio. Unrestricted standard keys are rejected, and Google announced the remaining standard-key shutdown for September 2026",
+            );
+        } else if status == reqwest::StatusCode::NOT_FOUND {
+            message.push_str(
+                ". Check the exact Gemini model name; removed embedding models such as text-embedding-004 and embedding-001 no longer work",
+            );
+        }
+    } else if operation.starts_with("OpenAI") {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            message.push_str(
+                ". Check that this is an active OpenAI API key and that its project can use the selected model",
+            );
+        } else if status == reqwest::StatusCode::NOT_FOUND {
+            message.push_str(
+                ". Check that the selected OpenAI model exists and is available to this project",
+            );
+        }
+    } else if operation.starts_with("Local AI") && status == reqwest::StatusCode::NOT_FOUND {
+        message.push_str(
+            ". Pull the exact vision or embedding model shown in settings with `ollama pull <model>`",
+        );
+    }
+    message
 }
 
 fn response_body_reports_error(body: &Value) -> bool {
@@ -1241,7 +1661,7 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn read_stub_request(stream: &mut std::net::TcpStream) -> (String, Value) {
+    fn read_stub_request(stream: &mut std::net::TcpStream) -> (String, Vec<String>, Value) {
         use std::io::Read;
 
         let mut request = Vec::new();
@@ -1272,14 +1692,66 @@ mod tests {
             request.extend_from_slice(&buffer[..read]);
         }
 
-        let request_line = String::from_utf8_lossy(&request[..header_end])
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned();
-        let body = serde_json::from_slice(&request[header_end..header_end + content_length])
-            .expect("stub request body should be JSON");
-        (request_line, body)
+        let header_text = String::from_utf8_lossy(&request[..header_end]);
+        let mut header_lines = header_text.lines();
+        let request_line = header_lines.next().unwrap_or_default().to_owned();
+        let headers = header_lines.map(str::to_owned).collect::<Vec<_>>();
+        let body = if content_length == 0 {
+            Value::Null
+        } else {
+            serde_json::from_slice(&request[header_end..header_end + content_length])
+                .expect("stub request body should be JSON")
+        };
+        (request_line, headers, body)
+    }
+
+    fn read_raw_stub_request(stream: &mut std::net::TcpStream) -> (String, Vec<String>, Vec<u8>) {
+        use std::io::Read;
+
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 8_192];
+        let (header_end, content_length) = loop {
+            let read = stream.read(&mut buffer).expect("stub request should read");
+            assert!(read > 0, "stub request closed before its headers arrived");
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_text = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = header_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or_default();
+            break (header_end + 4, content_length);
+        };
+        while request.len() < header_end + content_length {
+            let read = stream.read(&mut buffer).expect("stub body should read");
+            assert!(read > 0, "stub request closed before its body arrived");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let header_text = String::from_utf8_lossy(&request[..header_end]);
+        let mut header_lines = header_text.lines();
+        let request_line = header_lines.next().unwrap_or_default().to_owned();
+        let headers = header_lines.map(str::to_owned).collect::<Vec<_>>();
+        (
+            request_line,
+            headers,
+            request[header_end..header_end + content_length].to_vec(),
+        )
+    }
+
+    fn stub_header<'a>(headers: &'a [String], name: &str) -> Option<&'a str> {
+        headers.iter().find_map(|line| {
+            let (header_name, value) = line.split_once(':')?;
+            header_name
+                .eq_ignore_ascii_case(name)
+                .then_some(value.trim())
+        })
     }
 
     fn write_stub_response(stream: &mut std::net::TcpStream, body: &Value) {
@@ -1301,7 +1773,30 @@ mod tests {
         let address = listener.local_addr().expect("stub should have an address");
         let handle = std::thread::spawn(move || loop {
             let (mut stream, _) = listener.accept().expect("stub should accept a request");
-            let (request_line, request) = read_stub_request(&mut stream);
+            let (request_line, headers, raw_body) = read_raw_stub_request(&mut stream);
+            if request_line.starts_with("POST /audio/transcriptions ") {
+                assert_eq!(
+                    stub_header(&headers, "authorization"),
+                    Some("Bearer stub-api-key")
+                );
+                let body = String::from_utf8_lossy(&raw_body);
+                assert!(body.contains("name=\"timestamp_granularities[]\""));
+                assert!(body.contains("filename=\"speech.mp3\""));
+                write_stub_response(
+                    &mut stream,
+                    &json!({
+                        "segments": [
+                            {"start": 0.2, "end": 0.8, "text": "enemy eliminated"}
+                        ]
+                    }),
+                );
+                continue;
+            }
+            let request: Value = if raw_body.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&raw_body).expect("stub request body should be JSON")
+            };
             if request_line.starts_with("POST /responses ") {
                 let image_count = request
                     .pointer("/input/0/content")
@@ -1341,6 +1836,7 @@ mod tests {
                             "visible_text": ["ELIMINATED"],
                             "entities": ["Fortnite player"],
                             "actions": ["eliminating opponent"],
+                            "dialogue": [],
                             "setting": "forest battlefield",
                             "situation": "battle royale fight",
                             "confidence": 0.98
@@ -1373,6 +1869,130 @@ mod tests {
                 break;
             } else {
                 panic!("unexpected stub request: {request_line}");
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn spawn_openai_connection_stub() -> (String, std::thread::JoinHandle<()>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let handle = std::thread::spawn(move || {
+            let (mut model_stream, _) = listener.accept().expect("model check should connect");
+            let (request_line, headers, body) = read_stub_request(&mut model_stream);
+            assert!(request_line.starts_with("GET /models/gpt-5.6-luna "));
+            assert!(!request_line.contains("?key="));
+            assert_eq!(
+                stub_header(&headers, "authorization"),
+                Some("Bearer openai-test-key")
+            );
+            assert_eq!(body, Value::Null);
+            write_stub_response(&mut model_stream, &json!({"id": "gpt-5.6-luna"}));
+
+            let (mut embedding_stream, _) =
+                listener.accept().expect("embedding check should connect");
+            let (request_line, headers, body) = read_stub_request(&mut embedding_stream);
+            assert!(request_line.starts_with("POST /embeddings "));
+            assert_eq!(
+                stub_header(&headers, "authorization"),
+                Some("Bearer openai-test-key")
+            );
+            assert_eq!(
+                body.get("model").and_then(Value::as_str),
+                Some("text-embedding-3-small")
+            );
+            assert_eq!(
+                body.get("input").and_then(Value::as_array).map(Vec::len),
+                Some(1)
+            );
+            write_stub_response(
+                &mut embedding_stream,
+                &json!({"data": [{"index": 0, "embedding": [0.5, 0.25, 0.125]}]}),
+            );
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn spawn_gemini_connection_stub() -> (String, std::thread::JoinHandle<()>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let handle = std::thread::spawn(move || {
+            let (mut model_stream, _) = listener.accept().expect("model check should connect");
+            let (request_line, headers, body) = read_stub_request(&mut model_stream);
+            assert!(request_line.starts_with("GET /models/gemini-3.8-flash "));
+            assert!(!request_line.contains("?key="));
+            assert_eq!(
+                stub_header(&headers, "x-goog-api-key"),
+                Some("gemini-test-key")
+            );
+            assert_eq!(body, Value::Null);
+            write_stub_response(
+                &mut model_stream,
+                &json!({"name": "models/gemini-3.8-flash"}),
+            );
+
+            let (mut embedding_stream, _) =
+                listener.accept().expect("embedding check should connect");
+            let (request_line, headers, body) = read_stub_request(&mut embedding_stream);
+            assert!(request_line.starts_with("POST /models/gemini-embedding-2:embedContent "));
+            assert!(!request_line.contains("?key="));
+            assert_eq!(
+                stub_header(&headers, "x-goog-api-key"),
+                Some("gemini-test-key")
+            );
+            assert_eq!(
+                body.get("model").and_then(Value::as_str),
+                Some("models/gemini-embedding-2")
+            );
+            assert_eq!(
+                body.get("output_dimensionality").and_then(Value::as_u64),
+                Some(768)
+            );
+            assert!(body.get("taskType").is_none());
+            assert_eq!(
+                body.pointer("/content/parts/0/text")
+                    .and_then(Value::as_str),
+                Some("task: search result | query: MediaIndex connection test")
+            );
+            write_stub_response(
+                &mut embedding_stream,
+                &json!({"embedding": {"values": [0.75, 0.5, 0.25]}}),
+            );
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn spawn_gemini_oauth_connection_stub() -> (String, std::thread::JoinHandle<()>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let handle = std::thread::spawn(move || {
+            for expected_path in [
+                "GET /models/gemini-3.8-flash ",
+                "POST /models/gemini-embedding-2:embedContent ",
+            ] {
+                let (mut stream, _) = listener.accept().expect("OAuth check should connect");
+                let (request_line, headers, _body) = read_stub_request(&mut stream);
+                assert!(request_line.starts_with(expected_path));
+                assert_eq!(
+                    stub_header(&headers, "authorization"),
+                    Some("Bearer google-oauth-token")
+                );
+                assert_eq!(
+                    stub_header(&headers, "x-goog-user-project"),
+                    Some("mediaindex-oauth-test")
+                );
+                assert!(stub_header(&headers, "x-goog-api-key").is_none());
+                if expected_path.starts_with("GET") {
+                    write_stub_response(&mut stream, &json!({"name": "models/gemini-3.8-flash"}));
+                } else {
+                    write_stub_response(
+                        &mut stream,
+                        &json!({"embedding": {"values": [0.75, 0.5, 0.25]}}),
+                    );
+                }
             }
         });
         (format!("http://{address}"), handle)
@@ -1467,6 +2087,102 @@ mod tests {
     }
 
     #[test]
+    fn attaches_timestamped_spoken_segments_to_the_matching_visual_frames() {
+        let frame = |description: &str| FrameAnalysis {
+            description: description.to_owned(),
+            labels: Vec::new(),
+            visible_text: Vec::new(),
+            entities: Vec::new(),
+            actions: Vec::new(),
+            dialogue: Vec::new(),
+            setting: None,
+            situation: None,
+            confidence: Some(0.9),
+        };
+        let mut analyses = vec![
+            (0, frame("Opening frame")),
+            (5_000, frame("Middle frame")),
+            (10_000, frame("Later frame")),
+        ];
+        attach_transcript_segments(
+            &mut analyses,
+            &[
+                TranscriptSegment {
+                    start: 1.0,
+                    end: 2.0,
+                    text: "We should follow the trail".to_owned(),
+                },
+                TranscriptSegment {
+                    start: 6.0,
+                    end: 7.0,
+                    text: "There is someone ahead".to_owned(),
+                },
+            ],
+        );
+
+        assert_eq!(analyses[0].1.dialogue, vec!["We should follow the trail"]);
+        assert_eq!(analyses[1].1.dialogue, vec!["There is someone ahead"]);
+        assert!(analyses[2].1.dialogue.is_empty());
+    }
+
+    #[test]
+    fn sends_timestamped_openai_transcription_as_multipart_audio() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("stub should accept a request");
+            let (request_line, headers, body) = read_raw_stub_request(&mut stream);
+            assert!(request_line.starts_with("POST /audio/transcriptions "));
+            assert_eq!(
+                stub_header(&headers, "authorization"),
+                Some("Bearer openai-test-key")
+            );
+            let content_type = stub_header(&headers, "content-type").unwrap_or_default();
+            assert!(content_type.starts_with("multipart/form-data; boundary="));
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains("name=\"model\""));
+            assert!(body.contains("whisper-1"));
+            assert!(body.contains("name=\"response_format\""));
+            assert!(body.contains("verbose_json"));
+            assert!(body.contains("name=\"timestamp_granularities[]\""));
+            assert!(body.contains("segment"));
+            assert!(body.contains("filename=\"speech.mp3\""));
+            write_stub_response(
+                &mut stream,
+                &json!({
+                    "segments": [
+                        {"start": 1.25, "end": 2.75, "text": "Follow the trail"}
+                    ]
+                }),
+            );
+        });
+        let audio_path = std::env::temp_dir().join("mediaindex-transcription-test-speech.mp3");
+        fs::write(&audio_path, b"fake mp3 bytes").expect("fixture audio should write");
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::OpenAI),
+            api_key: Some("openai-test-key".to_owned()),
+            base_url: Some(format!("http://{address}")),
+            transcribe_audio: Some(true),
+            ..Default::default()
+        }))
+        .expect("OpenAI settings should be valid");
+        let client = build_http_client().expect("HTTP client should build");
+
+        let transcript = transcribe_openai_audio(&client, &audio_path, &settings)
+            .expect("transcription should parse");
+        let _ = fs::remove_file(&audio_path);
+        server.join().expect("stub should finish cleanly");
+
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].text, "Follow the trail");
+        assert_eq!(
+            settings.model_namespace(),
+            "openai:gpt-5.6-luna:text-embedding-3-small:speech-whisper-1"
+        );
+    }
+
+    #[test]
     fn builds_local_settings_without_an_api_key() {
         let settings = AiSettings::from_request(Some(AiRequestConfig {
             provider: Some(AiProvider::Local),
@@ -1477,7 +2193,98 @@ mod tests {
         assert_eq!(settings.provider, AiProvider::Local);
         assert_eq!(settings.vision_model, DEFAULT_LOCAL_VISION_MODEL);
         assert_eq!(settings.embedding_model, DEFAULT_LOCAL_EMBEDDING_MODEL);
-        assert_eq!(settings.model_namespace(), "local:gemma4:embeddinggemma");
+        assert_eq!(
+            settings.model_namespace(),
+            "local:gemma4:e2b:embeddinggemma"
+        );
+    }
+
+    #[test]
+    fn uses_supported_gemini_defaults() {
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::Gemini),
+            api_key: Some("test-key".to_owned()),
+            ..Default::default()
+        }))
+        .expect("Gemini settings should be valid");
+
+        assert_eq!(settings.vision_model, "gemini-3.8-flash");
+        assert_eq!(settings.embedding_model, "gemini-embedding-2");
+    }
+
+    #[test]
+    fn validates_openai_vision_and_embedding_connection_contract() {
+        let (base_url, server) = spawn_openai_connection_stub();
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::OpenAI),
+            api_key: Some("openai-test-key".to_owned()),
+            base_url: Some(base_url),
+            ..Default::default()
+        }))
+        .expect("OpenAI settings should be valid");
+
+        let report = test_connection(&settings).expect("OpenAI connection should validate");
+        server.join().expect("OpenAI stub should finish");
+        assert_eq!(report.provider, "openai");
+        assert_eq!(report.vision_model, "gpt-5.6-luna");
+        assert_eq!(report.embedding_model, "text-embedding-3-small");
+        assert_eq!(report.embedding_dimensions, 3);
+    }
+
+    #[test]
+    fn validates_gemini_auth_header_and_embedding_2_contract() {
+        let (base_url, server) = spawn_gemini_connection_stub();
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::Gemini),
+            api_key: Some("gemini-test-key".to_owned()),
+            base_url: Some(base_url),
+            ..Default::default()
+        }))
+        .expect("Gemini settings should be valid");
+
+        let report = test_connection(&settings).expect("Gemini connection should validate");
+        server.join().expect("Gemini stub should finish");
+        assert_eq!(report.provider, "gemini");
+        assert_eq!(report.vision_model, "gemini-3.8-flash");
+        assert_eq!(report.embedding_model, "gemini-embedding-2");
+        assert_eq!(report.embedding_dimensions, 3);
+    }
+
+    #[test]
+    fn validates_gemini_oauth_bearer_and_quota_project_contract() {
+        let (base_url, server) = spawn_gemini_oauth_connection_stub();
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::Gemini),
+            auth_mode: Some("oauth".to_owned()),
+            api_key: Some("google-oauth-token".to_owned()),
+            google_project_id: Some("mediaindex-oauth-test".to_owned()),
+            base_url: Some(base_url),
+            ..Default::default()
+        }))
+        .expect("Gemini OAuth settings should be valid");
+
+        let report = test_connection(&settings).expect("Gemini OAuth should validate");
+        server.join().expect("Gemini OAuth stub should finish");
+        assert_eq!(report.provider, "gemini");
+        assert_eq!(report.embedding_dimensions, 3);
+    }
+
+    #[test]
+    fn api_errors_name_provider_specific_recovery() {
+        let gemini = api_failure_message(
+            "Gemini vision model check",
+            reqwest::StatusCode::FORBIDDEN,
+            "permission denied",
+        );
+        assert!(gemini.contains("auth key"));
+        assert!(gemini.contains("September 2026"));
+
+        let local = api_failure_message(
+            "Local AI vision model check",
+            reqwest::StatusCode::NOT_FOUND,
+            "model not found",
+        );
+        assert!(local.contains("ollama pull <model>"));
     }
 
     #[test]
@@ -1516,6 +2323,19 @@ mod tests {
         );
         assert_eq!(openai_reasoning_effort("gpt-5.6-terra"), Some("low"));
         assert_eq!(openai_reasoning_effort("gpt-4.1-mini"), None);
+    }
+
+    #[test]
+    fn corrects_the_common_zero_four_mini_model_typo() {
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::OpenAI),
+            api_key: Some("test-key".to_owned()),
+            vision_model: Some("04-mini".to_owned()),
+            ..Default::default()
+        }))
+        .expect("OpenAI settings should be valid");
+
+        assert_eq!(settings.vision_model, "o4-mini");
     }
 
     #[test]
@@ -1562,12 +2382,25 @@ mod tests {
             base_url: Some(base_url),
             sample_interval_seconds: Some(1),
             max_frames: Some(24),
+            transcribe_audio: Some(true),
             ..Default::default()
         }))
         .expect("stub settings should be valid");
         let progress = std::cell::RefCell::new(Vec::new());
+        let metadata = MediaMetadata {
+            duration_ms: None,
+            size_bytes: None,
+            container: Some("mp4".to_owned()),
+            video_codec: Some("h264".to_owned()),
+            audio_codec: Some("aac".to_owned()),
+            width: None,
+            height: None,
+            frame_rate: None,
+            start_time: None,
+            creation_time: None,
+        };
 
-        let annotations = analyze_file_with_progress(&video, None, &settings, |event| {
+        let annotations = analyze_file_with_progress(&video, Some(&metadata), &settings, |event| {
             progress.borrow_mut().push(event.percent);
         })
         .expect("real video should complete the OpenAI response pipeline");
@@ -1597,6 +2430,9 @@ mod tests {
                     .contains(&"on-screen text: eliminated".to_owned())
                 && annotation.embedding == vec![1.0, 0.0, 0.5]
         }));
+        assert!(annotations.iter().any(|annotation| annotation
+            .labels
+            .contains(&"dialogue: enemy eliminated".to_owned())));
         let progress = progress.into_inner();
         assert_eq!(progress.first(), Some(&1));
         assert_eq!(progress.last(), Some(&100));

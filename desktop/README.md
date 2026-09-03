@@ -76,6 +76,7 @@ The desktop shell now includes the first local scanner slice from issue [#3](htt
 - cached hashes and FFprobe metadata on repeat scans when path, size, and modification time are unchanged;
 - folder hashing/metadata work and local or AI searches run off the Tauri UI thread, so long scans and provider requests do not freeze the window;
 - a 500-result render cap so a large search result cannot freeze the desktop window;
+- footage presented as dense contact sheets grouped by its real source folder;
 - explicit AI analysis of sampled frames with timestamped descriptions and embeddings for natural-language search.
 - restoration of the last successfully indexed library after an app restart, so existing clips and AI analysis remain immediately available.
 
@@ -90,9 +91,11 @@ AI analysis is explicit because it sends sampled JPEG frames to the configured
 AI provider and can consume time or API credits. Configure it in the app:
 
 1. Open **AI connection** in the left sidebar.
-2. Choose **Local (Ollama)**, **OpenAI (ChatGPT API)**, or **Google Gemini API**.
+2. Choose **Local (Ollama)**, **OpenAI API**, or **Google Gemini API**.
 3. Enter the API key for a cloud provider, check the model names and base URL,
-   then press **Test connection** and **Save settings**. OpenAI users can choose
+   then press **Test connection** and **Save settings**. The connection test
+   verifies both the selected vision model and a real embedding response before
+   accepting the configuration. OpenAI users can choose
    the budget GPT-5.6 Luna preset or the more detailed GPT-5.6 Terra preset.
    Luna is the default for cost-sensitive analysis; Terra is roughly ten times
    Luna's model token price and should be reserved for difficult footage. See
@@ -107,11 +110,19 @@ AI provider and can consume time or API credits. Configure it in the app:
 Non-secret settings are stored in this computer's local app storage and are not
 committed to the repository. A cloud API key is kept only in the current app
 session; older persisted keys are removed from local storage when the updated
-app starts. **OpenAI (ChatGPT API)** means the OpenAI developer API, not the
+app starts. **OpenAI API** means the OpenAI developer API, not the
 ChatGPT website subscription.
 
+The supported Gemini defaults are **Gemini 3.8 Flash** for sampled-frame vision
+and **Gemini Embedding 2** for search vectors. Gemini requests authenticate with
+the `x-goog-api-key` header; the key is never appended to a URL. Google has
+retired older embedding model names, so saved `text-embedding-004` or
+`embedding-001` configurations are migrated to Gemini Embedding 2. Use a Gemini
+API key created in Google AI Studio: restricted or unrestricted legacy standard
+Google Cloud API keys may be rejected by the Gemini API.
+
 For the local option, install and run [Ollama](https://ollama.com/), then make
-the selected vision and embedding models available (for example `gemma4` and
+the selected vision and embedding models available (by default `gemma4:e2b` and
 `embeddinggemma`). The default endpoint is `http://127.0.0.1:11434`.
 
 FFmpeg is resolved from the optional path in **AI connection**, then from the
@@ -154,6 +165,10 @@ similarity alone is rejected. **Balanced** and **Broad** progressively expand
 discovery. If the provider, vision model, or
 embedding model changes, run **Analyze with AI** again; incompatible provider
 annotations are intentionally kept separate.
+
+Embedding spaces from different providers or models are not interchangeable.
+After changing either model, enable **Reanalyze existing clips** once so every
+searchable moment is stored in the active provider/model namespace.
 
 AI analysis runs in a background worker, so the desktop window remains
 responsive while FFmpeg and network requests are in progress. While analysis

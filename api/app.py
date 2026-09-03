@@ -82,6 +82,13 @@ class ProjectPayload(ContractModel):
     owner_user_id: str
 
 
+class ProjectChangesPayload(ContractModel):
+    current_cursor: int = Field(ge=0)
+    since_cursor: int = Field(ge=0)
+    assets: dict[str, object]
+    local_files: dict[str, object]
+
+
 app = FastAPI(title="MediaIndex API", version="1.0.0")
 _sync_server = InMemorySyncServer()
 _project_names: dict[str, str] = {}
@@ -153,3 +160,22 @@ def sync_project(
         ) from error
 
     return SyncResponsePayload.model_validate(response)
+
+
+@app.get(
+    "/v1/projects/{project_id}/changes",
+    response_model=ProjectChangesPayload,
+)
+def get_project_changes(
+    project_id: UUID,
+    user_id: UserId,
+    since_cursor: int = 0,
+) -> ProjectChangesPayload:
+    try:
+        changes = _sync_server.get_changes(str(project_id), user_id, since_cursor=since_cursor)
+    except ProjectNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except AuthorizationError as error:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(error)) from error
+
+    return ProjectChangesPayload.model_validate(changes)

@@ -50,13 +50,28 @@ and AI connection tests run on background workers rather than the Tauri UI
 thread. Selecting a new folder keeps **Analyze with AI** disabled until that
 folder has been indexed successfully.
 
+**Current folder** is always scoped to the folder most recently chosen with
+**Select Footage Folder**. Selecting another folder does not mix earlier clips
+into this view and does not mark clips from other indexed roots as missing.
+**Analyzed archive** is the explicit cross-folder view: it lists only clips with
+saved AI annotations and preserves their real source-folder grouping.
+
+An analyzed clip shows **View AI analysis** without loading every annotation up
+front. Opening it loads the saved SQLite data on demand and explains how raw
+timestamp samples become contextual AI moments. The detail view exposes each
+full, untruncated description, start/end time, confidence, all stored context
+labels, and the provider/model namespace. Each moment can be previewed at its
+starting timestamp. Analyses made with different models remain grouped
+separately; reanalysis replaces only the selected model's own rows.
+
 ## AI search
 
 AI search is a separate, explicit workflow:
 
-1. Open **AI connection** and choose **Local (Ollama)**, **OpenAI (ChatGPT API)**,
-   or **Google Gemini API**. Add the cloud API key when needed, verify the
-   models/base URL, press **Test connection**, and save the settings. For
+1. Open **AI connection** and choose **Local (Ollama)**, **OpenAI API**,
+   or **Google Gemini API**. Add the cloud API key when needed, or use Gemini's
+   **Login with Google** and select a Google Cloud Desktop OAuth client JSON.
+   Verify the models/base URL, press **Test connection**, and save the settings. For
    OpenAI, choose GPT-5.6 Luna as the budget default or GPT-5.6 Terra only when
    recognition detail is worth roughly ten times Luna's model token price; use
    the [official model catalog](https://developers.openai.com/api/docs/models)
@@ -64,22 +79,31 @@ AI search is a separate, explicit workflow:
    **Library context** is optional: use it to list a project/franchise, setting,
    or possible fictional characters for an unfamiliar collection. The model is
    instructed to use this only when it agrees with the visible evidence.
+   The catalog also includes `gpt-4o-mini` and legacy `o4-mini`. A saved
+   `04-mini` typo is normalized to the real `o4-mini` model ID.
 2. Select a footage folder and wait for deterministic indexing to finish.
 3. Press **Analyze with AI**. MediaIndex samples frames, stores descriptions
    and embeddings locally, and reports any per-file failures. Clips already
    analyzed with the selected provider/models are skipped by default so repeat
-   clicks do not spend credits again. **Reanalyze existing clips** is an
-   explicit one-run override.
+   clicks do not spend credits again. If every clip is already analyzed, the
+   app asks before replacing anything. **Reanalyze existing clips** is an
+   explicit one-run override and always warns that same-model annotations will
+   be replaced and cloud requests may incur new cost.
 4. Enter a natural-language query in the **AI Search** field, for example
    `Fortnite kill`, `enemy elimination`, or `player victory`.
 
 AI results are ranked by embedding similarity and include the matching clip
-timestamp. Adjacent annotations from the same video within three seconds are
-coalesced after ranking, retaining the best-scoring timestamp for that event.
+time range. The index derives an adaptive merge window from that video's frame
+sampling cadence. Semantically similar adjacent frames become one range, while
+meaningful changes in action, setting, or situation start a new moment. Dialogue
+and readable on-screen text remain searchable inside the combined range without
+splitting an otherwise continuous scene every time the words change.
 Results are displayed as visual cards ordered by the best match for each video.
 FFmpeg generates and caches a local thumbnail for the best matching timestamp;
 clicking it opens Preview at that moment. Other moments are kept in a compact
-chronological list without repeating the featured timestamp. **Focused** mode is the default and applies an adaptive
+chronological list without repeating the featured timestamp. **Full description
+& analysis** opens the same saved-analysis inspector, so clipped card text never
+hides the complete result or the surrounding moments. **Focused** mode is the default and applies an adaptive
 score window, an absolute relevance floor, and an eight-video/two-moment-per-video
 cap. Exact or inflected on-screen text and labels receive enough ranking weight
 to survive that floor, while generic embedding similarity alone is filtered.
@@ -97,14 +121,24 @@ Ollama analysis remains sequential. The provider and model name are stored with
 each annotation, so embeddings from incompatible models are not mixed in one
 search.
 
-Before a cloud analysis, MediaIndex performs a local preflight and asks for
-confirmation with the unique-video count, maximum sampled-frame count, and
-maximum vision-batch count. Identical content found at multiple paths is counted
-and analyzed once. Cancelling this confirmation sends no API request.
+Before any analysis, MediaIndex performs a local preflight and asks for
+confirmation with the unique-video count, duration-based estimated sampled
+frames/vision requests, and configured upper bounds. Identical content found at
+multiple paths is counted and analyzed once. Cloud preflights also show the
+upload/request bounds. A model-aware rough estimate is available on the first
+run; the first completed run calibrates a machine-local per-model estimate for
+later preflights, and an in-progress run shows a live ETA. Cancelling
+confirmation sends no API request.
 
 The vision prompt requests recognizable fictional characters and franchises,
 other visible entities, actions and interactions, the setting, the broader
-situation, and readable text from HUDs, subtitles, signs, and overlays. It does
+situation, and readable text from HUDs, subtitles, signs, and overlays. Visible
+subtitle/caption dialogue is indexed separately. In OpenAI mode, **Transcribe
+spoken audio with timestamps** is enabled by default and uses `whisper-1` so
+speech that is absent from the image is searchable at the matching moment. The
+app extracts a mono 16 kHz, 32 kbit/s MP3 only for the configured analysis span;
+the original video is not uploaded. Gemini and Local Ollama currently index
+visible dialogue only. Vision analysis does
 not identify a real person from their face alone. Search ranking combines
 semantic similarity with keyword matching and light inflection handling
 (`kill`/`killed`, `elimination`/`eliminated`). For short-lived events, set
@@ -119,6 +153,7 @@ remains interactive during long analyses.
 
 For **Local (Ollama)**, Ollama must be running at the configured base URL and
 the selected models must already be installed. For cloud providers, the app
-uses the API directly; a ChatGPT web subscription is not an API key. The API
-key is kept only for the current app session and is not written to the
-repository or persistent browser storage.
+uses the API directly; a ChatGPT web subscription is not an API key. API keys
+are kept only for the current app session, and Gemini OAuth access tokens only
+in native process memory. Neither is written to the repository or persistent
+WebView storage.
