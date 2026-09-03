@@ -1,5 +1,5 @@
 use base64::Engine;
-use reqwest::blocking::{Client, Response};
+use reqwest::blocking::{multipart, Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::error::Error as StdError;
@@ -12,6 +12,7 @@ use crate::metadata::MediaMetadata;
 
 const DEFAULT_OPENAI_VISION_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_OPENAI_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+const DEFAULT_OPENAI_TRANSCRIPTION_MODEL: &str = "whisper-1";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_GEMINI_VISION_MODEL: &str = "gemini-3.8-flash";
 const DEFAULT_GEMINI_EMBEDDING_MODEL: &str = "gemini-embedding-2";
@@ -63,6 +64,10 @@ pub struct AiRequestConfig {
     pub sample_interval_seconds: Option<u64>,
     pub max_frames: Option<u64>,
     pub context_hint: Option<String>,
+    pub transcribe_audio: Option<bool>,
+    pub transcription_model: Option<String>,
+    pub auth_mode: Option<String>,
+    pub google_project_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -125,6 +130,10 @@ pub struct AiSettings {
     sample_interval_ms: u64,
     max_frames_per_file: usize,
     context_hint: Option<String>,
+    transcribe_audio: bool,
+    transcription_model: String,
+    gemini_uses_oauth: bool,
+    google_project_id: Option<String>,
 }
 
 fn sanitize_api_key(raw: &str) -> String {
@@ -162,6 +171,9 @@ impl AiSettings {
                     AiProvider::Local
                 }
             });
+        let gemini_uses_oauth =
+            provider == AiProvider::Gemini && request.auth_mode.as_deref() == Some("oauth");
+        let google_project_id = non_empty(request.google_project_id.clone());
 
         let api_key = non_empty(request.api_key).or_else(|| match provider {
             AiProvider::OpenAI => env_non_empty("MEDIAINDEX_OPENAI_API_KEY")
@@ -178,11 +190,19 @@ impl AiSettings {
                         .to_owned()
                 }
                 AiProvider::Gemini => {
-                    "Gemini needs an API key. Add it under AI connection or set MEDIAINDEX_GEMINI_API_KEY."
-                        .to_owned()
+                    if gemini_uses_oauth {
+                        "Google login is missing or expired. Press Login with Google and try again."
+                            .to_owned()
+                    } else {
+                        "Gemini needs an API key or Google login. Add one under AI connection or set MEDIAINDEX_GEMINI_API_KEY."
+                            .to_owned()
+                    }
                 }
                 AiProvider::Local => unreachable!(),
             });
+        }
+        if gemini_uses_oauth && google_project_id.is_none() {
+            return Err("Google login did not provide a Cloud project ID. Log in again with a Desktop OAuth client JSON that contains project_id.".to_owned());
         }
 
         let (default_vision_model, default_embedding_model, default_base_url) = match provider {
@@ -254,6 +274,10 @@ impl AiSettings {
         let ffmpeg_executable = resolve_ffmpeg_executable(request.ffmpeg_path);
         let context_hint =
             non_empty(request.context_hint).or_else(|| env_non_empty("MEDIAINDEX_AI_CONTEXT"));
+        let transcribe_audio =
+            provider == AiProvider::OpenAI && request.transcribe_audio.unwrap_or(false);
+        let transcription_model = non_empty(request.transcription_model)
+            .unwrap_or_else(|| DEFAULT_OPENAI_TRANSCRIPTION_MODEL.to_owned());
 
         Ok(Self {
             provider,
@@ -265,16 +289,25 @@ impl AiSettings {
             sample_interval_ms: sample_interval_seconds.saturating_mul(1_000),
             max_frames_per_file,
             context_hint,
+            transcribe_audio,
+            transcription_model,
+            gemini_uses_oauth,
+            google_project_id,
         })
     }
 
     pub fn model_namespace(&self) -> String {
-        format!(
+        let base = format!(
             "{}:{}:{}",
             self.provider.name(),
             self.vision_model,
             self.embedding_model
-        )
+        );
+        if self.transcribe_audio {
+            format!("{base}:speech-{}", self.transcription_model)
+        } else {
+            base
+        }
     }
 
     pub fn parallel_file_limit(&self) -> usize {
@@ -300,6 +333,21 @@ impl AiSettings {
     pub(crate) fn sample_interval_ms(&self) -> u64 {
         self.sample_interval_ms
     }
+
+    pub(crate) fn transcribes_audio(&self) -> bool {
+        self.transcribe_audio
+    }
+}
+
+fn authorize_gemini(request: RequestBuilder, settings: &AiSettings) -> RequestBuilder {
+    if settings.gemini_uses_oauth {
+        request.bearer_auth(&settings.api_key).header(
+            "x-goog-user-project",
+            settings.google_project_id.as_deref().unwrap_or_default(),
+        )
+    } else {
+        request.header("x-goog-api-key", &settings.api_key)
+    }
 }
 
 pub fn resolve_ffmpeg_executable(configured_path: Option<String>) -> PathBuf {
@@ -312,27 +360,27 @@ pub fn resolve_ffmpeg_executable(configured_path: Option<String>) -> PathBuf {
 
 pub fn analyze_file(
     path: &Path,
-    _metadata: Option<&MediaMetadata>,
+    metadata: Option<&MediaMetadata>,
     settings: &AiSettings,
 ) -> Result<Vec<AiAnnotation>, String> {
-    analyze_file_with_progress(path, _metadata, settings, |_| {})
+    analyze_file_with_progress(path, metadata, settings, |_| {})
 }
 
 pub fn analyze_file_with_progress<F>(
     path: &Path,
-    _metadata: Option<&MediaMetadata>,
+    metadata: Option<&MediaMetadata>,
     settings: &AiSettings,
     progress: F,
 ) -> Result<Vec<AiAnnotation>, String>
 where
     F: Fn(AiFileProgress),
 {
-    analyze_file_with_progress_and_cancel(path, _metadata, settings, progress, || false)
+    analyze_file_with_progress_and_cancel(path, metadata, settings, progress, || false)
 }
 
 pub fn analyze_file_with_progress_and_cancel<F, C>(
     path: &Path,
-    _metadata: Option<&MediaMetadata>,
+    metadata: Option<&MediaMetadata>,
     settings: &AiSettings,
     progress: F,
     is_cancelled: C,
@@ -353,6 +401,11 @@ where
         percent: 10,
         phase: "Analyzing frames",
     });
+    let should_transcribe_audio = settings.transcribe_audio
+        && metadata
+            .and_then(|metadata| metadata.audio_codec.as_deref())
+            .is_some();
+    let vision_percent_span = if should_transcribe_audio { 60 } else { 80 };
     let mut analyses = Vec::with_capacity(frames.len());
     let mut frame_errors = Vec::new();
     let mut processed_frames = 0usize;
@@ -380,9 +433,9 @@ where
         }
         ensure_analysis_not_cancelled(&is_cancelled)?;
         processed_frames += frame_batch.len();
-        let vision_percent = 10 + ((processed_frames * 80) / frames.len()) as u8;
+        let vision_percent = 10 + ((processed_frames * vision_percent_span) / frames.len()) as u8;
         progress(AiFileProgress {
-            percent: vision_percent.min(90),
+            percent: vision_percent.min(10 + vision_percent_span as u8),
             phase: "Analyzing frames",
         });
     }
@@ -395,6 +448,28 @@ where
                 .cloned()
                 .unwrap_or_else(|| "no frame analysis was returned".to_owned())
         ));
+    }
+
+    if should_transcribe_audio {
+        progress(AiFileProgress {
+            percent: 72,
+            phase: "Extracting speech audio",
+        });
+        ensure_analysis_not_cancelled(&is_cancelled)?;
+        let audio_path = extract_audio_track(path, settings)?;
+        progress(AiFileProgress {
+            percent: 78,
+            phase: "Transcribing speech",
+        });
+        let transcription = transcribe_openai_audio(&client, &audio_path, settings);
+        let _ = fs::remove_file(&audio_path);
+        let transcript_segments = transcription?;
+        ensure_analysis_not_cancelled(&is_cancelled)?;
+        attach_transcript_segments(&mut analyses, &transcript_segments);
+        progress(AiFileProgress {
+            percent: 90,
+            phase: "Speech indexed",
+        });
     }
 
     let embedding_texts = analyses
@@ -495,6 +570,147 @@ where
     Ok(annotations)
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct TranscriptSegment {
+    start: f64,
+    end: f64,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TimestampedTranscript {
+    #[serde(default)]
+    segments: Vec<TranscriptSegment>,
+}
+
+fn extract_audio_track(path: &Path, settings: &AiSettings) -> Result<PathBuf, String> {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    let output_path = std::env::temp_dir().join(format!(
+        "mediaindex-speech-{}-{unique}.mp3",
+        std::process::id()
+    ));
+    let maximum_seconds = settings
+        .sample_interval_ms
+        .saturating_mul(settings.max_frames_per_file as u64)
+        .div_ceil(1_000)
+        .max(1);
+    let mut command = Command::new(&settings.ffmpeg_executable);
+    configure_hidden_process(&mut command);
+    let output = command
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", "-t",
+        ])
+        .arg(maximum_seconds.to_string())
+        .args(["-f", "mp3", "-y"])
+        .arg(&output_path)
+        .output()
+        .map_err(|error| {
+            format!(
+                "FFmpeg could not extract speech audio from {}: {error}",
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&output_path);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!(
+                "FFmpeg could not extract speech audio from {}",
+                path.display()
+            )
+        } else {
+            format!(
+                "FFmpeg could not extract speech audio from {}: {stderr}",
+                path.display()
+            )
+        });
+    }
+    if !output_path.is_file()
+        || fs::metadata(&output_path)
+            .map(|value| value.len())
+            .unwrap_or(0)
+            == 0
+    {
+        let _ = fs::remove_file(&output_path);
+        return Err(format!(
+            "FFmpeg produced no speech audio for {}",
+            path.display()
+        ));
+    }
+    Ok(output_path)
+}
+
+fn transcribe_openai_audio(
+    client: &Client,
+    audio_path: &Path,
+    settings: &AiSettings,
+) -> Result<Vec<TranscriptSegment>, String> {
+    if settings.provider != AiProvider::OpenAI {
+        return Ok(Vec::new());
+    }
+    let audio = fs::read(audio_path).map_err(|error| {
+        format!(
+            "cannot read extracted speech audio {}: {error}",
+            audio_path.display()
+        )
+    })?;
+    let response = execute_with_retry("OpenAI speech transcription", || {
+        let part = multipart::Part::bytes(audio.clone())
+            .file_name("speech.mp3")
+            .mime_str("audio/mpeg")?;
+        let form = multipart::Form::new()
+            .text("model", settings.transcription_model.clone())
+            .text("response_format", "verbose_json")
+            .text("timestamp_granularities[]", "segment")
+            .part("file", part);
+        client
+            .post(format!("{}/audio/transcriptions", settings.base_url))
+            .bearer_auth(&settings.api_key)
+            .multipart(form)
+            .send()
+    })?;
+    let body = read_json_response(response, "OpenAI speech transcription")?;
+    let transcript: TimestampedTranscript = serde_json::from_value(body).map_err(|error| {
+        format!("OpenAI speech transcription returned invalid timestamps: {error}")
+    })?;
+    Ok(transcript
+        .segments
+        .into_iter()
+        .filter_map(|segment| {
+            let text = segment.text.trim().to_owned();
+            (!text.is_empty() && segment.start.is_finite() && segment.end.is_finite()).then_some(
+                TranscriptSegment {
+                    start: segment.start.max(0.0),
+                    end: segment.end.max(segment.start).max(0.0),
+                    text,
+                },
+            )
+        })
+        .collect())
+}
+
+fn attach_transcript_segments(
+    analyses: &mut [(u64, FrameAnalysis)],
+    segments: &[TranscriptSegment],
+) {
+    if analyses.is_empty() {
+        return;
+    }
+    for segment in segments {
+        let midpoint_ms = (((segment.start + segment.end) / 2.0) * 1_000.0).max(0.0) as u64;
+        let target = analyses
+            .partition_point(|(timestamp_ms, _)| *timestamp_ms <= midpoint_ms)
+            .saturating_sub(1)
+            .min(analyses.len() - 1);
+        analyses[target].1.dialogue.push(segment.text.clone());
+    }
+}
+
 fn ensure_analysis_not_cancelled<C>(is_cancelled: &C) -> Result<(), String>
 where
     C: Fn() -> bool,
@@ -541,10 +757,11 @@ fn validate_vision_model(client: &Client, settings: &AiSettings) -> Result<(), S
                 .send()
         })?,
         AiProvider::Gemini => execute_with_retry("Gemini vision model check", || {
-            client
-                .get(format!("{}/models/{clean_model}", settings.base_url))
-                .header("x-goog-api-key", &settings.api_key)
-                .send()
+            authorize_gemini(
+                client.get(format!("{}/models/{clean_model}", settings.base_url)),
+                settings,
+            )
+            .send()
         })?,
         AiProvider::Local => execute_with_retry("Local AI vision model check", || {
             client
@@ -1018,9 +1235,7 @@ fn describe_gemini(
         "generationConfig": {"responseMimeType": "application/json"}
     });
     let response = execute_with_retry("Gemini vision", || {
-        client
-            .post(&url)
-            .header("x-goog-api-key", &settings.api_key)
+        authorize_gemini(client.post(&url), settings)
             .json(&payload)
             .send()
     })?;
@@ -1205,9 +1420,7 @@ fn request_single_gemini_embedding(
         payload["taskType"] = json!(task_type);
     }
     let response = execute_with_retry("Gemini embedding", || {
-        client
-            .post(&url)
-            .header("x-goog-api-key", &settings.api_key)
+        authorize_gemini(client.post(&url), settings)
             .json(&payload)
             .send()
     })
@@ -1492,6 +1705,46 @@ mod tests {
         (request_line, headers, body)
     }
 
+    fn read_raw_stub_request(stream: &mut std::net::TcpStream) -> (String, Vec<String>, Vec<u8>) {
+        use std::io::Read;
+
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 8_192];
+        let (header_end, content_length) = loop {
+            let read = stream.read(&mut buffer).expect("stub request should read");
+            assert!(read > 0, "stub request closed before its headers arrived");
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_text = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = header_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or_default();
+            break (header_end + 4, content_length);
+        };
+        while request.len() < header_end + content_length {
+            let read = stream.read(&mut buffer).expect("stub body should read");
+            assert!(read > 0, "stub request closed before its body arrived");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let header_text = String::from_utf8_lossy(&request[..header_end]);
+        let mut header_lines = header_text.lines();
+        let request_line = header_lines.next().unwrap_or_default().to_owned();
+        let headers = header_lines.map(str::to_owned).collect::<Vec<_>>();
+        (
+            request_line,
+            headers,
+            request[header_end..header_end + content_length].to_vec(),
+        )
+    }
+
     fn stub_header<'a>(headers: &'a [String], name: &str) -> Option<&'a str> {
         headers.iter().find_map(|line| {
             let (header_name, value) = line.split_once(':')?;
@@ -1520,7 +1773,30 @@ mod tests {
         let address = listener.local_addr().expect("stub should have an address");
         let handle = std::thread::spawn(move || loop {
             let (mut stream, _) = listener.accept().expect("stub should accept a request");
-            let (request_line, _headers, request) = read_stub_request(&mut stream);
+            let (request_line, headers, raw_body) = read_raw_stub_request(&mut stream);
+            if request_line.starts_with("POST /audio/transcriptions ") {
+                assert_eq!(
+                    stub_header(&headers, "authorization"),
+                    Some("Bearer stub-api-key")
+                );
+                let body = String::from_utf8_lossy(&raw_body);
+                assert!(body.contains("name=\"timestamp_granularities[]\""));
+                assert!(body.contains("filename=\"speech.mp3\""));
+                write_stub_response(
+                    &mut stream,
+                    &json!({
+                        "segments": [
+                            {"start": 0.2, "end": 0.8, "text": "enemy eliminated"}
+                        ]
+                    }),
+                );
+                continue;
+            }
+            let request: Value = if raw_body.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&raw_body).expect("stub request body should be JSON")
+            };
             if request_line.starts_with("POST /responses ") {
                 let image_count = request
                     .pointer("/input/0/content")
@@ -1560,6 +1836,7 @@ mod tests {
                             "visible_text": ["ELIMINATED"],
                             "entities": ["Fortnite player"],
                             "actions": ["eliminating opponent"],
+                            "dialogue": [],
                             "setting": "forest battlefield",
                             "situation": "battle royale fight",
                             "confidence": 0.98
@@ -1687,6 +1964,40 @@ mod tests {
         (format!("http://{address}"), handle)
     }
 
+    fn spawn_gemini_oauth_connection_stub() -> (String, std::thread::JoinHandle<()>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let handle = std::thread::spawn(move || {
+            for expected_path in [
+                "GET /models/gemini-3.8-flash ",
+                "POST /models/gemini-embedding-2:embedContent ",
+            ] {
+                let (mut stream, _) = listener.accept().expect("OAuth check should connect");
+                let (request_line, headers, _body) = read_stub_request(&mut stream);
+                assert!(request_line.starts_with(expected_path));
+                assert_eq!(
+                    stub_header(&headers, "authorization"),
+                    Some("Bearer google-oauth-token")
+                );
+                assert_eq!(
+                    stub_header(&headers, "x-goog-user-project"),
+                    Some("mediaindex-oauth-test")
+                );
+                assert!(stub_header(&headers, "x-goog-api-key").is_none());
+                if expected_path.starts_with("GET") {
+                    write_stub_response(&mut stream, &json!({"name": "models/gemini-3.8-flash"}));
+                } else {
+                    write_stub_response(
+                        &mut stream,
+                        &json!({"embedding": {"values": [0.75, 0.5, 0.25]}}),
+                    );
+                }
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
     #[test]
     fn extracts_output_text_from_responses_payload() {
         let body = json!({
@@ -1776,6 +2087,102 @@ mod tests {
     }
 
     #[test]
+    fn attaches_timestamped_spoken_segments_to_the_matching_visual_frames() {
+        let frame = |description: &str| FrameAnalysis {
+            description: description.to_owned(),
+            labels: Vec::new(),
+            visible_text: Vec::new(),
+            entities: Vec::new(),
+            actions: Vec::new(),
+            dialogue: Vec::new(),
+            setting: None,
+            situation: None,
+            confidence: Some(0.9),
+        };
+        let mut analyses = vec![
+            (0, frame("Opening frame")),
+            (5_000, frame("Middle frame")),
+            (10_000, frame("Later frame")),
+        ];
+        attach_transcript_segments(
+            &mut analyses,
+            &[
+                TranscriptSegment {
+                    start: 1.0,
+                    end: 2.0,
+                    text: "We should follow the trail".to_owned(),
+                },
+                TranscriptSegment {
+                    start: 6.0,
+                    end: 7.0,
+                    text: "There is someone ahead".to_owned(),
+                },
+            ],
+        );
+
+        assert_eq!(analyses[0].1.dialogue, vec!["We should follow the trail"]);
+        assert_eq!(analyses[1].1.dialogue, vec!["There is someone ahead"]);
+        assert!(analyses[2].1.dialogue.is_empty());
+    }
+
+    #[test]
+    fn sends_timestamped_openai_transcription_as_multipart_audio() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("stub should accept a request");
+            let (request_line, headers, body) = read_raw_stub_request(&mut stream);
+            assert!(request_line.starts_with("POST /audio/transcriptions "));
+            assert_eq!(
+                stub_header(&headers, "authorization"),
+                Some("Bearer openai-test-key")
+            );
+            let content_type = stub_header(&headers, "content-type").unwrap_or_default();
+            assert!(content_type.starts_with("multipart/form-data; boundary="));
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains("name=\"model\""));
+            assert!(body.contains("whisper-1"));
+            assert!(body.contains("name=\"response_format\""));
+            assert!(body.contains("verbose_json"));
+            assert!(body.contains("name=\"timestamp_granularities[]\""));
+            assert!(body.contains("segment"));
+            assert!(body.contains("filename=\"speech.mp3\""));
+            write_stub_response(
+                &mut stream,
+                &json!({
+                    "segments": [
+                        {"start": 1.25, "end": 2.75, "text": "Follow the trail"}
+                    ]
+                }),
+            );
+        });
+        let audio_path = std::env::temp_dir().join("mediaindex-transcription-test-speech.mp3");
+        fs::write(&audio_path, b"fake mp3 bytes").expect("fixture audio should write");
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::OpenAI),
+            api_key: Some("openai-test-key".to_owned()),
+            base_url: Some(format!("http://{address}")),
+            transcribe_audio: Some(true),
+            ..Default::default()
+        }))
+        .expect("OpenAI settings should be valid");
+        let client = build_http_client().expect("HTTP client should build");
+
+        let transcript = transcribe_openai_audio(&client, &audio_path, &settings)
+            .expect("transcription should parse");
+        let _ = fs::remove_file(&audio_path);
+        server.join().expect("stub should finish cleanly");
+
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].text, "Follow the trail");
+        assert_eq!(
+            settings.model_namespace(),
+            "openai:gpt-5.6-luna:text-embedding-3-small:speech-whisper-1"
+        );
+    }
+
+    #[test]
     fn builds_local_settings_without_an_api_key() {
         let settings = AiSettings::from_request(Some(AiRequestConfig {
             provider: Some(AiProvider::Local),
@@ -1840,6 +2247,25 @@ mod tests {
         assert_eq!(report.provider, "gemini");
         assert_eq!(report.vision_model, "gemini-3.8-flash");
         assert_eq!(report.embedding_model, "gemini-embedding-2");
+        assert_eq!(report.embedding_dimensions, 3);
+    }
+
+    #[test]
+    fn validates_gemini_oauth_bearer_and_quota_project_contract() {
+        let (base_url, server) = spawn_gemini_oauth_connection_stub();
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::Gemini),
+            auth_mode: Some("oauth".to_owned()),
+            api_key: Some("google-oauth-token".to_owned()),
+            google_project_id: Some("mediaindex-oauth-test".to_owned()),
+            base_url: Some(base_url),
+            ..Default::default()
+        }))
+        .expect("Gemini OAuth settings should be valid");
+
+        let report = test_connection(&settings).expect("Gemini OAuth should validate");
+        server.join().expect("Gemini OAuth stub should finish");
+        assert_eq!(report.provider, "gemini");
         assert_eq!(report.embedding_dimensions, 3);
     }
 
@@ -1956,12 +2382,25 @@ mod tests {
             base_url: Some(base_url),
             sample_interval_seconds: Some(1),
             max_frames: Some(24),
+            transcribe_audio: Some(true),
             ..Default::default()
         }))
         .expect("stub settings should be valid");
         let progress = std::cell::RefCell::new(Vec::new());
+        let metadata = MediaMetadata {
+            duration_ms: None,
+            size_bytes: None,
+            container: Some("mp4".to_owned()),
+            video_codec: Some("h264".to_owned()),
+            audio_codec: Some("aac".to_owned()),
+            width: None,
+            height: None,
+            frame_rate: None,
+            start_time: None,
+            creation_time: None,
+        };
 
-        let annotations = analyze_file_with_progress(&video, None, &settings, |event| {
+        let annotations = analyze_file_with_progress(&video, Some(&metadata), &settings, |event| {
             progress.borrow_mut().push(event.percent);
         })
         .expect("real video should complete the OpenAI response pipeline");
@@ -1991,6 +2430,9 @@ mod tests {
                     .contains(&"on-screen text: eliminated".to_owned())
                 && annotation.embedding == vec![1.0, 0.0, 0.5]
         }));
+        assert!(annotations.iter().any(|annotation| annotation
+            .labels
+            .contains(&"dialogue: enemy eliminated".to_owned())));
         let progress = progress.into_inner();
         assert_eq!(progress.first(), Some(&1));
         assert_eq!(progress.last(), Some(&100));

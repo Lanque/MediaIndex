@@ -15,7 +15,7 @@ without presenting MediaIndex as a browser-hosted product.
 - Published branch: `origin/feat/performance-cost-and-search-optimizations`
 - Integration target: fetched `origin/main` at `79e2626`
 - Local `main` is stale at `78cb453`. Merge commit `6ef9655` synchronized the
-  feature branch with `origin/main`; the branch is 16 commits ahead and 0 behind
+  feature branch with `origin/main`; the branch is 18 commits ahead and 0 behind
   at this snapshot. Read
   [main-integration-review.md](main-integration-review.md) before changing Git
   history.
@@ -49,9 +49,15 @@ without presenting MediaIndex as a browser-hosted product.
 13. Made per-root reconciliation preserve other folders and retained missing
     clips as discoverable saved AI results.
 14. Replaced fixed timestamp suppression with context-aware time ranges and
-    action/setting/situation/dialogue boundaries.
+    action/setting/situation boundaries while retaining changing dialogue and
+    on-screen text inside the searchable range.
 15. Added reanalysis replacement warnings, duration-based request estimates,
-    measured per-model timing, live ETA, `gpt-4o-mini`, and legacy `o4-mini`.
+    a first-run estimate, measured per-model timing, live ETA, `gpt-4o-mini`,
+    and legacy `o4-mini`.
+16. Added optional timestamped OpenAI speech transcription using a compressed
+    temporary audio track and included speech duration in analysis preflight.
+17. Added native Gemini **Login with Google** using a user-owned Desktop OAuth
+    client JSON, PKCE, a loopback callback, and memory-only access tokens.
 
 ## First actions in the next session
 
@@ -102,18 +108,22 @@ Use the executable or NSIS-installed app, not the Vite browser preview.
 - open the original clip in the system player;
 - restart and confirm the indexed library restores from SQLite;
 - test connection for the selected provider/model pair;
+- when a Google Desktop OAuth client is available, use **Login with Google**,
+  verify the quota project, test Gemini, disconnect, and confirm the token is
+  removed; otherwise test the AI Studio API-key path;
 - run bounded AI analysis, watch progress, cancel midway, and resume;
-- search visible text, an action, an entity, and a general situation;
+- search visible text, spoken dialogue, an action, an entity, and a general situation;
 - confirm adjacent seconds from one event appear as one time range and a real
-  action/setting/dialogue change starts a new range;
+  action/setting/situation change starts a new range while changing dialogue
+  remains searchable within it;
 - confirm repeated analysis warns before replacing same-model moments and the
-  preflight/live progress show an honest calibrated estimate;
+  preflight/live progress show a first-run or calibrated estimate;
 - change embedding model and confirm the UI requires reanalysis;
 - verify no command-prompt window appears during FFmpeg/FFprobe work.
 
 ## GitHub reconciliation
 
-When authenticated, list all open and closed issues/PRs and map the 17
+When authenticated, list all open and closed issues/PRs and map the 18
 post-`origin/main` commits to them. The foundation stack is already merged
 through PR #39, so use one focused follow-up PR rather than recreating that
 stack. The follow-up PR should include:
@@ -123,7 +133,8 @@ stack. The follow-up PR should include:
 - exact automated test output;
 - packaged installer path/artifact name;
 - desktop screenshots;
-- security/privacy statement for sampled cloud frames;
+- security/privacy statement for sampled cloud frames, temporary speech audio,
+  and Gemini memory-only OAuth credentials;
 - explicit known limitations and deferred branch-protection state.
 
 ## Exit criteria

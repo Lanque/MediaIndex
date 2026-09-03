@@ -960,13 +960,7 @@ fn ai_context_is_similar(
     left_labels: &[String],
     right_labels: &[String],
 ) -> bool {
-    for prefix in [
-        "action: ",
-        "setting: ",
-        "situation: ",
-        "dialogue: ",
-        "on-screen text: ",
-    ] {
+    for prefix in ["action: ", "setting: ", "situation: "] {
         let left = labels_with_prefix(left_labels, prefix);
         let right = labels_with_prefix(right_labels, prefix);
         if !left.is_empty() && !right.is_empty() && left.is_disjoint(&right) {
@@ -1555,6 +1549,53 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].timestamp_ms, 0);
         assert_eq!(results[0].end_timestamp_ms, 120_000);
+    }
+
+    #[test]
+    fn keeps_changing_dialogue_searchable_inside_one_continuous_scene() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/forest-talk.mp4", "hash-forest-talk")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        let annotation = |timestamp_ms, dialogue: &str| AiAnnotation {
+            timestamp_ms,
+            description: format!("A man walks through a forest. Dialogue: {dialogue}"),
+            labels: vec![
+                "action: walking".to_owned(),
+                "setting: forest".to_owned(),
+                format!("dialogue: {dialogue}"),
+            ],
+            embedding: vec![1.0, 0.0],
+            confidence: Some(0.9),
+            model: "fixture".to_owned(),
+        };
+        index
+            .replace_ai_annotations(
+                "hash-forest-talk",
+                &[
+                    annotation(0, "follow the trail"),
+                    annotation(10_000, "watch the river"),
+                    annotation(20_000, "we are almost there"),
+                ],
+            )
+            .expect("annotations should persist");
+
+        let results = index
+            .search_ai("watch the river", &[1.0, 0.0], 20, Some("fixture"))
+            .expect("AI search should work");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            (results[0].timestamp_ms, results[0].end_timestamp_ms),
+            (0, 20_000)
+        );
+        assert!(results[0]
+            .labels
+            .iter()
+            .any(|label| label == "dialogue: watch the river"));
     }
 
     #[test]

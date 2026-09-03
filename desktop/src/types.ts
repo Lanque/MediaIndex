@@ -61,6 +61,7 @@ export type AiAnalysisPlan = {
   max_vision_requests: number;
   estimated_sampled_frames: number;
   estimated_vision_requests: number;
+  estimated_audio_seconds: number;
   model: string;
 };
 
@@ -74,10 +75,12 @@ export type AiProgress = {
 };
 
 export type AiProvider = "local" | "openai" | "gemini";
+export type AiAuthMode = "api_key" | "oauth";
 export type AiSearchFocus = "focused" | "balanced" | "broad";
 
 export type AiConfig = {
   provider: AiProvider;
+  authMode: AiAuthMode;
   apiKey: string;
   visionModel: string;
   embeddingModel: string;
@@ -86,7 +89,15 @@ export type AiConfig = {
   sampleIntervalSeconds: number;
   maxFrames: number;
   contextHint: string;
+  transcribeAudio: boolean;
+  transcriptionModel: string;
   reanalyzeExisting: boolean;
+};
+
+export type GeminiOAuthStatus = {
+  connected: boolean;
+  project_id: string | null;
+  expires_at_unix_ms: number | null;
 };
 
 export type AiConnectionReport = {

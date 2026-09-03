@@ -14,11 +14,11 @@ must not be used for review statistics.
 The current `feat/performance-cost-and-search-optimizations` branch now contains
 `origin/main`; it is 0 commits behind. The post-main history consists of the ten
 original performance/provider/UI commits, two focused finishing commits, the
-synchronization merge, the documentation reconciliation, one integration
-cleanup commit, and this published-state update: 16 commits ahead in total at
-this snapshot.
+synchronization merge, documentation reconciliation, integration cleanup,
+published-state update, selected-folder/context-range work, and the current
+speech/OAuth pass: 18 commits ahead in total at this snapshot.
 
-The review delta is approximately 3.3k insertions and 1.3k deletions across 24
+The review delta is approximately 5.2k insertions and 1.4k deletions across 29
 tracked files. The largest areas are the TypeScript desktop interface, its
 visual system, and Rust provider/indexing behavior. Local `.github` Impeccable
 tooling and `.impeccable/` review artifacts are intentionally outside this
@@ -34,9 +34,9 @@ installer produced by `tauri build`.
 | --- | --- | --- |
 | Scan/index | working scanner, metadata, SQLite index | tiered hashing, cache/performance work, background execution |
 | Local search | filters and preview/open foundation | FTS/vector optimizations, 500-result cap, source-folder contact sheets |
-| AI analysis | sampled-frame OpenAI search flow | OpenAI/Gemini/Ollama selection, bounded batches, cancellation, model namespaces |
-| Provider compatibility | earlier model IDs and connection behavior | current catalog, vision plus embedding connection validation, actionable errors |
-| AI results | timestamped matches | focused/balanced/broad relevance and adjacent-moment coalescing per video |
+| AI analysis | sampled-frame OpenAI search flow | OpenAI/Gemini/Ollama selection, bounded batches, cancellation, model namespaces, and timestamped OpenAI speech |
+| Provider compatibility | earlier model IDs and connection behavior | current catalog, vision plus embedding connection validation, Gemini Desktop OAuth, and actionable errors |
+| AI results | timestamped matches | focused/balanced/broad relevance and continuous contextual ranges with changing dialogue retained for search |
 | Interface | responsive desktop preview | Archive Accession Desk visual system and desktop-first information architecture |
 | Documentation | project/architecture/ADR foundation | product brief, design system, provider matrix, release evidence, continuation plan |
 
@@ -73,8 +73,8 @@ this private repository (`gh` returns HTTP 401 and the logged-out page returns
 ## Merge gate
 
 - all Python, Rust, TypeScript, migration, and infrastructure checks pass;
-- provider contract tests prove the OpenAI Bearer and Gemini
-  `x-goog-api-key`/Embedding 2 request shapes;
+- provider contract tests prove OpenAI Bearer, speech multipart, Gemini
+  `x-goog-api-key`, Gemini OAuth Bearer/quota-project, and Embedding 2 request shapes;
 - `cargo fmt --check` and repository diff checks are clean;
 - a release Tauri build produces a working executable and NSIS installer;
 - local preview/open works outside the development server;

@@ -6,6 +6,7 @@ import type {
   AiIndexReport,
   AiSearchFocus,
   AiSearchResult,
+  GeminiOAuthStatus,
   IndexReport,
   SearchFilters,
   SearchResult,
@@ -62,6 +63,18 @@ export async function getAiThumbnail(
 
 export async function testAiConnection(config: AiConfig): Promise<AiConnectionReport> {
   return invoke<AiConnectionReport>("test_ai_connection", { config });
+}
+
+export async function loginGeminiOAuth(clientFilePath: string): Promise<GeminiOAuthStatus> {
+  return invoke<GeminiOAuthStatus>("login_gemini_oauth", { clientFilePath });
+}
+
+export async function getGeminiOAuthStatus(): Promise<GeminiOAuthStatus> {
+  return invoke<GeminiOAuthStatus>("get_gemini_oauth_status");
+}
+
+export async function logoutGeminiOAuth(): Promise<GeminiOAuthStatus> {
+  return invoke<GeminiOAuthStatus>("logout_gemini_oauth");
 }
 
 export async function openIndexedMediaPath(path: string): Promise<void> {

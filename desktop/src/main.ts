@@ -14,6 +14,7 @@ import {
   type AiProvider,
   type AiSearchFocus,
   type AiSearchResult,
+  type GeminiOAuthStatus,
   type IndexReport,
   type ModelPreset,
   type SearchFilters,
@@ -92,7 +93,7 @@ app.innerHTML = `
         <details class="ai-settings" open>
           <summary>AI Vision & Embeddings</summary>
           <p class="settings-help">
-            Original videos stay on your computer. Cloud providers receive only the sampled frame images used for analysis; Local Ollama sends nothing off-device.
+            Original videos stay on your computer. Cloud providers receive sampled frame images; OpenAI can also receive a compressed speech track when timestamped transcription is enabled. Local Ollama sends nothing off-device.
           </p>
 
           <div class="active-model-card" id="active-model-card">
@@ -117,6 +118,9 @@ app.innerHTML = `
               <p id="provider-auth-help"></p>
               <div class="provider-auth-actions">
                 <button class="text-button" id="open-provider-key-page" type="button">Get API key</button>
+                <button class="text-button" id="login-gemini-oauth" type="button">Login with Google</button>
+                <button class="text-button" id="use-gemini-api-key" type="button" hidden>Use API key</button>
+                <button class="text-button" id="logout-gemini-oauth" type="button" hidden>Disconnect Google</button>
                 <button class="text-button" id="open-provider-oauth-docs" type="button">OAuth setup</button>
               </div>
             </div>
@@ -153,6 +157,16 @@ app.innerHTML = `
                   <label>Max frames / video
                     <input id="ai-max-frames" name="max-frames" min="1" type="number" />
                   </label>
+                </div>
+                <div class="speech-settings" id="speech-settings">
+                  <label class="checkbox-field">
+                    <input id="ai-transcribe-audio" name="transcribe-audio" type="checkbox" />
+                    Transcribe spoken audio with timestamps
+                  </label>
+                  <label>Transcription model
+                    <input id="ai-transcription-model" name="transcription-model" placeholder="whisper-1" />
+                  </label>
+                  <p>OpenAI speech transcription uploads a compressed mono audio track for the analyzed time span. Disable this to analyze frames only.</p>
                 </div>
                 <label class="checkbox-field">
                   <input id="ai-reanalyze-existing" name="reanalyze-existing" type="checkbox" />
@@ -303,11 +317,17 @@ const providerAuthPanel = document.querySelector<HTMLElement>("#provider-auth-pa
 const providerAuthHelp = document.querySelector<HTMLElement>("#provider-auth-help");
 const openProviderKeyPageButton = document.querySelector<HTMLButtonElement>("#open-provider-key-page");
 const openProviderOauthDocsButton = document.querySelector<HTMLButtonElement>("#open-provider-oauth-docs");
+const loginGeminiOauthButton = document.querySelector<HTMLButtonElement>("#login-gemini-oauth");
+const useGeminiApiKeyButton = document.querySelector<HTMLButtonElement>("#use-gemini-api-key");
+const logoutGeminiOauthButton = document.querySelector<HTMLButtonElement>("#logout-gemini-oauth");
 const aiVisionModel = document.querySelector<HTMLInputElement>("#ai-vision-model");
 const aiEmbeddingModel = document.querySelector<HTMLInputElement>("#ai-embedding-model");
 const aiBaseUrl = document.querySelector<HTMLInputElement>("#ai-base-url");
 const aiFfmpegPath = document.querySelector<HTMLInputElement>("#ai-ffmpeg-path");
 const aiContextHint = document.querySelector<HTMLInputElement>("#ai-context-hint");
+const speechSettings = document.querySelector<HTMLElement>("#speech-settings");
+const aiTranscribeAudio = document.querySelector<HTMLInputElement>("#ai-transcribe-audio");
+const aiTranscriptionModel = document.querySelector<HTMLInputElement>("#ai-transcription-model");
 const aiSampleSeconds = document.querySelector<HTMLInputElement>("#ai-sample-seconds");
 const aiMaxFrames = document.querySelector<HTMLInputElement>("#ai-max-frames");
 const aiReanalyzeExisting = document.querySelector<HTMLInputElement>("#ai-reanalyze-existing");
@@ -350,6 +370,12 @@ let aiStopRequested = false;
 let currentHubFilter: "all" | AiProvider = "all";
 let libraryView: "current" | "analyzed" = "current";
 let analysisStartedAt = 0;
+let geminiAuthMode: "api_key" | "oauth" = "api_key";
+let geminiOAuthStatus: GeminiOAuthStatus = {
+  connected: false,
+  project_id: null,
+  expires_at_unix_ms: null,
+};
 const thumbnailCache = new Map<string, string>();
 
 const AI_SETTINGS_STORAGE_KEY = "mediaindex.ai.settings.v1";
@@ -365,7 +391,8 @@ function normalizeVisionModel(provider: AiProvider, model: string): string {
 }
 
 function timingKey(config: AiConfig): string {
-  return `${config.provider}:${normalizeVisionModel(config.provider, config.visionModel).toLowerCase()}:${config.embeddingModel.toLowerCase()}`;
+  const speech = config.transcribeAudio ? `:speech-${config.transcriptionModel.toLowerCase()}` : "";
+  return `${config.provider}:${normalizeVisionModel(config.provider, config.visionModel).toLowerCase()}:${config.embeddingModel.toLowerCase()}${speech}`;
 }
 
 function readTimingHistory(): AiTimingHistory {
@@ -409,7 +436,23 @@ function formatApproximateTime(milliseconds: number): string {
 function analysisTimeEstimate(plan: AiAnalysisPlan, config: AiConfig): string {
   const timing = readTimingHistory()[timingKey(config)];
   if (!timing || plan.estimated_vision_requests <= 0) {
-    return "No measured time estimate yet; this run will calibrate it.";
+    const model = config.visionModel.toLowerCase();
+    const millisecondsPerRequest = config.provider === "local"
+      ? 12_000
+      : model.includes("terra")
+        ? 8_000
+        : model.includes("o4-mini")
+          ? 6_000
+          : config.provider === "gemini"
+            ? 2_500
+            : 3_500;
+    const preparationMs = plan.analyze_file_count * (config.provider === "local" ? 2_500 : 1_500);
+    const speechMs = plan.estimated_audio_seconds * 180;
+    const estimate = Math.max(
+      1_000,
+      plan.estimated_vision_requests * millisecondsPerRequest + preparationMs + speechMs,
+    );
+    return `Rough first-run estimate: ${formatApproximateTime(estimate)}. The completed run will calibrate future estimates on this computer.`;
   }
   return `Estimated time: ${formatApproximateTime(timing.millisecondsPerRequest * plan.estimated_vision_requests)} based on ${timing.samples} completed local run${timing.samples === 1 ? "" : "s"}.`;
 }
@@ -446,6 +489,7 @@ function aiDefaults(provider: AiProvider): AiConfig {
   if (provider === "openai") {
     return {
       provider,
+      authMode: "api_key",
       apiKey: "",
       visionModel: "gpt-5.6-luna",
       embeddingModel: "text-embedding-3-small",
@@ -454,12 +498,15 @@ function aiDefaults(provider: AiProvider): AiConfig {
       sampleIntervalSeconds: 5,
       maxFrames: 60,
       contextHint: "",
+      transcribeAudio: true,
+      transcriptionModel: "whisper-1",
       reanalyzeExisting: false,
     };
   }
   if (provider === "gemini") {
     return {
       provider,
+      authMode: "api_key",
       apiKey: "",
       visionModel: "gemini-3.8-flash",
       embeddingModel: "gemini-embedding-2",
@@ -468,11 +515,14 @@ function aiDefaults(provider: AiProvider): AiConfig {
       sampleIntervalSeconds: 5,
       maxFrames: 120,
       contextHint: "",
+      transcribeAudio: false,
+      transcriptionModel: "whisper-1",
       reanalyzeExisting: false,
     };
   }
   return {
     provider: "local",
+    authMode: "api_key",
     apiKey: "",
     visionModel: "gemma4:e2b",
     embeddingModel: "embeddinggemma",
@@ -481,6 +531,8 @@ function aiDefaults(provider: AiProvider): AiConfig {
     sampleIntervalSeconds: 5,
     maxFrames: 120,
     contextHint: "",
+    transcribeAudio: false,
+    transcriptionModel: "whisper-1",
     reanalyzeExisting: false,
   };
 }
@@ -501,7 +553,11 @@ function readAiConfig(): AiConfig {
   }
   return {
     provider,
-    apiKey: cleanApiKey(aiApiKey?.value ?? ""),
+    authMode: provider === "gemini" ? geminiAuthMode : "api_key",
+    apiKey:
+      provider === "gemini" && geminiAuthMode === "oauth"
+        ? ""
+        : cleanApiKey(aiApiKey?.value ?? ""),
     visionModel: normalizeVisionModel(
       provider,
       aiVisionModel?.value.trim() || defaults.visionModel,
@@ -512,6 +568,8 @@ function readAiConfig(): AiConfig {
     sampleIntervalSeconds: Math.max(1, Number(aiSampleSeconds?.value ?? 5) || 5),
     maxFrames: Math.max(1, Number(aiMaxFrames?.value ?? defaults.maxFrames) || defaults.maxFrames),
     contextHint: aiContextHint?.value.trim() ?? "",
+    transcribeAudio: provider === "openai" && (aiTranscribeAudio?.checked ?? false),
+    transcriptionModel: aiTranscriptionModel?.value.trim() || "whisper-1",
     reanalyzeExisting: aiReanalyzeExisting?.checked ?? false,
   };
 }
@@ -657,6 +715,9 @@ function closeModelHub(): void {
 
 function applyAiConfig(config: AiConfig): void {
   if (aiProvider) aiProvider.value = config.provider;
+  if (config.provider === "gemini") {
+    geminiAuthMode = config.authMode === "oauth" ? "oauth" : "api_key";
+  }
   if (aiApiKey) aiApiKey.value = config.apiKey || getSessionApiKey(config.provider);
   if (aiVisionModel) aiVisionModel.value = config.visionModel;
   if (aiEmbeddingModel) aiEmbeddingModel.value = config.embeddingModel;
@@ -665,6 +726,8 @@ function applyAiConfig(config: AiConfig): void {
   if (aiSampleSeconds) aiSampleSeconds.value = String(config.sampleIntervalSeconds);
   if (aiMaxFrames) aiMaxFrames.value = String(config.maxFrames);
   if (aiContextHint) aiContextHint.value = config.contextHint;
+  if (aiTranscribeAudio) aiTranscribeAudio.checked = config.transcribeAudio;
+  if (aiTranscriptionModel) aiTranscriptionModel.value = config.transcriptionModel;
   if (aiReanalyzeExisting) aiReanalyzeExisting.checked = config.reanalyzeExisting;
   updateAiProviderFields();
   updateActiveModelCard();
@@ -672,14 +735,20 @@ function applyAiConfig(config: AiConfig): void {
 
 function updateAiProviderFields(): void {
   const provider = (aiProvider?.value as AiProvider) || "gemini";
-  if (aiApiKeyLabel) aiApiKeyLabel.hidden = provider === "local";
+  const usesGeminiOauth = provider === "gemini" && geminiAuthMode === "oauth";
+  if (aiApiKeyLabel) aiApiKeyLabel.hidden = provider === "local" || usesGeminiOauth;
   if (providerAuthPanel) providerAuthPanel.hidden = provider === "local";
+  if (speechSettings) speechSettings.hidden = provider !== "openai";
   if (providerAuthHelp) {
     providerAuthHelp.textContent =
       provider === "openai"
         ? "OpenAI API access uses an API key. A ChatGPT login or subscription does not authorize API requests."
         : provider === "gemini"
-          ? "This build uses a Google AI Studio key. A real Google sign-in requires your own Google Cloud desktop OAuth client ID and consent screen."
+          ? usesGeminiOauth
+            ? geminiOAuthStatus.connected
+              ? `Signed in with Google for Cloud project ${geminiOAuthStatus.project_id ?? "unknown"}. The access token stays in app memory only.`
+              : "Google login is selected but not active. Press Login with Google and choose your Desktop OAuth client JSON."
+            : "Use a Google AI Studio API key, or sign in with a Google Cloud Desktop OAuth client JSON."
           : "Local Ollama needs no account or API key.";
   }
   if (openProviderKeyPageButton) {
@@ -688,6 +757,15 @@ function updateAiProviderFields(): void {
   }
   if (openProviderOauthDocsButton) {
     openProviderOauthDocsButton.hidden = provider !== "gemini";
+  }
+  if (loginGeminiOauthButton) {
+    loginGeminiOauthButton.hidden = provider !== "gemini" || (usesGeminiOauth && geminiOAuthStatus.connected);
+  }
+  if (useGeminiApiKeyButton) {
+    useGeminiApiKeyButton.hidden = provider !== "gemini" || !usesGeminiOauth;
+  }
+  if (logoutGeminiOauthButton) {
+    logoutGeminiOauthButton.hidden = provider !== "gemini" || !geminiOAuthStatus.connected;
   }
   if (aiApiKey) {
     aiApiKey.placeholder =
@@ -734,6 +812,8 @@ function loadAiConfig(): void {
       saved?.provider === "openai" || saved?.provider === "gemini" || saved?.provider === "local"
         ? saved.provider
         : fallback.provider;
+    geminiAuthMode =
+      provider === "gemini" && saved?.authMode === "oauth" ? "oauth" : "api_key";
     const sessionApiKey = getSessionApiKey(provider);
     const defaults = aiDefaults(provider);
     let visionModel = normalizeVisionModel(
@@ -769,6 +849,7 @@ function loadAiConfig(): void {
       embeddingModel,
       baseUrl,
       apiKey: sessionApiKey,
+      authMode: provider === "gemini" ? geminiAuthMode : "api_key",
       reanalyzeExisting: false,
     });
   } catch {
@@ -784,9 +865,11 @@ function saveAiConfig(): AiConfig {
   try {
     const { apiKey, reanalyzeExisting: _oneRunOverride, ...safeSettings } = config;
     localStorage.setItem(AI_SETTINGS_STORAGE_KEY, JSON.stringify(safeSettings));
-    setSessionApiKey(config.provider, apiKey);
+    if (config.authMode === "api_key") setSessionApiKey(config.provider, apiKey);
     if (aiConfigStatus)
-      aiConfigStatus.textContent = "Settings saved. API key is stored for this session only.";
+      aiConfigStatus.textContent = config.authMode === "oauth"
+        ? "Settings saved. Google access stays in app memory only."
+        : "Settings saved. API key is stored for this session only.";
   } catch (error) {
     if (aiConfigStatus) aiConfigStatus.textContent = `Could not save AI settings: ${String(error)}`;
   }
@@ -795,6 +878,18 @@ function saveAiConfig(): AiConfig {
 }
 
 loadAiConfig();
+
+async function restoreGeminiOAuthStatus(): Promise<void> {
+  if (!("__TAURI_INTERNALS__" in window)) return;
+  try {
+    geminiOAuthStatus = await tauriApi.getGeminiOAuthStatus();
+  } catch {
+    geminiOAuthStatus = { connected: false, project_id: null, expires_at_unix_ms: null };
+  }
+  updateAiProviderFields();
+}
+
+void restoreGeminiOAuthStatus();
 
 async function restoreSelectedLibrary(): Promise<void> {
   try {
@@ -1395,10 +1490,13 @@ async function analyzeLibraryWithAi(): Promise<void> {
       const replacementWarning = replacesExisting
         ? `\n\nWarning: saved ${plan.model} moments for ${plan.already_analyzed_file_count} clips will be replaced.`
         : "";
+      const speechSummary = plan.estimated_audio_seconds > 0
+        ? ` Spoken audio: about ${formatApproximateTime(plan.estimated_audio_seconds * 1_000).replace("about ", "")} sent to ${config.transcriptionModel} for timestamped transcription.`
+        : "";
       const requestSummary = config.provider === "local"
         ? `${plan.estimated_sampled_frames} estimated sampled frames processed locally.`
         : `${plan.estimated_sampled_frames} estimated sampled frame images in about ${plan.estimated_vision_requests} vision requests. ` +
-          `Configured maximum: ${plan.max_sampled_frames} frames in ${plan.max_vision_requests} requests.`;
+          `Configured maximum: ${plan.max_sampled_frames} frames in ${plan.max_vision_requests} requests.${speechSummary}`;
       const confirmed = window.confirm(
         `${aiProviderLabel(config.provider)} will ${action} ${plan.analyze_file_count} unique videos.\n\n` +
           `${requestSummary}${skipped}${replacementWarning}\n\n${analysisTimeEstimate(plan, config)}\n\nContinue?`,
@@ -1522,7 +1620,7 @@ async function testAiConnection(): Promise<void> {
   if (!testAiConnectionButton) return;
   testAiConnectionButton.disabled = true;
   const config = saveAiConfig();
-  if (config.provider !== "local" && !config.apiKey) {
+  if (config.provider !== "local" && config.authMode !== "oauth" && !config.apiKey) {
     if (aiConfigStatus)
       aiConfigStatus.textContent = `Please enter your ${aiProviderLabel(config.provider)} API key first.`;
     testAiConnectionButton.disabled = false;
@@ -1534,7 +1632,7 @@ async function testAiConnection(): Promise<void> {
     testAiConnectionButton.disabled = false;
     return;
   }
-  if (config.provider === "gemini" && config.apiKey.startsWith("sk-")) {
+  if (config.provider === "gemini" && config.authMode === "api_key" && config.apiKey.startsWith("sk-")) {
     if (aiConfigStatus)
       aiConfigStatus.textContent = `The entered key starts with 'sk-', which is an OpenAI key. For Google Gemini, please enter a Google AI Studio key (starts with AIza...).`;
     testAiConnectionButton.disabled = false;
@@ -1582,6 +1680,7 @@ modelHubTabs?.querySelectorAll<HTMLButtonElement>(".model-hub-tab").forEach((tab
 aiProvider?.addEventListener("change", () => {
   const provider = (aiProvider.value as AiProvider) || "gemini";
   const defaults = aiDefaults(provider);
+  geminiAuthMode = provider === "gemini" && geminiOAuthStatus.connected ? "oauth" : "api_key";
   if (aiApiKey) aiApiKey.value = getSessionApiKey(provider);
   if (aiVisionModel) aiVisionModel.value = defaults.visionModel;
   if (aiEmbeddingModel) aiEmbeddingModel.value = defaults.embeddingModel;
@@ -1619,6 +1718,54 @@ openProviderOauthDocsButton?.addEventListener("click", async () => {
   } catch (error) {
     if (aiConfigStatus) aiConfigStatus.textContent = `Could not open OAuth setup guide: ${conciseMessage(error)}`;
   }
+});
+
+loginGeminiOauthButton?.addEventListener("click", async () => {
+  const selected = await open({
+    directory: false,
+    multiple: false,
+    title: "Select Google Desktop OAuth client JSON",
+    filters: [{ name: "Google OAuth client", extensions: ["json"] }],
+  });
+  if (typeof selected !== "string") return;
+  loginGeminiOauthButton.disabled = true;
+  if (aiConfigStatus) {
+    aiConfigStatus.textContent =
+      "Waiting for Google sign-in in your system browser… Return here after approving access.";
+  }
+  try {
+    geminiOAuthStatus = await tauriApi.loginGeminiOAuth(selected);
+    geminiAuthMode = "oauth";
+    if (aiApiKey) aiApiKey.value = "";
+    saveAiConfig();
+    updateAiProviderFields();
+    if (aiConfigStatus) {
+      aiConfigStatus.textContent = `Signed in with Google for Cloud project ${geminiOAuthStatus.project_id ?? "unknown"}. Press Test Connection to verify model access.`;
+    }
+  } catch (error) {
+    geminiOAuthStatus = { connected: false, project_id: null, expires_at_unix_ms: null };
+    if (aiConfigStatus) aiConfigStatus.textContent = conciseMessage(error);
+    updateAiProviderFields();
+  } finally {
+    loginGeminiOauthButton.disabled = false;
+  }
+});
+
+useGeminiApiKeyButton?.addEventListener("click", async () => {
+  geminiOAuthStatus = await tauriApi.logoutGeminiOAuth();
+  geminiAuthMode = "api_key";
+  if (aiApiKey) aiApiKey.value = getSessionApiKey("gemini");
+  saveAiConfig();
+  updateAiProviderFields();
+  if (aiConfigStatus) aiConfigStatus.textContent = "Gemini will use an AI Studio API key.";
+});
+
+logoutGeminiOauthButton?.addEventListener("click", async () => {
+  geminiOAuthStatus = await tauriApi.logoutGeminiOAuth();
+  geminiAuthMode = "api_key";
+  saveAiConfig();
+  updateAiProviderFields();
+  if (aiConfigStatus) aiConfigStatus.textContent = "Google disconnected. The in-memory access token was removed.";
 });
 
 document.querySelectorAll<HTMLButtonElement>("[data-library-view]").forEach((button) => {
