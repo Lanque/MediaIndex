@@ -1,6 +1,7 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import "./styles.css";
 
 import {
@@ -112,6 +113,13 @@ app.innerHTML = `
             <label id="ai-api-key-label">API Key
               <input id="ai-api-key" name="api-key" type="password" autocomplete="off" placeholder="Enter Gemini (AIza...) or OpenAI (sk-...) API key" />
             </label>
+            <div class="provider-auth-panel" id="provider-auth-panel">
+              <p id="provider-auth-help"></p>
+              <div class="provider-auth-actions">
+                <button class="text-button" id="open-provider-key-page" type="button">Get API key</button>
+                <button class="text-button" id="open-provider-oauth-docs" type="button">OAuth setup</button>
+              </div>
+            </div>
 
             <details class="advanced-ai-settings" style="margin-top: 4px;">
               <summary style="font-size: 11px; color: var(--text-muted); cursor: pointer;">Advanced Configuration</summary>
@@ -178,10 +186,16 @@ app.innerHTML = `
       <section class="content-panel">
         <div class="panel-header">
           <div>
-            <h1 class="panel-title">Footage library</h1>
-            <p class="panel-subtitle">Grouped by source folder · originals remain untouched</p>
+            <h1 class="panel-title" id="panel-title">Current folder</h1>
+            <p class="panel-subtitle" id="panel-subtitle">Grouped by source folder · originals remain untouched</p>
           </div>
-          <span class="count-badge" id="clip-count">0 clips</span>
+          <div class="panel-header-actions">
+            <div class="library-view-tabs" aria-label="Library view">
+              <button class="library-view-tab is-active" data-library-view="current" type="button">Current folder</button>
+              <button class="library-view-tab" data-library-view="analyzed" type="button">Analyzed archive</button>
+            </div>
+            <span class="count-badge" id="clip-count">0 clips</span>
+          </div>
         </div>
         <div class="search-container">
           <form class="search-form" id="search-form">
@@ -237,7 +251,7 @@ app.innerHTML = `
           <p class="eyebrow" style="margin-bottom: 4px;">AI MODEL SELECTION & PRICING</p>
           <h2 id="model-hub-title" style="font-size: 1.35rem;">Choose a Vision Model</h2>
           <p class="lede" style="font-size: 0.85rem; margin-top: 4px; color: var(--text-muted);">
-            Current stable Gemini, OpenAI GPT-5.6, and local Ollama options. Pricing checked September 2026.
+            Gemini, OpenAI, and local Ollama options. API prices are informational and can change.
           </p>
         </div>
         <button class="secondary-button" id="close-model-hub" type="button">Close</button>
@@ -285,6 +299,10 @@ const modelHubGrid = document.querySelector<HTMLElement>("#model-hub-grid");
 const modelHubTabs = document.querySelector<HTMLElement>("#model-hub-tabs");
 const aiApiKey = document.querySelector<HTMLInputElement>("#ai-api-key");
 const aiApiKeyLabel = document.querySelector<HTMLLabelElement>("#ai-api-key-label");
+const providerAuthPanel = document.querySelector<HTMLElement>("#provider-auth-panel");
+const providerAuthHelp = document.querySelector<HTMLElement>("#provider-auth-help");
+const openProviderKeyPageButton = document.querySelector<HTMLButtonElement>("#open-provider-key-page");
+const openProviderOauthDocsButton = document.querySelector<HTMLButtonElement>("#open-provider-oauth-docs");
 const aiVisionModel = document.querySelector<HTMLInputElement>("#ai-vision-model");
 const aiEmbeddingModel = document.querySelector<HTMLInputElement>("#ai-embedding-model");
 const aiBaseUrl = document.querySelector<HTMLInputElement>("#ai-base-url");
@@ -309,6 +327,8 @@ const analysisProgressTrack = document.querySelector<HTMLElement>("#analysis-pro
 const analysisProgressFill = document.querySelector<HTMLElement>("#analysis-progress-fill");
 const aiSearchStatus = document.querySelector<HTMLElement>("#ai-search-status");
 const clipCount = document.querySelector<HTMLElement>("#clip-count");
+const panelTitle = document.querySelector<HTMLElement>("#panel-title");
+const panelSubtitle = document.querySelector<HTMLElement>("#panel-subtitle");
 const emptyState = document.querySelector<HTMLElement>("#empty-state");
 const resultList = document.querySelector<HTMLElement>("#result-list");
 const resultsNote = document.querySelector<HTMLElement>("#results-note");
@@ -328,11 +348,71 @@ let aiAnalysisRunning = false;
 let aiCancellationPending = false;
 let aiStopRequested = false;
 let currentHubFilter: "all" | AiProvider = "all";
+let libraryView: "current" | "analyzed" = "current";
+let analysisStartedAt = 0;
 const thumbnailCache = new Map<string, string>();
 
 const AI_SETTINGS_STORAGE_KEY = "mediaindex.ai.settings.v1";
 const AI_API_KEY_SESSION_STORAGE_KEY = "mediaindex.ai.api-key.session.v1";
 const LIBRARY_PATH_STORAGE_KEY = "mediaindex.library.path.v1";
+const AI_TIMING_STORAGE_KEY = "mediaindex.ai.timing.v1";
+
+type AiTimingHistory = Record<string, { millisecondsPerRequest: number; samples: number }>;
+
+function normalizeVisionModel(provider: AiProvider, model: string): string {
+  const trimmed = model.trim();
+  return provider === "openai" && trimmed.toLowerCase() === "04-mini" ? "o4-mini" : trimmed;
+}
+
+function timingKey(config: AiConfig): string {
+  return `${config.provider}:${normalizeVisionModel(config.provider, config.visionModel).toLowerCase()}:${config.embeddingModel.toLowerCase()}`;
+}
+
+function readTimingHistory(): AiTimingHistory {
+  try {
+    return JSON.parse(localStorage.getItem(AI_TIMING_STORAGE_KEY) ?? "{}") as AiTimingHistory;
+  } catch {
+    return {};
+  }
+}
+
+function recordAnalysisTiming(config: AiConfig, plan: AiAnalysisPlan, elapsedMs: number): void {
+  if (plan.estimated_vision_requests <= 0 || elapsedMs <= 0) return;
+  const history = readTimingHistory();
+  const key = timingKey(config);
+  const previous = history[key];
+  const measured = elapsedMs / plan.estimated_vision_requests;
+  const samples = Math.min((previous?.samples ?? 0) + 1, 10);
+  history[key] = {
+    millisecondsPerRequest: previous
+      ? (previous.millisecondsPerRequest * (samples - 1) + measured) / samples
+      : measured,
+    samples,
+  };
+  try {
+    localStorage.setItem(AI_TIMING_STORAGE_KEY, JSON.stringify(history));
+  } catch {
+    // A timing estimate is optional; analysis results are already stored in SQLite.
+  }
+}
+
+function formatApproximateTime(milliseconds: number): string {
+  const seconds = Math.max(1, Math.round(milliseconds / 1_000));
+  if (seconds < 60) return `about ${seconds}s`;
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  if (minutes < 60) return `about ${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes ? `about ${hours}h ${remainingMinutes}m` : `about ${hours}h`;
+}
+
+function analysisTimeEstimate(plan: AiAnalysisPlan, config: AiConfig): string {
+  const timing = readTimingHistory()[timingKey(config)];
+  if (!timing || plan.estimated_vision_requests <= 0) {
+    return "No measured time estimate yet; this run will calibrate it.";
+  }
+  return `Estimated time: ${formatApproximateTime(timing.millisecondsPerRequest * plan.estimated_vision_requests)} based on ${timing.samples} completed local run${timing.samples === 1 ? "" : "s"}.`;
+}
 
 function cleanApiKey(raw: string): string {
   let cleaned = raw.trim();
@@ -422,7 +502,10 @@ function readAiConfig(): AiConfig {
   return {
     provider,
     apiKey: cleanApiKey(aiApiKey?.value ?? ""),
-    visionModel: aiVisionModel?.value.trim() || defaults.visionModel,
+    visionModel: normalizeVisionModel(
+      provider,
+      aiVisionModel?.value.trim() || defaults.visionModel,
+    ),
     embeddingModel: aiEmbeddingModel?.value.trim() || defaults.embeddingModel,
     baseUrl,
     ffmpegPath: aiFfmpegPath?.value.trim() ?? "",
@@ -590,6 +673,22 @@ function applyAiConfig(config: AiConfig): void {
 function updateAiProviderFields(): void {
   const provider = (aiProvider?.value as AiProvider) || "gemini";
   if (aiApiKeyLabel) aiApiKeyLabel.hidden = provider === "local";
+  if (providerAuthPanel) providerAuthPanel.hidden = provider === "local";
+  if (providerAuthHelp) {
+    providerAuthHelp.textContent =
+      provider === "openai"
+        ? "OpenAI API access uses an API key. A ChatGPT login or subscription does not authorize API requests."
+        : provider === "gemini"
+          ? "This build uses a Google AI Studio key. A real Google sign-in requires your own Google Cloud desktop OAuth client ID and consent screen."
+          : "Local Ollama needs no account or API key.";
+  }
+  if (openProviderKeyPageButton) {
+    openProviderKeyPageButton.textContent =
+      provider === "openai" ? "Open OpenAI API keys" : "Open Google AI Studio";
+  }
+  if (openProviderOauthDocsButton) {
+    openProviderOauthDocsButton.hidden = provider !== "gemini";
+  }
   if (aiApiKey) {
     aiApiKey.placeholder =
       provider === "local"
@@ -637,7 +736,10 @@ function loadAiConfig(): void {
         : fallback.provider;
     const sessionApiKey = getSessionApiKey(provider);
     const defaults = aiDefaults(provider);
-    let visionModel = saved?.visionModel?.trim() || defaults.visionModel;
+    let visionModel = normalizeVisionModel(
+      provider,
+      saved?.visionModel?.trim() || defaults.visionModel,
+    );
     let embeddingModel = saved?.embeddingModel?.trim() || defaults.embeddingModel;
     if (provider === "gemini") {
       if (visionModel === "gemini-1.5-flash" || visionModel === "gemini-3.1-pro") {
@@ -676,6 +778,9 @@ function loadAiConfig(): void {
 
 function saveAiConfig(): AiConfig {
   const config = readAiConfig();
+  if (aiVisionModel && aiVisionModel.value.trim() !== config.visionModel) {
+    aiVisionModel.value = config.visionModel;
+  }
   try {
     const { apiKey, reanalyzeExisting: _oneRunOverride, ...safeSettings } = config;
     localStorage.setItem(AI_SETTINGS_STORAGE_KEY, JSON.stringify(safeSettings));
@@ -694,12 +799,11 @@ loadAiConfig();
 async function restoreSelectedLibrary(): Promise<void> {
   try {
     if (!("__TAURI_INTERNALS__" in window)) return;
-    let savedPath = localStorage.getItem(LIBRARY_PATH_STORAGE_KEY)?.trim() ?? "";
+    const savedPath = localStorage.getItem(LIBRARY_PATH_STORAGE_KEY)?.trim() ?? "";
     if (!savedPath) {
-      savedPath = (await tauriApi.getIndexedLibraryPath())?.trim() ?? "";
-      if (savedPath) localStorage.setItem(LIBRARY_PATH_STORAGE_KEY, savedPath);
+      renderResults([], false);
+      return;
     }
-    if (!savedPath) return;
     selectedLibraryPath = savedPath;
     updateHeaderFolder(savedPath);
     if (analyzeAiButton) analyzeAiButton.disabled = false;
@@ -729,7 +833,14 @@ function showAiProgress(percent: number, label: string, isError = false): void {
 void listen<AiProgress>("ai-progress", ({ payload }) => {
   const fileName = payload.current_file.split(/[\\/]/).pop() ?? payload.current_file;
   const phase = aiStopRequested ? "Stopping after current request…" : payload.phase;
-  showAiProgress(payload.percent, phase);
+  const elapsed = analysisStartedAt ? Date.now() - analysisStartedAt : 0;
+  const remaining = payload.percent > 1
+    ? (elapsed * (100 - payload.percent)) / payload.percent
+    : 0;
+  const phaseWithEta = !aiStopRequested && remaining > 0
+    ? `${phase} · ${formatApproximateTime(remaining)} left`
+    : phase;
+  showAiProgress(payload.percent, phaseWithEta);
   if (libraryStatus) {
     libraryStatus.textContent = aiStopRequested
       ? `Stopping AI analysis · ${payload.completed_files}/${payload.total_files} clips saved`
@@ -772,6 +883,28 @@ function summarizeAiWarnings(warnings: AiIndexReport["warnings"]): string {
     : `${count} clips paused (${reason}) · rerun to complete remaining clips`;
 }
 
+function updateLibraryViewUi(): void {
+  document.querySelectorAll<HTMLButtonElement>("[data-library-view]").forEach((button) => {
+    const active = button.dataset.libraryView === libraryView;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  if (panelTitle) {
+    panelTitle.textContent = libraryView === "current" ? "Current folder" : "Analyzed archive";
+  }
+  if (panelSubtitle) {
+    panelSubtitle.textContent = libraryView === "current"
+      ? "Only the selected folder · grouped by source folder · originals remain untouched"
+      : "Previously analyzed clips from every indexed folder · AI data remains saved locally";
+  }
+}
+
+function setLibraryView(view: "current" | "analyzed"): void {
+  libraryView = view;
+  updateLibraryViewUi();
+  void searchLibrary();
+}
+
 function readFilters(): SearchFilters {
   const value = (id: string) => document.querySelector<HTMLInputElement>(id)?.value.trim() ?? "";
   const sortBy = document.querySelector<HTMLSelectElement>("#sort-by")?.value ?? "name";
@@ -780,6 +913,8 @@ function readFilters(): SearchFilters {
   return {
     keyword: value("#search-input") || undefined,
     folder: value("#filter-folder") || undefined,
+    root: libraryView === "current" ? selectedLibraryPath || undefined : undefined,
+    ai_only: libraryView === "analyzed",
     date_from_unix_ms: dateToUnixMs(value("#filter-date-from")),
     date_to_unix_ms: dateToUnixMs(value("#filter-date-to")),
     resolution: value("#filter-resolution") || undefined,
@@ -841,6 +976,12 @@ function formatFps(raw?: string | null): string {
   return !isNaN(num) ? `${Math.round(num * 100) / 100} fps` : `${raw} fps`;
 }
 
+function formatMomentRange(startMs = 0, endMs = startMs): string {
+  return endMs > startMs
+    ? `${formatDuration(startMs)}–${formatDuration(endMs)}`
+    : formatDuration(startMs);
+}
+
 function renderResultCard(result: SearchResult, index: number): string {
   const metadata = result.metadata;
   const fileName = result.path.split(/[\\/]/).pop() ?? result.path;
@@ -900,7 +1041,7 @@ function renderLibraryGroups(results: SearchResult[]): string {
   return Array.from(groups.values())
     .map((group) => {
       const folderName = group.path.split(/[\\/]/).pop() ?? group.path;
-      const relativePath = selectedLibraryPath && group.path.toLocaleLowerCase().startsWith(selectedLibraryPath.toLocaleLowerCase())
+      const relativePath = libraryView === "current" && selectedLibraryPath && group.path.toLocaleLowerCase().startsWith(selectedLibraryPath.toLocaleLowerCase())
         ? group.path.slice(selectedLibraryPath.length).replace(/^[\\/]+/, "") || "Selected folder"
         : group.path;
       const totalSize = group.results.reduce((sum, result) => sum + result.size_bytes, 0);
@@ -962,7 +1103,7 @@ function renderGroupedAiResults(results: SearchResult[]): string {
             ${otherMoments
               .map(
                 (moment) => `<button class="moment-row preview-result" type="button" data-name="${escapeHtml(fileName)}" data-path="${escapeHtml(moment.path)}" data-timestamp-ms="${moment.timestamp_ms ?? 0}" ${moment.available ? "" : "disabled"}>
-              <strong>${escapeHtml(formatDuration(moment.timestamp_ms))}</strong>
+              <strong>${escapeHtml(formatMomentRange(moment.timestamp_ms ?? 0, moment.end_timestamp_ms ?? moment.timestamp_ms ?? 0))}</strong>
               <span>${escapeHtml(moment.ai_description ?? "Matching scene")}</span>
               <span class="moment-play" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="m7 4 8 6-8 6z"/></svg></span>
             </button>`,
@@ -975,7 +1116,7 @@ function renderGroupedAiResults(results: SearchResult[]): string {
       <button class="video-thumbnail preview-result" type="button" data-name="${escapeHtml(fileName)}" data-path="${escapeHtml(bestMatch.path)}" data-timestamp-ms="${timestamp}" data-thumbnail-key="${escapeHtml(thumbnailKey)}" ${bestMatch.available ? "" : "disabled"} aria-label="Preview ${escapeHtml(fileName)} at ${escapeHtml(formatDuration(timestamp))}">
         <span class="thumbnail-placeholder">Creating thumbnail…</span>
         <span class="thumbnail-play" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="m7 4 8 6-8 6z"/></svg></span>
-        <span class="thumbnail-time">${escapeHtml(formatDuration(timestamp))}</span>
+        <span class="thumbnail-time">${escapeHtml(formatMomentRange(timestamp, bestMatch.end_timestamp_ms ?? timestamp))}</span>
         <span class="relevance-badge ${badgeClass}">${escapeHtml(relevance)}</span>
       </button>
       <div class="video-card-body">
@@ -1044,11 +1185,19 @@ function renderResults(results: SearchResult[], groupByVideo = false): void {
     if (resultsNote) resultsNote.hidden = true;
     const emptyTitle = document.querySelector<HTMLElement>("#empty-title");
     const emptyCopy = document.querySelector<HTMLElement>("#empty-copy");
-    if (selectedLibraryPath) {
+    if (libraryView === "analyzed") {
+      if (emptyTitle) emptyTitle.textContent = groupByVideo ? "No matching analyzed moments" : "No analyzed clips yet";
+      if (emptyCopy) emptyCopy.textContent = groupByVideo
+        ? "Try another description or switch models to search an index created with a different model."
+        : "Analyze a selected folder to add its clips to this saved archive.";
+    } else if (selectedLibraryPath) {
       if (emptyTitle) emptyTitle.textContent = groupByVideo ? "No matching visual moments" : "No clips match these filters";
       if (emptyCopy) emptyCopy.textContent = groupByVideo
         ? "Try a broader description, or analyze the folder again with a stronger vision model."
         : "Clear or change the filename and metadata filters to see this library again.";
+    } else {
+      if (emptyTitle) emptyTitle.textContent = "No folder selected";
+      if (emptyCopy) emptyCopy.textContent = "Choose Select Footage Folder. Only that folder will appear in this view; older AI analyses stay in Analyzed archive.";
     }
     emptyState.hidden = false;
     return;
@@ -1092,6 +1241,17 @@ async function searchLibrary(trigger?: HTMLButtonElement): Promise<void> {
     trigger.disabled = true;
     trigger.textContent = "Filtering…";
   }
+  if (libraryView === "current" && !selectedLibraryPath) {
+    renderResults([], false);
+    if (clipCount) clipCount.textContent = "0 clips";
+    if (libraryStatus) libraryStatus.textContent = "No folder selected";
+    if (libraryPath) libraryPath.textContent = "Choose a local folder to begin";
+    if (trigger) {
+      trigger.disabled = false;
+      trigger.textContent = originalLabel;
+    }
+    return;
+  }
   try {
     const results = await tauriApi.searchMedia(readFilters());
     renderResults(results, false);
@@ -1105,9 +1265,13 @@ async function searchLibrary(trigger?: HTMLButtonElement): Promise<void> {
         : `${totalClips} clips`;
     }
     if (libraryStatus) {
-      libraryStatus.textContent = `${totalClips} clips in library`;
+      libraryStatus.textContent = libraryView === "analyzed"
+        ? `${totalClips} analyzed clips saved`
+        : `${totalClips} clips in selected folder`;
     }
-    if (libraryPath && selectedLibraryPath) {
+    if (libraryPath && libraryView === "analyzed") {
+      libraryPath.textContent = "Saved AI analysis archive · original folder structure preserved";
+    } else if (libraryPath && selectedLibraryPath) {
       libraryPath.textContent = aiIndexedClips > 0
         ? `${selectedLibraryPath} · ${aiIndexedClips}/${totalClips} clips analyzed with AI (saved in SQLite)`
         : `${selectedLibraryPath} · Ready for AI analysis`;
@@ -1129,6 +1293,10 @@ async function searchAiLibrary(): Promise<void> {
     if (aiSearchStatus) aiSearchStatus.textContent = "Enter a natural-language AI query first.";
     return;
   }
+  if (libraryView === "current" && !selectedLibraryPath) {
+    if (aiSearchStatus) aiSearchStatus.textContent = "Select a footage folder first, or switch to Analyzed archive.";
+    return;
+  }
 
   const originalLabel = aiSearchButton?.textContent ?? "AI Search";
   if (aiSearchButton) {
@@ -1142,7 +1310,12 @@ async function searchAiLibrary(): Promise<void> {
   }
   if (libraryStatus) libraryStatus.textContent = "AI search in progress…";
   try {
-    const matches = await tauriApi.searchAi(query, config, focus);
+    const matches = await tauriApi.searchAi(
+      query,
+      config,
+      focus,
+      libraryView === "current" ? selectedLibraryPath : undefined,
+    );
     const displayResults: SearchResult[] = matches.map((match) => ({
       path: match.path,
       content_hash: match.content_hash,
@@ -1151,6 +1324,7 @@ async function searchAiLibrary(): Promise<void> {
       status: "ACTIVE",
       available: match.available,
       timestamp_ms: match.timestamp_ms,
+      end_timestamp_ms: match.end_timestamp_ms,
       ai_description: match.description,
       match_score: match.score,
       metadata: null,
@@ -1188,21 +1362,46 @@ async function analyzeLibraryWithAi(): Promise<void> {
   if (selectFolderButton) selectFolderButton.disabled = true;
   const config = saveAiConfig();
   let analysisStarted = false;
+  let forceReanalysis = config.reanalyzeExisting;
+  let plan: AiAnalysisPlan | null = null;
   try {
-    const plan = await tauriApi.planAiAnalysis(
+    plan = await tauriApi.planAiAnalysis(
       selectedLibraryPath,
       config,
-      config.reanalyzeExisting,
+      forceReanalysis,
     );
-    if (config.provider !== "local" && plan.analyze_file_count > 0) {
-      const action = config.reanalyzeExisting ? "reanalyze" : "analyze";
+
+    if (!forceReanalysis && plan.analyze_file_count === 0 && plan.already_analyzed_file_count > 0) {
+      const reanalyze = window.confirm(
+        `All ${plan.already_analyzed_file_count} clips in this folder are already analyzed with ${plan.model}.\n\n` +
+          "Reanalyze them anyway? Existing moments for this model will be replaced, and cloud providers may charge for the new requests.",
+      );
+      if (!reanalyze) {
+        if (libraryStatus) libraryStatus.textContent = "Existing AI analysis kept";
+        if (libraryPath) libraryPath.textContent = "No API requests were sent and saved moments were not changed.";
+        if (aiSearchStatus) aiSearchStatus.textContent = "Open Analyzed archive to search the saved analysis.";
+        return;
+      }
+      forceReanalysis = true;
+      plan = await tauriApi.planAiAnalysis(selectedLibraryPath, config, true);
+    }
+
+    const replacesExisting = forceReanalysis && plan.already_analyzed_file_count > 0;
+    if (plan.analyze_file_count > 0) {
+      const action = replacesExisting ? "reanalyze" : "analyze";
       const skipped = plan.skipped_file_count
         ? `\n${plan.skipped_file_count} already indexed clips will be skipped.`
         : "";
+      const replacementWarning = replacesExisting
+        ? `\n\nWarning: saved ${plan.model} moments for ${plan.already_analyzed_file_count} clips will be replaced.`
+        : "";
+      const requestSummary = config.provider === "local"
+        ? `${plan.estimated_sampled_frames} estimated sampled frames processed locally.`
+        : `${plan.estimated_sampled_frames} estimated sampled frame images in about ${plan.estimated_vision_requests} vision requests. ` +
+          `Configured maximum: ${plan.max_sampled_frames} frames in ${plan.max_vision_requests} requests.`;
       const confirmed = window.confirm(
         `${aiProviderLabel(config.provider)} will ${action} ${plan.analyze_file_count} unique videos.\n\n` +
-          `Maximum configured upload: ${plan.max_sampled_frames} sampled frame images in up to ${plan.max_vision_requests} vision batches ` +
-          `(${plan.max_frames_per_file} frames per video). Short clips may use less.${skipped}\n\nContinue?`,
+          `${requestSummary}${skipped}${replacementWarning}\n\n${analysisTimeEstimate(plan, config)}\n\nContinue?`,
       );
       if (!confirmed) {
         if (libraryStatus) libraryStatus.textContent = "AI analysis not started";
@@ -1222,11 +1421,16 @@ async function analyzeLibraryWithAi(): Promise<void> {
     if (libraryStatus) libraryStatus.textContent = "AI analysis in progress…";
     if (libraryPath)
       libraryPath.textContent = `Using ${aiProviderLabel(config.provider)} · ${config.visionModel} / ${config.embeddingModel}`;
+    analysisStartedAt = Date.now();
     const report = await tauriApi.analyzeMediaFolder(
       selectedLibraryPath,
       config,
-      config.reanalyzeExisting,
+      forceReanalysis,
     );
+    const elapsedMs = Date.now() - analysisStartedAt;
+    if (!report.cancelled && report.analyzed_file_count > 0) {
+      recordAnalysisTiming(config, plan, elapsedMs);
+    }
     if (report.cancelled) {
       showAiProgress(lastAiProgressPercent, "Analysis stopped");
       if (libraryStatus)
@@ -1276,6 +1480,7 @@ async function analyzeLibraryWithAi(): Promise<void> {
       aiReanalyzeExisting.checked = false;
       saveAiConfig();
     }
+    analysisStartedAt = 0;
     aiAnalysisRunning = false;
     aiCancellationPending = false;
     aiStopRequested = false;
@@ -1396,6 +1601,33 @@ testAiConnectionButton?.addEventListener("click", () => {
   void testAiConnection();
 });
 
+openProviderKeyPageButton?.addEventListener("click", async () => {
+  const provider = (aiProvider?.value as AiProvider) || "gemini";
+  const url = provider === "openai"
+    ? "https://platform.openai.com/api-keys"
+    : "https://aistudio.google.com/app/apikey";
+  try {
+    await openUrl(url);
+  } catch (error) {
+    if (aiConfigStatus) aiConfigStatus.textContent = `Could not open provider page: ${conciseMessage(error)}`;
+  }
+});
+
+openProviderOauthDocsButton?.addEventListener("click", async () => {
+  try {
+    await openUrl("https://ai.google.dev/gemini-api/docs/oauth");
+  } catch (error) {
+    if (aiConfigStatus) aiConfigStatus.textContent = `Could not open OAuth setup guide: ${conciseMessage(error)}`;
+  }
+});
+
+document.querySelectorAll<HTMLButtonElement>("[data-library-view]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const view = button.dataset.libraryView;
+    if (view === "current" || view === "analyzed") setLibraryView(view);
+  });
+});
+
 selectFolderButton?.addEventListener("click", async () => {
   const selected = await open({
     directory: true,
@@ -1407,6 +1639,8 @@ selectFolderButton?.addEventListener("click", async () => {
     return;
   }
 
+  libraryView = "current";
+  updateLibraryViewUi();
   selectFolderButton.disabled = true;
   if (analyzeAiButton) analyzeAiButton.disabled = true;
   if (libraryStatus) libraryStatus.textContent = "Scanning folder…";
@@ -1461,6 +1695,8 @@ document.querySelector<HTMLButtonElement>("#learn-more")?.addEventListener("clic
   window.alert("See docs/project-plan.md for the current MVP scope.");
 });
 
+updateLibraryViewUi();
+renderResults([], false);
 void restoreSelectedLibrary();
 
 closePreviewButton?.addEventListener("click", closePreview);

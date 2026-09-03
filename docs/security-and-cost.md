@@ -64,14 +64,16 @@ delivery, stale cursors, authorization failures, and worker crashes.
 - GPT-5.6 Luna is the cost-sensitive OpenAI default; the substantially more
   expensive Terra preset is labeled as an explicit detailed-analysis choice.
 - New OpenAI settings cap analysis at 60 sampled frames per video by default.
-- OpenAI and Gemini runs require confirmation after a local preflight reports
-  the unique content count and configured maximum sampled frames/vision
-  batches. Cancelling the dialog sends no provider requests.
+- Every run requires confirmation after a local preflight reports
+  the unique content count, duration-based estimated sampled frames/vision
+  requests, configured upper bounds, and a measured per-model time estimate
+  when one is available. Cancelling the dialog sends no provider requests.
 - Duplicate file paths that share a content hash are analyzed once, preventing
   duplicate API spend for copied footage.
 - **Analyze with AI** skips content that already has annotations in the active
   provider/model namespace. Reanalysis is a one-run checkbox that is never
-  persisted and resets after the run.
+  persisted and resets after the run. Reanalysis requires confirmation and
+  clearly states that same-model annotations will be replaced.
 - Only one AI analysis can run at a time. The stop control prevents additional
   files and frame batches from starting, keeps completed clip annotations, and
   lets a later run continue with missing clips. A cloud request already sent to
