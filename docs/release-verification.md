@@ -1,7 +1,8 @@
 # Release verification
 
-Verification snapshot: 2026-09-03, branch
-`feat/performance-cost-and-search-optimizations`.
+Verification snapshot: 2026-09-03, tested on
+`feat/performance-cost-and-search-optimizations` and merged into local `main`
+by `8bdcc78`.
 
 ## Automated results
 
