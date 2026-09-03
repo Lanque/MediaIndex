@@ -350,6 +350,21 @@ video:focus-visible {
   text-underline-offset: 2px;
 }
 .text-button:hover { color: #ffd1c5; }
+.speech-settings {
+  display: grid;
+  gap: 7px;
+  padding: 8px;
+  background: #1b1c19;
+  border: 1px solid #45463f;
+  border-radius: 3px;
+}
+.speech-settings[hidden] { display: none; }
+.speech-settings p {
+  margin: 0;
+  color: #aaa99f;
+  font-size: 9px;
+  line-height: 1.45;
+}
 .active-model-card {
   margin: 10px 0;
   padding: 10px;

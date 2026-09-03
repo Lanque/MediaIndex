@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod gemini_oauth;
 pub mod local_index;
 pub mod metadata;
 pub mod scanner;
@@ -65,6 +66,7 @@ struct AiAnalysisPlan {
     max_vision_requests: u64,
     estimated_sampled_frames: u64,
     estimated_vision_requests: u64,
+    estimated_audio_seconds: u64,
     model: String,
 }
 
@@ -220,7 +222,7 @@ fn plan_ai_analysis(
     config: Option<ai::AiRequestConfig>,
     force: Option<bool>,
 ) -> Result<AiAnalysisPlan, String> {
-    let settings = ai::AiSettings::from_request(config)?;
+    let settings = ai_settings(&app, config)?;
     let index = open_local_index(&app)?;
     let indexed_files = unique_indexed_files_under_root(
         index.known_files().map_err(|error| error.to_string())?,
@@ -240,11 +242,12 @@ fn plan_ai_analysis(
     let requests_per_file = max_frames_per_file.div_ceil(vision_batch_size);
     let mut estimated_sampled_frames = 0u64;
     let mut estimated_vision_requests = 0u64;
+    let mut estimated_audio_seconds = 0u64;
     for file in &files {
-        let duration_ms = index
+        let metadata = index
             .get_asset_metadata(&file.content_hash)
-            .map_err(|error| error.to_string())?
-            .and_then(|metadata| metadata.duration_ms);
+            .map_err(|error| error.to_string())?;
+        let duration_ms = metadata.as_ref().and_then(|metadata| metadata.duration_ms);
         let sampled_frames = duration_ms
             .map(|duration| {
                 duration
@@ -257,6 +260,22 @@ fn plan_ai_analysis(
         estimated_sampled_frames = estimated_sampled_frames.saturating_add(sampled_frames);
         estimated_vision_requests =
             estimated_vision_requests.saturating_add(sampled_frames.div_ceil(vision_batch_size));
+        if settings.transcribes_audio()
+            && metadata
+                .as_ref()
+                .and_then(|metadata| metadata.audio_codec.as_deref())
+                .is_some()
+        {
+            let configured_span_ms = settings
+                .sample_interval_ms()
+                .saturating_mul(max_frames_per_file);
+            estimated_audio_seconds = estimated_audio_seconds.saturating_add(
+                duration_ms
+                    .unwrap_or(configured_span_ms)
+                    .min(configured_span_ms)
+                    .div_ceil(1_000),
+            );
+        }
     }
 
     Ok(AiAnalysisPlan {
@@ -269,6 +288,7 @@ fn plan_ai_analysis(
         max_vision_requests: analyze_file_count.saturating_mul(requests_per_file),
         estimated_sampled_frames,
         estimated_vision_requests,
+        estimated_audio_seconds,
         model,
     })
 }
@@ -285,7 +305,7 @@ fn analyze_media_folder_blocking(
     force: bool,
     control: &AiAnalysisControl,
 ) -> Result<ai::AiIndexReport, String> {
-    let settings = ai::AiSettings::from_request(config)?;
+    let settings = ai_settings(&app, config)?;
     let mut index = open_local_index(&app)?;
     let root = Path::new(&path);
     let indexed_files = unique_indexed_files_under_root(
@@ -547,7 +567,7 @@ fn search_ai_blocking(
     focus: Option<local_index::AiSearchFocus>,
     root: Option<String>,
 ) -> Result<Vec<local_index::AiSearchResult>, String> {
-    let settings = ai::AiSettings::from_request(config)?;
+    let settings = ai_settings(&app, config)?;
     let model_namespace = settings.model_namespace();
     let index = open_local_index(&app)?;
     let root_path = root
@@ -631,18 +651,58 @@ fn get_ai_thumbnail_blocking(
 
 #[tauri::command]
 async fn test_ai_connection(
+    app: tauri::AppHandle,
     config: Option<ai::AiRequestConfig>,
 ) -> Result<ai::AiConnectionReport, String> {
-    tauri::async_runtime::spawn_blocking(move || test_ai_connection_blocking(config))
+    tauri::async_runtime::spawn_blocking(move || test_ai_connection_blocking(app, config))
         .await
         .map_err(|error| format!("AI connection worker failed: {error}"))?
 }
 
 fn test_ai_connection_blocking(
+    app: tauri::AppHandle,
     config: Option<ai::AiRequestConfig>,
 ) -> Result<ai::AiConnectionReport, String> {
-    let settings = ai::AiSettings::from_request(config)?;
+    let settings = ai_settings(&app, config)?;
     ai::test_connection(&settings)
+}
+
+fn ai_settings(
+    app: &tauri::AppHandle,
+    config: Option<ai::AiRequestConfig>,
+) -> Result<ai::AiSettings, String> {
+    let config = app
+        .state::<gemini_oauth::GeminiOAuthSession>()
+        .resolve_config(config)?;
+    ai::AiSettings::from_request(config)
+}
+
+#[tauri::command]
+async fn login_gemini_oauth(
+    app: tauri::AppHandle,
+    client_file_path: String,
+) -> Result<gemini_oauth::GeminiOAuthStatus, String> {
+    let session = app
+        .state::<gemini_oauth::GeminiOAuthSession>()
+        .inner()
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || session.login(&app, Path::new(&client_file_path)))
+        .await
+        .map_err(|error| format!("Google login worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn get_gemini_oauth_status(
+    session: tauri::State<'_, gemini_oauth::GeminiOAuthSession>,
+) -> gemini_oauth::GeminiOAuthStatus {
+    session.status()
+}
+
+#[tauri::command]
+fn logout_gemini_oauth(
+    session: tauri::State<'_, gemini_oauth::GeminiOAuthSession>,
+) -> gemini_oauth::GeminiOAuthStatus {
+    session.logout()
 }
 
 #[tauri::command]
@@ -695,6 +755,7 @@ fn open_local_index(app: &tauri::AppHandle) -> Result<local_index::SqliteIndex, 
 pub fn run() {
     tauri::Builder::default()
         .manage(AiAnalysisControl::default())
+        .manage(gemini_oauth::GeminiOAuthSession::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -709,6 +770,9 @@ pub fn run() {
             search_ai,
             get_ai_thumbnail,
             test_ai_connection,
+            login_gemini_oauth,
+            get_gemini_oauth_status,
+            logout_gemini_oauth,
             open_indexed_media_path,
             prepare_indexed_media_preview
         ])

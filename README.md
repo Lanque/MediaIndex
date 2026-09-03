@@ -16,7 +16,10 @@ the Rust backend.
 - a selected-folder view plus a separate saved AI-analysis archive, both grouped
   by the footage's real source folders;
 - deterministic search, filters, local preview, and opening the original clip;
-- explicit sampled-frame AI analysis through OpenAI, Gemini, or local Ollama;
+- explicit sampled-frame AI analysis through OpenAI, Gemini, or local Ollama,
+  plus optional timestamped OpenAI speech transcription;
+- native Gemini **Login with Google** through a user-owned Desktop OAuth client,
+  with session-only credentials;
 - per-video visual search that combines similar adjacent frames into contextual
   time ranges;
 - background analysis progress, measured time estimates, cancellation, and

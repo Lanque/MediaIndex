@@ -24,8 +24,11 @@ in the desktop bundle, repository, logs, or fixtures.
 
 The desktop AI connection persists non-secret settings only. Cloud API keys
 are held in the current WebView session and legacy keys are removed from
-persistent local storage on startup. The backend never returns a key to search
-or thumbnail results.
+persistent local storage on startup. Gemini Desktop OAuth uses PKCE and an
+ephemeral `127.0.0.1` callback; its access token stays in Rust process memory
+and is cleared on disconnect, expiry, or app exit. The selected OAuth client
+JSON is read for login and is not copied into app settings. The backend never
+returns a key or OAuth token to the WebView, search, or thumbnail results.
 
 The production desktop WebView enforces a Content Security Policy that permits
 only bundled application resources, Tauri IPC, local asset-protocol video, and
@@ -64,10 +67,15 @@ delivery, stale cursors, authorization failures, and worker crashes.
 - GPT-5.6 Luna is the cost-sensitive OpenAI default; the substantially more
   expensive Terra preset is labeled as an explicit detailed-analysis choice.
 - New OpenAI settings cap analysis at 60 sampled frames per video by default.
+- Timestamped OpenAI speech indexing uploads only a temporary mono 16 kHz,
+  32 kbit/s MP3 for the configured analysis span, never the original video.
+  The temporary file is deleted immediately after the request, and the feature
+  can be disabled for frame-only analysis.
 - Every run requires confirmation after a local preflight reports
   the unique content count, duration-based estimated sampled frames/vision
-  requests, configured upper bounds, and a measured per-model time estimate
-  when one is available. Cancelling the dialog sends no provider requests.
+  requests, configured upper bounds, estimated speech-audio duration, and a
+  model-aware first-run time estimate, and a locally measured per-model estimate
+  after calibration. Cancelling the dialog sends no provider requests.
 - Duplicate file paths that share a content hash are analyzed once, preventing
   duplicate API spend for copied footage.
 - **Analyze with AI** skips content that already has annotations in the active
