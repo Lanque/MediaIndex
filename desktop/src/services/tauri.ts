@@ -10,6 +10,7 @@ import type {
   IndexReport,
   SearchFilters,
   SearchResult,
+  SavedAiMoment,
 } from "../types";
 
 export async function indexMediaFolder(path: string): Promise<IndexReport> {
@@ -47,6 +48,10 @@ export async function searchAi(
   root?: string,
 ): Promise<AiSearchResult[]> {
   return invoke<AiSearchResult[]>("search_ai", { query, config, focus, root: root || null });
+}
+
+export async function getSavedAiMoments(path: string): Promise<SavedAiMoment[]> {
+  return invoke<SavedAiMoment[]>("get_saved_ai_moments", { path });
 }
 
 export async function getAiThumbnail(

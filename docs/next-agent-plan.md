@@ -15,7 +15,7 @@ without presenting MediaIndex as a browser-hosted product.
 - Published branch: `origin/feat/performance-cost-and-search-optimizations`
 - Integration target: fetched `origin/main` at `79e2626`
 - Local `main` is stale at `78cb453`. Merge commit `6ef9655` synchronized the
-  feature branch with `origin/main`; the branch is 18 commits ahead and 0 behind
+  feature branch with `origin/main`; the branch is 19 commits ahead and 0 behind
   at this snapshot. Read
   [main-integration-review.md](main-integration-review.md) before changing Git
   history.
@@ -58,6 +58,10 @@ without presenting MediaIndex as a browser-hosted product.
     temporary audio track and included speech duration in analysis preflight.
 17. Added native Gemini **Login with Google** using a user-owned Desktop OAuth
     client JSON, PKCE, a loopback callback, and memory-only access tokens.
+18. Added a lazy saved-analysis inspector with complete descriptions, contextual
+    ranges, labels, confidence, preview controls, and separate model histories;
+    fixed reanalysis so it replaces only the active model instead of deleting
+    other model results.
 
 ## First actions in the next session
 
@@ -113,6 +117,8 @@ Use the executable or NSIS-installed app, not the Vite browser preview.
   removed; otherwise test the AI Studio API-key path;
 - run bounded AI analysis, watch progress, cancel midway, and resume;
 - search visible text, spoken dialogue, an action, an entity, and a general situation;
+- open **View AI analysis** from ordinary and AI-search cards, verify long text
+  is complete, and preview multiple saved contextual ranges;
 - confirm adjacent seconds from one event appear as one time range and a real
   action/setting/situation change starts a new range while changing dialogue
   remains searchable within it;
@@ -123,7 +129,7 @@ Use the executable or NSIS-installed app, not the Vite browser preview.
 
 ## GitHub reconciliation
 
-When authenticated, list all open and closed issues/PRs and map the 18
+When authenticated, list all open and closed issues/PRs and map the 19
 post-`origin/main` commits to them. The foundation stack is already merged
 through PR #39, so use one focused follow-up PR rather than recreating that
 stack. The follow-up PR should include:

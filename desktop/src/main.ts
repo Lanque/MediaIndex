@@ -17,6 +17,7 @@ import {
   type GeminiOAuthStatus,
   type IndexReport,
   type ModelPreset,
+  type SavedAiMoment,
   type SearchFilters,
   type SearchResult,
 } from "./types";
@@ -282,6 +283,28 @@ app.innerHTML = `
     </section>
   </div>
 
+  <!-- Saved AI analysis Modal -->
+  <div class="preview-backdrop" id="analysis-dialog" hidden>
+    <section class="analysis-modal" role="dialog" aria-modal="true" aria-labelledby="analysis-title">
+      <div class="preview-header">
+        <div>
+          <p class="section-label">Saved AI analysis</p>
+          <h2 id="analysis-title">AI analysis</h2>
+          <p class="analysis-path" id="analysis-path"></p>
+        </div>
+        <button class="secondary-button" id="close-analysis" type="button">Close</button>
+      </div>
+      <div class="analysis-modal-body">
+        <div class="analysis-explainer">
+          <strong>What is an AI moment?</strong>
+          <p>MediaIndex samples timestamps from the video, then combines adjacent samples with the same action, setting, and situation into one contextual time range. Dialogue, visible text, entities, and other detected details remain searchable inside that range.</p>
+        </div>
+        <p class="analysis-status" id="analysis-status" role="status">Loading saved analysis…</p>
+        <div class="analysis-content" id="analysis-content"></div>
+      </div>
+    </section>
+  </div>
+
   <!-- Video Preview Modal -->
   <div class="preview-backdrop" id="preview-dialog" hidden>
     <section class="preview-modal" role="dialog" aria-modal="true" aria-labelledby="preview-title">
@@ -352,6 +375,12 @@ const panelSubtitle = document.querySelector<HTMLElement>("#panel-subtitle");
 const emptyState = document.querySelector<HTMLElement>("#empty-state");
 const resultList = document.querySelector<HTMLElement>("#result-list");
 const resultsNote = document.querySelector<HTMLElement>("#results-note");
+const analysisDialog = document.querySelector<HTMLElement>("#analysis-dialog");
+const analysisTitle = document.querySelector<HTMLElement>("#analysis-title");
+const analysisPath = document.querySelector<HTMLElement>("#analysis-path");
+const analysisStatus = document.querySelector<HTMLElement>("#analysis-status");
+const analysisContent = document.querySelector<HTMLElement>("#analysis-content");
+const closeAnalysisButton = document.querySelector<HTMLButtonElement>("#close-analysis");
 const previewDialog = document.querySelector<HTMLElement>("#preview-dialog");
 const previewTitle = document.querySelector<HTMLElement>("#preview-title");
 const previewPath = document.querySelector<HTMLElement>("#preview-path");
@@ -362,6 +391,7 @@ const closePreviewButton = document.querySelector<HTMLButtonElement>("#close-pre
 let selectedLibraryPath = "";
 let pendingPreviewTimestamp = 0;
 let previewGeneration = 0;
+let analysisGeneration = 0;
 let lastAiProgressPercent = 0;
 let thumbnailGeneration = 0;
 let aiAnalysisRunning = false;
@@ -377,6 +407,7 @@ let geminiOAuthStatus: GeminiOAuthStatus = {
   expires_at_unix_ms: null,
 };
 const thumbnailCache = new Map<string, string>();
+const savedAnalysisCache = new Map<string, SavedAiMoment[]>();
 
 const AI_SETTINGS_STORAGE_KEY = "mediaindex.ai.settings.v1";
 const AI_API_KEY_SESSION_STORAGE_KEY = "mediaindex.ai.api-key.session.v1";
@@ -1077,6 +1108,100 @@ function formatMomentRange(startMs = 0, endMs = startMs): string {
     : formatDuration(startMs);
 }
 
+function renderSavedMomentLabel(label: string): string {
+  const separator = label.indexOf(": ");
+  if (separator < 0) return `<span class="analysis-label">${escapeHtml(label)}</span>`;
+  const category = label.slice(0, separator);
+  const value = label.slice(separator + 2);
+  return `<span class="analysis-label"><strong>${escapeHtml(category)}</strong>${escapeHtml(value)}</span>`;
+}
+
+function closeSavedAnalysis(): void {
+  analysisGeneration += 1;
+  if (analysisDialog) analysisDialog.hidden = true;
+}
+
+async function openSavedAnalysis(
+  path: string,
+  fileName: string,
+  savedSampleCount = 0,
+  available = true,
+): Promise<void> {
+  if (!analysisDialog || !analysisContent || !analysisStatus) return;
+  const generation = ++analysisGeneration;
+  if (analysisTitle) analysisTitle.textContent = fileName;
+  if (analysisPath) analysisPath.textContent = path;
+  analysisContent.innerHTML = "";
+  analysisStatus.hidden = false;
+  analysisStatus.textContent = "Loading saved AI analysis…";
+  analysisDialog.hidden = false;
+
+  try {
+    const cacheKey = path.toLocaleLowerCase();
+    let moments = savedAnalysisCache.get(cacheKey);
+    if (!moments) {
+      moments = await tauriApi.getSavedAiMoments(path);
+      savedAnalysisCache.set(cacheKey, moments);
+    }
+    if (generation !== analysisGeneration) return;
+    if (moments.length === 0) {
+      analysisStatus.textContent = "No saved AI analysis was found for this clip.";
+      return;
+    }
+
+    const groups = new Map<string, SavedAiMoment[]>();
+    for (const moment of moments) {
+      const group = groups.get(moment.model) ?? [];
+      group.push(moment);
+      groups.set(moment.model, group);
+    }
+    const sampleSummary = savedSampleCount > 0
+      ? `${savedSampleCount} saved timestamp samples are shown as ${moments.length} contextual ${moments.length === 1 ? "range" : "ranges"}. `
+      : `${moments.length} contextual ${moments.length === 1 ? "range" : "ranges"}. `;
+    analysisStatus.textContent = `${sampleSummary}${groups.size} model ${groups.size === 1 ? "analysis" : "analyses"} stored locally.`;
+    analysisContent.innerHTML = Array.from(groups.entries())
+      .map(([model, modelMoments]) => `<section class="analysis-model-group">
+        <header>
+          <div>
+            <span>Analysis model</span>
+            <code>${escapeHtml(model)}</code>
+          </div>
+          <strong>${modelMoments.length} ${modelMoments.length === 1 ? "moment" : "moments"}</strong>
+        </header>
+        <div class="analysis-moment-list">
+          ${modelMoments
+            .map((moment, index) => `<article class="analysis-moment-card">
+              <div class="analysis-moment-heading">
+                <div>
+                  <span class="analysis-moment-number">${String(index + 1).padStart(2, "0")}</span>
+                  <strong>${escapeHtml(formatMomentRange(moment.timestamp_ms, moment.end_timestamp_ms))}</strong>
+                  ${moment.confidence == null ? "" : `<span class="analysis-confidence">${Math.round(moment.confidence * 100)}% confidence</span>`}
+                </div>
+                <button class="secondary-button analysis-moment-preview" type="button" data-path="${escapeHtml(path)}" data-name="${escapeHtml(fileName)}" data-timestamp-ms="${moment.timestamp_ms}" ${available ? "" : "disabled"}>Preview moment</button>
+              </div>
+              <p class="analysis-description">${escapeHtml(moment.description)}</p>
+              ${moment.labels.length > 0 ? `<div class="analysis-labels">${moment.labels.map(renderSavedMomentLabel).join("")}</div>` : `<p class="analysis-no-labels">No additional context labels were stored.</p>`}
+            </article>`)
+            .join("")}
+        </div>
+      </section>`)
+      .join("");
+    analysisContent.querySelectorAll<HTMLButtonElement>(".analysis-moment-preview").forEach((button) => {
+      button.addEventListener("click", () => {
+        closeSavedAnalysis();
+        void openPreview(
+          button.dataset.path ?? "",
+          button.dataset.name ?? "Preview",
+          Number(button.dataset.timestampMs ?? "0"),
+        );
+      });
+    });
+  } catch (error) {
+    if (generation !== analysisGeneration) return;
+    analysisStatus.textContent = `Could not load saved AI analysis: ${conciseMessage(error)}`;
+  }
+}
+
 function renderResultCard(result: SearchResult, index: number): string {
   const metadata = result.metadata;
   const fileName = result.path.split(/[\\/]/).pop() ?? result.path;
@@ -1090,7 +1215,7 @@ function renderResultCard(result: SearchResult, index: number): string {
   const aiCount = result.ai_annotation_count ?? 0;
 
   const aiBadge = aiCount > 0
-    ? `<span class="relevance-badge badge-ai-indexed">AI · ${aiCount} moments</span>`
+    ? `<span class="relevance-badge badge-ai-indexed">AI · ${aiCount} samples</span>`
     : `<span class="relevance-badge badge-ai-unindexed">Scan only</span>`;
 
   const metaPills = [
@@ -1117,6 +1242,7 @@ function renderResultCard(result: SearchResult, index: number): string {
       </div>
       <p class="video-card-folder" title="${escapeHtml(result.path)}">${escapeHtml(parentFolder)}</p>
       <div class="video-card-meta">${escapeHtml(metaPills || "Metadata unavailable")}</div>
+      ${aiCount > 0 ? `<button class="analysis-disclosure-button view-ai-analysis" type="button" data-path="${escapeHtml(result.path)}" data-name="${escapeHtml(fileName)}" data-sample-count="${aiCount}" data-available="${result.available}"><span>View AI analysis</span><small>${aiCount} saved ${aiCount === 1 ? "sample" : "samples"}</small></button>` : ""}
     </div>
   </article>`;
 }
@@ -1223,6 +1349,7 @@ function renderGroupedAiResults(results: SearchResult[]): string {
         </div>
         <p class="video-card-folder">${escapeHtml(parentFolder)}</p>
         <p class="video-best-description">${escapeHtml(bestMatch.ai_description ?? "Matching scene")}</p>
+        <button class="analysis-disclosure-button view-ai-analysis" type="button" data-path="${escapeHtml(bestMatch.path)}" data-name="${escapeHtml(fileName)}" data-sample-count="${bestMatch.ai_annotation_count ?? 0}" data-available="${bestMatch.available}"><span>Full description &amp; analysis</span><small>All saved context</small></button>
         ${extraMoments}
       </div>
     </article>`;
@@ -1326,6 +1453,16 @@ function renderResults(results: SearchResult[], groupByVideo = false): void {
         if (libraryStatus) libraryStatus.textContent = "Could not open clip";
         if (libraryPath) libraryPath.textContent = conciseMessage(error);
       }
+    });
+  });
+  resultList.querySelectorAll<HTMLButtonElement>(".view-ai-analysis").forEach((button) => {
+    button.addEventListener("click", () => {
+      void openSavedAnalysis(
+        button.dataset.path ?? "",
+        button.dataset.name ?? "AI analysis",
+        Number(button.dataset.sampleCount ?? "0"),
+        button.dataset.available !== "false",
+      );
     });
   });
 }
@@ -1525,6 +1662,7 @@ async function analyzeLibraryWithAi(): Promise<void> {
       config,
       forceReanalysis,
     );
+    if (report.analyzed_file_count > 0) savedAnalysisCache.clear();
     const elapsedMs = Date.now() - analysisStartedAt;
     if (!report.cancelled && report.analyzed_file_count > 0) {
       recordAnalysisTiming(config, plan, elapsedMs);
@@ -1850,6 +1988,10 @@ closePreviewButton?.addEventListener("click", closePreview);
 previewDialog?.addEventListener("click", (event) => {
   if (event.target === previewDialog) closePreview();
 });
+closeAnalysisButton?.addEventListener("click", closeSavedAnalysis);
+analysisDialog?.addEventListener("click", (event) => {
+  if (event.target === analysisDialog) closeSavedAnalysis();
+});
 previewVideo?.addEventListener("loadedmetadata", () => {
   if (pendingPreviewTimestamp > 0 && Number.isFinite(previewVideo.duration)) {
     previewVideo.currentTime = Math.min(
@@ -1870,6 +2012,8 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     if (modelPickerDialog && !modelPickerDialog.hidden) {
       closeModelHub();
+    } else if (analysisDialog && !analysisDialog.hidden) {
+      closeSavedAnalysis();
     } else if (previewDialog && !previewDialog.hidden) {
       closePreview();
     }

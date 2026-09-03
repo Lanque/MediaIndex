@@ -15,8 +15,8 @@ The current `feat/performance-cost-and-search-optimizations` branch now contains
 `origin/main`; it is 0 commits behind. The post-main history consists of the ten
 original performance/provider/UI commits, two focused finishing commits, the
 synchronization merge, documentation reconciliation, integration cleanup,
-published-state update, selected-folder/context-range work, and the current
-speech/OAuth pass: 18 commits ahead in total at this snapshot.
+published-state update, selected-folder/context-range work, speech/OAuth, and
+the saved-analysis inspector pass: 19 commits ahead in total at this snapshot.
 
 The review delta is approximately 5.2k insertions and 1.4k deletions across 29
 tracked files. The largest areas are the TypeScript desktop interface, its
@@ -36,7 +36,7 @@ installer produced by `tauri build`.
 | Local search | filters and preview/open foundation | FTS/vector optimizations, 500-result cap, source-folder contact sheets |
 | AI analysis | sampled-frame OpenAI search flow | OpenAI/Gemini/Ollama selection, bounded batches, cancellation, model namespaces, and timestamped OpenAI speech |
 | Provider compatibility | earlier model IDs and connection behavior | current catalog, vision plus embedding connection validation, Gemini Desktop OAuth, and actionable errors |
-| AI results | timestamped matches | focused/balanced/broad relevance and continuous contextual ranges with changing dialogue retained for search |
+| AI results | timestamped matches | focused/balanced/broad relevance, continuous contextual ranges, and a lazy full-context inspector with preserved per-model history |
 | Interface | responsive desktop preview | Archive Accession Desk visual system and desktop-first information architecture |
 | Documentation | project/architecture/ADR foundation | product brief, design system, provider matrix, release evidence, continuation plan |
 

@@ -23,7 +23,7 @@ pull request.
 | Documentation maintenance | #14 | updated in the integration branch |
 | Selected-media preview job | #30 / #32 | implementation present |
 | FastAPI sync runtime | #31 | implementation and tests present |
-| Desktop AI visual index and search | #38 / #39 | implemented with provider compatibility fixes, contextual time ranges, timestamped OpenAI speech, Gemini Desktop OAuth, reanalysis confirmation, and first-run/calibrated ETA |
+| Desktop AI visual index and search | #38 / #39 | implemented with provider compatibility fixes, contextual time ranges, lazy full-analysis inspection, per-model history preservation, timestamped OpenAI speech, Gemini Desktop OAuth, reanalysis confirmation, and first-run/calibrated ETA |
 
 ## Integration state
 
@@ -32,7 +32,7 @@ pull request.
   `78cb453`; use `origin/main` for comparisons.
 - `feat/performance-cost-and-search-optimizations` is the current desktop MVP
   follow-up branch. Commit `6ef9655` merged `origin/main`, so the branch now
-  contains the fetched baseline and is 18 commits ahead, 0 behind after this
+  contains the fetched baseline and is 19 commits ahead, 0 behind after this
   snapshot.
 - The merge strategy and live GitHub reconciliation are documented in
   [main-integration-review.md](main-integration-review.md).
