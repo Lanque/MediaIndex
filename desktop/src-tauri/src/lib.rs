@@ -237,6 +237,7 @@ fn plan_ai_analysis(
     if indexed_files.is_empty() {
         return Err("No indexed active clips were found in the selected folder".to_owned());
     }
+    ensure_ai_identity_verified(&indexed_files)?;
     let model = settings.model_namespace();
     let total_file_count = indexed_files.len() as u64;
     let already_analyzed_file_count = count_already_analyzed(&index, &indexed_files, &model)?;
@@ -341,6 +342,7 @@ fn analyze_media_folder_blocking(
     if indexed_files.is_empty() {
         return Err("No indexed active clips were found in the selected folder".to_owned());
     }
+    ensure_ai_identity_verified(&indexed_files)?;
 
     let provider = settings.model_namespace();
     let (files, skipped_file_count) = select_ai_files(&index, indexed_files, &provider, force)?;
@@ -620,6 +622,19 @@ fn unique_indexed_files_under_root(
         .collect()
 }
 
+fn ensure_ai_identity_verified(indexed_files: &[local_index::IndexedFile]) -> Result<(), String> {
+    let unverified_count = indexed_files
+        .iter()
+        .filter(|file| !file.identity_verified)
+        .count();
+    if unverified_count > 0 {
+        return Err(format!(
+            "AI analysis requires a fresh scan before paid requests: {unverified_count} indexed clip identity(ies) are unverified"
+        ));
+    }
+    Ok(())
+}
+
 fn select_ai_files(
     index: &local_index::SqliteIndex,
     indexed_files: Vec<local_index::IndexedFile>,
@@ -629,6 +644,12 @@ fn select_ai_files(
     let mut files = Vec::with_capacity(indexed_files.len());
     let mut skipped_file_count = 0u64;
     for file in indexed_files {
+        if !file.identity_verified {
+            return Err(format!(
+                "AI analysis requires a fresh scan before paid requests: '{}' has an unverified identity",
+                file.path
+            ));
+        }
         let already_analyzed = file.identity_verified
             && !force
             && index
@@ -1177,6 +1198,23 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].path, "/library/a/clip.mp4");
         assert_eq!(selected[1].path, "/library/b/unique.mp4");
+    }
+
+    #[test]
+    fn rejects_unverified_content_before_ai_analysis() {
+        let files = vec![local_index::IndexedFile {
+            path: "/library/legacy/clip.mp4".to_owned(),
+            content_hash: "legacy-hash".to_owned(),
+            size_bytes: 10,
+            modified_unix_ms: None,
+            status: local_index::LocalFileStatus::Active,
+            identity_verified: false,
+        }];
+
+        let error = ensure_ai_identity_verified(&files).expect_err("legacy identity must block");
+
+        assert!(error.contains("fresh scan"));
+        assert!(error.contains("unverified"));
     }
 
     #[test]
