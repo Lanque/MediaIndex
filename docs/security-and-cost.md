@@ -74,8 +74,16 @@ delivery, stale cursors, authorization failures, and worker crashes.
 - Every run requires confirmation after a local preflight reports
   the unique content count, duration-based estimated sampled frames/vision
   requests, configured upper bounds, estimated speech-audio duration, and a
-  model-aware first-run time estimate, and a locally measured per-model estimate
-  after calibration. Cancelling the dialog sends no provider requests.
+  model-aware first-run time estimate, a low/likely/high API cost estimate, and
+  a locally measured per-model estimate after calibration. The API cost estimate
+  is a heuristic: unknown model pricing is reported as unknown rather than zero,
+  local runtime cost excludes CPU/GPU time and electricity, and the checked
+  pricing date and source are retained in the plan. Cancelling the dialog sends
+  no provider requests.
+- Remote pricing is maintained as a small checked catalog using the
+  [OpenAI pricing](https://developers.openai.com/api/docs/pricing) and
+  [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) pages. A custom
+  or newly introduced model must be priced before a USD estimate can be shown.
 - Duplicate file paths that share a content hash are analyzed once, preventing
   duplicate API spend for copied footage.
 - **Analyze with AI** skips content that already has annotations in the active

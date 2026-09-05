@@ -488,6 +488,26 @@ function analysisTimeEstimate(plan: AiAnalysisPlan, config: AiConfig): string {
   return `Estimated time: ${formatApproximateTime(timing.millisecondsPerRequest * plan.estimated_vision_requests)} based on ${timing.samples} completed local run${timing.samples === 1 ? "" : "s"}.`;
 }
 
+function formatEstimatedUsd(value: number): string {
+  return value < 0.01 ? `$${value.toFixed(4)}` : `$${value.toFixed(2)}`;
+}
+
+function analysisCostSummary(plan: AiAnalysisPlan): string {
+  const cost = plan.estimated_cost;
+  if (cost.pricing_status === "local") {
+    return "API fee: none for the local runtime; local CPU/GPU time and electricity are separate.";
+  }
+  if (
+    cost.pricing_status !== "known" ||
+    cost.estimated_low_usd === null ||
+    cost.estimated_likely_usd === null ||
+    cost.estimated_high_usd === null
+  ) {
+    return `API cost: unknown for at least one configured model. Pricing was checked ${cost.pricing_checked_at}; unknown pricing is not treated as $0.`;
+  }
+  return `Estimated API cost: ${formatEstimatedUsd(cost.estimated_low_usd)}–${formatEstimatedUsd(cost.estimated_high_usd)} USD (likely ${formatEstimatedUsd(cost.estimated_likely_usd)}). Pricing checked ${cost.pricing_checked_at}; the provider bill may differ.`;
+}
+
 function cleanApiKey(raw: string): string {
   let cleaned = raw.trim();
   if (cleaned.toLowerCase().startsWith("bearer ")) {
@@ -1636,7 +1656,7 @@ async function analyzeLibraryWithAi(): Promise<void> {
           `Configured maximum: ${plan.max_sampled_frames} frames in ${plan.max_vision_requests} requests.${speechSummary}`;
       const confirmed = window.confirm(
         `${aiProviderLabel(config.provider)} will ${action} ${plan.analyze_file_count} unique videos.\n\n` +
-          `${requestSummary}${skipped}${replacementWarning}\n\n${analysisTimeEstimate(plan, config)}\n\nContinue?`,
+          `${requestSummary}\n${analysisCostSummary(plan)}${skipped}${replacementWarning}\n\n${analysisTimeEstimate(plan, config)}\n\nContinue?`,
       );
       if (!confirmed) {
         if (libraryStatus) libraryStatus.textContent = "AI analysis not started";

@@ -337,6 +337,22 @@ impl AiSettings {
     pub(crate) fn transcribes_audio(&self) -> bool {
         self.transcribe_audio
     }
+
+    pub(crate) fn provider_name(&self) -> &'static str {
+        self.provider.name()
+    }
+
+    pub(crate) fn vision_model(&self) -> &str {
+        &self.vision_model
+    }
+
+    pub(crate) fn embedding_model(&self) -> &str {
+        &self.embedding_model
+    }
+
+    pub(crate) fn transcription_model(&self) -> &str {
+        &self.transcription_model
+    }
 }
 
 fn authorize_gemini(request: RequestBuilder, settings: &AiSettings) -> RequestBuilder {

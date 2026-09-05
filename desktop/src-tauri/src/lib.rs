@@ -1,7 +1,9 @@
 pub mod ai;
+pub mod cost;
 pub mod gemini_oauth;
 pub mod local_index;
 pub mod metadata;
+pub mod pricing;
 pub mod scanner;
 
 use base64::Engine;
@@ -67,6 +69,7 @@ struct AiAnalysisPlan {
     estimated_sampled_frames: u64,
     estimated_vision_requests: u64,
     estimated_audio_seconds: u64,
+    estimated_cost: cost::AiCostEstimate,
     model: String,
 }
 
@@ -244,6 +247,7 @@ fn plan_ai_analysis(
     let mut estimated_sampled_frames = 0u64;
     let mut estimated_vision_requests = 0u64;
     let mut estimated_audio_seconds = 0u64;
+    let mut cost_files = Vec::with_capacity(files.len());
     for file in &files {
         let metadata = index
             .get_asset_metadata(&file.content_hash)
@@ -259,8 +263,14 @@ fn plan_ai_analysis(
             })
             .unwrap_or(max_frames_per_file);
         estimated_sampled_frames = estimated_sampled_frames.saturating_add(sampled_frames);
-        estimated_vision_requests =
-            estimated_vision_requests.saturating_add(sampled_frames.div_ceil(vision_batch_size));
+        let vision_requests = sampled_frames.div_ceil(vision_batch_size);
+        estimated_vision_requests = estimated_vision_requests.saturating_add(vision_requests);
+        cost_files.push(cost::CostFile {
+            sampled_frames,
+            vision_requests,
+            width: metadata.as_ref().and_then(|metadata| metadata.width),
+            height: metadata.as_ref().and_then(|metadata| metadata.height),
+        });
         if settings.transcribes_audio()
             && metadata
                 .as_ref()
@@ -278,6 +288,15 @@ fn plan_ai_analysis(
             );
         }
     }
+    let estimated_cost = cost::estimate(cost::CostInput {
+        provider: settings.provider_name().to_owned(),
+        vision_model: settings.vision_model().to_owned(),
+        embedding_model: settings.embedding_model().to_owned(),
+        transcription_model: settings.transcription_model().to_owned(),
+        transcribes_audio: settings.transcribes_audio(),
+        audio_seconds: estimated_audio_seconds,
+        files: cost_files,
+    });
 
     Ok(AiAnalysisPlan {
         total_file_count,
@@ -290,6 +309,7 @@ fn plan_ai_analysis(
         estimated_sampled_frames,
         estimated_vision_requests,
         estimated_audio_seconds,
+        estimated_cost,
         model,
     })
 }
