@@ -158,6 +158,9 @@ app.innerHTML = `
                   <label>Max frames / video
                     <input id="ai-max-frames" name="max-frames" min="1" type="number" />
                   </label>
+                  <label>Remote API budget (USD) <span class="optional-label">(optional)</span>
+                    <input id="ai-budget-usd" name="budget-usd" min="0.01" step="0.01" type="number" placeholder="No limit" />
+                  </label>
                 </div>
                 <div class="speech-settings" id="speech-settings">
                   <label class="checkbox-field">
@@ -353,6 +356,7 @@ const aiTranscribeAudio = document.querySelector<HTMLInputElement>("#ai-transcri
 const aiTranscriptionModel = document.querySelector<HTMLInputElement>("#ai-transcription-model");
 const aiSampleSeconds = document.querySelector<HTMLInputElement>("#ai-sample-seconds");
 const aiMaxFrames = document.querySelector<HTMLInputElement>("#ai-max-frames");
+const aiBudgetUsd = document.querySelector<HTMLInputElement>("#ai-budget-usd");
 const aiReanalyzeExisting = document.querySelector<HTMLInputElement>("#ai-reanalyze-existing");
 const saveAiSettingsButton = document.querySelector<HTMLButtonElement>("#save-ai-settings");
 const testAiConnectionButton = document.querySelector<HTMLButtonElement>("#test-ai-connection");
@@ -503,9 +507,27 @@ function analysisCostSummary(plan: AiAnalysisPlan): string {
     cost.estimated_likely_usd === null ||
     cost.estimated_high_usd === null
   ) {
-    return `API cost: unknown for at least one configured model. Pricing was checked ${cost.pricing_checked_at}; unknown pricing is not treated as $0.`;
+    const budget = cost.budget_limit_usd === null
+      ? ""
+      : ` Budget limit: ${formatEstimatedUsd(cost.budget_limit_usd)}.`;
+    return `API cost: unknown for at least one configured model.${budget} Pricing was checked ${cost.pricing_checked_at}; unknown pricing is not treated as $0.`;
   }
-  return `Estimated API cost: ${formatEstimatedUsd(cost.estimated_low_usd)}–${formatEstimatedUsd(cost.estimated_high_usd)} USD (likely ${formatEstimatedUsd(cost.estimated_likely_usd)}). Pricing checked ${cost.pricing_checked_at}; the provider bill may differ.`;
+  const budget = cost.budget_limit_usd === null
+    ? " No budget limit is configured."
+    : ` Budget limit: ${formatEstimatedUsd(cost.budget_limit_usd)} (${cost.budget_status}).`;
+  return `Estimated API cost: ${formatEstimatedUsd(cost.estimated_low_usd)}–${formatEstimatedUsd(cost.estimated_high_usd)} USD (likely ${formatEstimatedUsd(cost.estimated_likely_usd)}).${budget} Pricing checked ${cost.pricing_checked_at}; the provider bill may differ.`;
+}
+
+function analysisBudgetBlockReason(plan: AiAnalysisPlan): string | null {
+  const cost = plan.estimated_cost;
+  if (cost.budget_limit_usd === null || cost.pricing_status === "local") return null;
+  if (cost.budget_status === "exceeds_limit") {
+    return `The conservative API cost estimate exceeds the configured ${formatEstimatedUsd(cost.budget_limit_usd)} budget. Lower the frame/audio scope or raise the budget.`;
+  }
+  if (cost.budget_status === "unknown") {
+    return "The configured budget cannot be enforced because at least one selected model has unknown pricing. Choose a checked model or clear the budget limit.";
+  }
+  return null;
 }
 
 function cleanApiKey(raw: string): string {
@@ -551,6 +573,7 @@ function aiDefaults(provider: AiProvider): AiConfig {
       contextHint: "",
       transcribeAudio: true,
       transcriptionModel: "whisper-1",
+      budgetUsd: null,
       reanalyzeExisting: false,
     };
   }
@@ -568,6 +591,7 @@ function aiDefaults(provider: AiProvider): AiConfig {
       contextHint: "",
       transcribeAudio: false,
       transcriptionModel: "whisper-1",
+      budgetUsd: null,
       reanalyzeExisting: false,
     };
   }
@@ -584,6 +608,7 @@ function aiDefaults(provider: AiProvider): AiConfig {
     contextHint: "",
     transcribeAudio: false,
     transcriptionModel: "whisper-1",
+    budgetUsd: null,
     reanalyzeExisting: false,
   };
 }
@@ -621,6 +646,9 @@ function readAiConfig(): AiConfig {
     contextHint: aiContextHint?.value.trim() ?? "",
     transcribeAudio: provider === "openai" && (aiTranscribeAudio?.checked ?? false),
     transcriptionModel: aiTranscriptionModel?.value.trim() || "whisper-1",
+    budgetUsd: Number.isFinite(Number(aiBudgetUsd?.value)) && Number(aiBudgetUsd?.value) > 0
+      ? Number(aiBudgetUsd?.value)
+      : null,
     reanalyzeExisting: aiReanalyzeExisting?.checked ?? false,
   };
 }
@@ -779,6 +807,7 @@ function applyAiConfig(config: AiConfig): void {
   if (aiContextHint) aiContextHint.value = config.contextHint;
   if (aiTranscribeAudio) aiTranscribeAudio.checked = config.transcribeAudio;
   if (aiTranscriptionModel) aiTranscriptionModel.value = config.transcriptionModel;
+  if (aiBudgetUsd) aiBudgetUsd.value = config.budgetUsd === null ? "" : String(config.budgetUsd);
   if (aiReanalyzeExisting) aiReanalyzeExisting.checked = config.reanalyzeExisting;
   updateAiProviderFields();
   updateActiveModelCard();
@@ -1654,6 +1683,13 @@ async function analyzeLibraryWithAi(): Promise<void> {
         ? `${plan.estimated_sampled_frames} estimated sampled frames processed locally.`
         : `${plan.estimated_sampled_frames} estimated sampled frame images in about ${plan.estimated_vision_requests} vision requests. ` +
           `Configured maximum: ${plan.max_sampled_frames} frames in ${plan.max_vision_requests} requests.${speechSummary}`;
+      const budgetBlockReason = analysisBudgetBlockReason(plan);
+      if (budgetBlockReason) {
+        if (libraryStatus) libraryStatus.textContent = "AI analysis not started";
+        if (libraryPath) libraryPath.textContent = budgetBlockReason;
+        if (aiSearchStatus) aiSearchStatus.textContent = "Adjust the AI budget or model settings and try again.";
+        return;
+      }
       const confirmed = window.confirm(
         `${aiProviderLabel(config.provider)} will ${action} ${plan.analyze_file_count} unique videos.\n\n` +
           `${requestSummary}\n${analysisCostSummary(plan)}${skipped}${replacementWarning}\n\n${analysisTimeEstimate(plan, config)}\n\nContinue?`,

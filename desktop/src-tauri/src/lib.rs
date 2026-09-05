@@ -5,6 +5,7 @@ pub mod local_index;
 pub mod metadata;
 pub mod pricing;
 pub mod scanner;
+pub mod usage;
 
 use base64::Engine;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -12,6 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
@@ -295,6 +297,7 @@ fn plan_ai_analysis(
         transcription_model: settings.transcription_model().to_owned(),
         transcribes_audio: settings.transcribes_audio(),
         audio_seconds: estimated_audio_seconds,
+        budget_limit_usd: settings.budget_usd(),
         files: cost_files,
     });
 
@@ -326,8 +329,10 @@ fn analyze_media_folder_blocking(
     force: bool,
     control: &AiAnalysisControl,
 ) -> Result<ai::AiIndexReport, String> {
-    let settings = ai_settings(&app, config)?;
+    let settings = ai_settings(&app, config.clone())?;
     let mut index = open_local_index(&app)?;
+    let plan = plan_ai_analysis(app.clone(), path.clone(), config.clone(), Some(force))?;
+    validate_ai_budget(&plan)?;
     let root = Path::new(&path);
     let indexed_files = unique_indexed_files_under_root(
         index.known_files().map_err(|error| error.to_string())?,
@@ -339,6 +344,45 @@ fn analyze_media_folder_blocking(
 
     let provider = settings.model_namespace();
     let (files, skipped_file_count) = select_ai_files(&index, indexed_files, &provider, force)?;
+    let run_id = new_ai_run_id();
+    let recorder = usage::AiUsageRecorder::new(
+        run_id.clone(),
+        plan.estimated_cost.pricing_status,
+        plan.estimated_cost.pricing_checked_at,
+    );
+    let expected_request_count = plan
+        .estimated_vision_requests
+        .saturating_add(plan.estimated_sampled_frames)
+        .saturating_add(u64::from(plan.estimated_audio_seconds > 0))
+        .max(1);
+    let usage_recorder = match (
+        plan.estimated_cost.budget_limit_usd,
+        plan.estimated_cost.estimated_high_usd,
+    ) {
+        (Some(limit), Some(estimated_high)) => {
+            usage::AiBudgetGate::new(limit, estimated_high / expected_request_count as f64)
+                .map(|gate| recorder.clone().with_budget_gate(gate))
+                .unwrap_or(recorder)
+        }
+        _ => recorder,
+    };
+    index
+        .start_ai_analysis_run(&usage::AiRunSpec {
+            run_id: run_id.clone(),
+            operation: "analyze_media_folder".to_owned(),
+            provider: settings.provider_name().to_owned(),
+            vision_model: settings.vision_model().to_owned(),
+            embedding_model: settings.embedding_model().to_owned(),
+            transcription_model: settings
+                .transcribes_audio()
+                .then(|| settings.transcription_model().to_owned()),
+            model_namespace: provider.clone(),
+            pricing_status: plan.estimated_cost.pricing_status.to_owned(),
+            pricing_checked_at: plan.estimated_cost.pricing_checked_at.to_owned(),
+            estimated_cost_usd: plan.estimated_cost.estimated_likely_usd,
+            budget_limit_usd: plan.estimated_cost.budget_limit_usd,
+        })
+        .map_err(|error| error.to_string())?;
 
     let mut report = ai::AiIndexReport {
         analyzed_file_count: 0,
@@ -372,13 +416,13 @@ fn analyze_media_folder_blocking(
     let persisted_files = Arc::new(AtomicU64::new(0));
     let (sender, receiver) = mpsc::channel();
 
-    std::thread::scope(|scope| {
+    let worker_result = std::thread::scope(|scope| {
         for _ in 0..worker_count {
             let worker_tasks = Arc::clone(&tasks);
             let worker_progress = Arc::clone(&file_progress);
             let worker_persisted = Arc::clone(&persisted_files);
             let worker_sender = sender.clone();
-            let worker_settings = settings.clone();
+            let worker_settings = settings.clone().with_usage_recorder(usage_recorder.clone());
             let worker_provider = provider.clone();
             let worker_app = app.clone();
             let worker_control = control.clone();
@@ -423,6 +467,7 @@ fn analyze_media_folder_blocking(
         drop(sender);
 
         while let Ok((file_index, file, result)) = receiver.recv() {
+            persist_ai_usage_events(&mut index, &usage_recorder)?;
             let outcome =
                 persist_ai_result(&mut index, &mut report, &file, result, &persisted_files)?;
             let percent = update_overall_progress(&file_progress, file_index, 100);
@@ -449,9 +494,27 @@ fn analyze_media_folder_blocking(
             }
         }
         Ok::<(), String>(())
-    })?;
+    });
+
+    persist_ai_usage_events(&mut index, &usage_recorder)?;
 
     report.cancelled |= control.is_cancelled();
+    let run_status = match &worker_result {
+        Ok(()) if report.cancelled => "cancelled",
+        Ok(()) if report.warnings.is_empty() => "completed",
+        Ok(()) => "partial",
+        Err(_) => "failed",
+    };
+    index
+        .finish_ai_analysis_run(
+            &run_id,
+            run_status,
+            report.analyzed_file_count,
+            report.annotation_count,
+            usage_recorder.reserved_budget_usd(plan.estimated_cost.budget_limit_usd),
+        )
+        .map_err(|error| error.to_string())?;
+    worker_result?;
 
     if !report.cancelled {
         emit_ai_progress(
@@ -466,6 +529,44 @@ fn analyze_media_folder_blocking(
     }
 
     Ok(report)
+}
+
+fn new_ai_run_id() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("run-{}-{timestamp}", std::process::id())
+}
+
+fn persist_ai_usage_events(
+    index: &mut local_index::SqliteIndex,
+    recorder: &usage::AiUsageRecorder,
+) -> Result<(), String> {
+    for event in recorder.drain() {
+        index
+            .record_ai_usage_event(&event)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn validate_ai_budget(plan: &AiAnalysisPlan) -> Result<(), String> {
+    let cost = &plan.estimated_cost;
+    if cost.budget_limit_usd.is_none() || cost.pricing_status == "local" {
+        return Ok(());
+    }
+    match cost.budget_status {
+        "exceeds_limit" => Err(
+            "The conservative API cost estimate exceeds the configured budget; refresh the plan before starting analysis."
+                .to_owned(),
+        ),
+        "unknown" => Err(
+            "The configured budget cannot be enforced because at least one selected model has unknown pricing."
+                .to_owned(),
+        ),
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -621,7 +722,7 @@ fn search_ai_blocking(
 ) -> Result<Vec<local_index::AiSearchResult>, String> {
     let settings = ai_settings(&app, config)?;
     let model_namespace = settings.model_namespace();
-    let index = open_local_index(&app)?;
+    let mut index = open_local_index(&app)?;
     let root_path = root
         .as_deref()
         .filter(|value| !value.trim().is_empty())
@@ -635,17 +736,55 @@ fn search_ai_blocking(
             "No AI moments indexed for {model_namespace}. Analyze the folder with this provider and model first."
         ));
     }
-    let embedding = ai::embed_query(&query, &settings)?;
+    let run_id = new_ai_run_id();
+    let usage_recorder =
+        usage::AiUsageRecorder::new(run_id.clone(), "unknown", pricing::PRICING_CHECKED_AT);
     index
-        .search_ai_with_focus_under_root(
-            &query,
-            &embedding,
-            100,
-            Some(&model_namespace),
-            focus.unwrap_or_default(),
-            root_path,
+        .start_ai_analysis_run(&usage::AiRunSpec {
+            run_id: run_id.clone(),
+            operation: "search_ai".to_owned(),
+            provider: settings.provider_name().to_owned(),
+            vision_model: settings.vision_model().to_owned(),
+            embedding_model: settings.embedding_model().to_owned(),
+            transcription_model: None,
+            model_namespace: model_namespace.clone(),
+            pricing_status: "unknown".to_owned(),
+            pricing_checked_at: pricing::PRICING_CHECKED_AT.to_owned(),
+            estimated_cost_usd: None,
+            budget_limit_usd: None,
+        })
+        .map_err(|error| error.to_string())?;
+    let embedding = ai::embed_query(
+        &query,
+        &settings.with_usage_recorder(usage_recorder.clone()),
+    );
+    persist_ai_usage_events(&mut index, &usage_recorder)?;
+    let results = embedding.and_then(|embedding| {
+        index
+            .search_ai_with_focus_under_root(
+                &query,
+                &embedding,
+                100,
+                Some(&model_namespace),
+                focus.unwrap_or_default(),
+                root_path,
+            )
+            .map_err(|error| error.to_string())
+    });
+    index
+        .finish_ai_analysis_run(
+            &run_id,
+            if results.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+            0,
+            0,
+            None,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    results
 }
 
 #[tauri::command]
@@ -730,7 +869,42 @@ fn test_ai_connection_blocking(
     config: Option<ai::AiRequestConfig>,
 ) -> Result<ai::AiConnectionReport, String> {
     let settings = ai_settings(&app, config)?;
-    ai::test_connection(&settings)
+    let mut index = open_local_index(&app)?;
+    let run_id = new_ai_run_id();
+    let usage_recorder =
+        usage::AiUsageRecorder::new(run_id.clone(), "unknown", pricing::PRICING_CHECKED_AT);
+    let model_namespace = settings.model_namespace();
+    index
+        .start_ai_analysis_run(&usage::AiRunSpec {
+            run_id: run_id.clone(),
+            operation: "test_ai_connection".to_owned(),
+            provider: settings.provider_name().to_owned(),
+            vision_model: settings.vision_model().to_owned(),
+            embedding_model: settings.embedding_model().to_owned(),
+            transcription_model: None,
+            model_namespace,
+            pricing_status: "unknown".to_owned(),
+            pricing_checked_at: pricing::PRICING_CHECKED_AT.to_owned(),
+            estimated_cost_usd: None,
+            budget_limit_usd: None,
+        })
+        .map_err(|error| error.to_string())?;
+    let result = ai::test_connection(&settings.with_usage_recorder(usage_recorder.clone()));
+    persist_ai_usage_events(&mut index, &usage_recorder)?;
+    index
+        .finish_ai_analysis_run(
+            &run_id,
+            if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+            0,
+            0,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+    result
 }
 
 fn ai_settings(

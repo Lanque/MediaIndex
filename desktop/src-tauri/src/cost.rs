@@ -25,6 +25,7 @@ pub struct CostInput {
     pub transcription_model: String,
     pub transcribes_audio: bool,
     pub audio_seconds: u64,
+    pub budget_limit_usd: Option<f64>,
     pub files: Vec<CostFile>,
 }
 
@@ -48,6 +49,8 @@ pub struct AiCostEstimate {
     pub audio_seconds: u64,
     pub pricing_checked_at: &'static str,
     pub pricing_source: &'static str,
+    pub budget_limit_usd: Option<f64>,
+    pub budget_status: &'static str,
     pub assumptions: Vec<String>,
 }
 
@@ -98,6 +101,8 @@ pub fn estimate(input: CostInput) -> AiCostEstimate {
             audio_seconds: input.audio_seconds,
             pricing_checked_at: pricing::PRICING_CHECKED_AT,
             pricing_source: "local runtime",
+            budget_limit_usd: input.budget_limit_usd,
+            budget_status: "local",
             assumptions: vec![
                 "No provider API fee is included; local CPU/GPU time and electricity are separate."
                     .to_owned(),
@@ -121,6 +126,9 @@ pub fn estimate(input: CostInput) -> AiCostEstimate {
         embedding_rate.is_some(),
         transcription_rate.is_some(),
     );
+    let pricing_known =
+        vision.is_some() && embedding_rate.is_some() && transcription_rate.is_some();
+    let computed_budget_status = budget_status(pricing_known, None, input.budget_limit_usd);
 
     let Some(vision) = vision else {
         return unknown_estimate(
@@ -129,6 +137,8 @@ pub fn estimate(input: CostInput) -> AiCostEstimate {
             embedding_input_tokens,
             input.audio_seconds,
             source,
+            input.budget_limit_usd,
+            computed_budget_status,
             assumptions,
         );
     };
@@ -139,6 +149,8 @@ pub fn estimate(input: CostInput) -> AiCostEstimate {
             embedding_input_tokens,
             input.audio_seconds,
             source,
+            input.budget_limit_usd,
+            computed_budget_status,
             assumptions,
         );
     };
@@ -149,6 +161,8 @@ pub fn estimate(input: CostInput) -> AiCostEstimate {
             embedding_input_tokens,
             input.audio_seconds,
             source,
+            input.budget_limit_usd,
+            computed_budget_status,
             assumptions,
         );
     };
@@ -159,6 +173,11 @@ pub fn estimate(input: CostInput) -> AiCostEstimate {
             + embedding_tokens as f64 * embedding_rate / 1_000_000.0
             + input.audio_seconds as f64 / 60.0 * transcription_rate
     };
+    let estimated_high_usd = cost(
+        vision_input_tokens.high,
+        vision_output_tokens.high,
+        embedding_input_tokens.high,
+    );
 
     AiCostEstimate {
         currency: "USD",
@@ -184,6 +203,8 @@ pub fn estimate(input: CostInput) -> AiCostEstimate {
         audio_seconds: input.audio_seconds,
         pricing_checked_at: pricing::PRICING_CHECKED_AT,
         pricing_source: source,
+        budget_limit_usd: input.budget_limit_usd,
+        budget_status: budget_status(true, Some(estimated_high_usd), input.budget_limit_usd),
         assumptions,
     }
 }
@@ -194,6 +215,8 @@ fn unknown_estimate(
     embedding_input_tokens: TokenEstimate,
     audio_seconds: u64,
     source: &'static str,
+    budget_limit_usd: Option<f64>,
+    budget_status: &'static str,
     assumptions: Vec<String>,
 ) -> AiCostEstimate {
     AiCostEstimate {
@@ -208,6 +231,8 @@ fn unknown_estimate(
         audio_seconds,
         pricing_checked_at: pricing::PRICING_CHECKED_AT,
         pricing_source: source,
+        budget_limit_usd,
+        budget_status,
         assumptions,
     }
 }
@@ -254,6 +279,24 @@ fn assumptions(
     assumptions
 }
 
+fn budget_status(
+    pricing_known: bool,
+    estimated_high_usd: Option<f64>,
+    budget_limit_usd: Option<f64>,
+) -> &'static str {
+    let Some(limit) = budget_limit_usd else {
+        return "not_configured";
+    };
+    if !pricing_known {
+        return "unknown";
+    }
+    if estimated_high_usd.is_some_and(|estimate| estimate <= limit) {
+        "within_limit"
+    } else {
+        "exceeds_limit"
+    }
+}
+
 fn image_tokens(width: Option<u32>, height: Option<u32>) -> u64 {
     let (width, height) = (width.unwrap_or(1_280), height.unwrap_or(720));
     let scale = (MAX_IMAGE_SIDE as f64 / u32::max(width, height) as f64).min(1.0);
@@ -288,6 +331,7 @@ mod tests {
             transcription_model: "whisper-1".to_owned(),
             transcribes_audio: false,
             audio_seconds: 0,
+            budget_limit_usd: None,
             files: vec![CostFile {
                 sampled_frames: 8,
                 vision_requests: 1,
@@ -331,5 +375,17 @@ mod tests {
         assert_eq!(estimate.pricing_status, "local");
         assert!(estimate.estimated_likely_usd.is_none());
         assert!(estimate.assumptions[0].contains("local CPU/GPU"));
+    }
+
+    #[test]
+    fn budget_status_is_conservative_and_unknown_is_not_approved() {
+        let mut known_input = input("openai");
+        known_input.budget_limit_usd = Some(1.0);
+        assert_eq!(estimate(known_input).budget_status, "within_limit");
+
+        let mut unknown_input = input("openai");
+        unknown_input.vision_model = "custom-vision".to_owned();
+        unknown_input.budget_limit_usd = Some(1.0);
+        assert_eq!(estimate(unknown_input).budget_status, "unknown");
     }
 }
