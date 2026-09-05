@@ -249,6 +249,7 @@ fn plan_ai_analysis(
     let requests_per_file = max_frames_per_file.div_ceil(vision_batch_size);
     let mut estimated_sampled_frames = 0u64;
     let mut estimated_vision_requests = 0u64;
+    let mut estimated_embedding_requests = 0u64;
     let mut estimated_audio_seconds = 0u64;
     let mut cost_files = Vec::with_capacity(files.len());
     for file in &files {
@@ -268,6 +269,12 @@ fn plan_ai_analysis(
         estimated_sampled_frames = estimated_sampled_frames.saturating_add(sampled_frames);
         let vision_requests = sampled_frames.div_ceil(vision_batch_size);
         estimated_vision_requests = estimated_vision_requests.saturating_add(vision_requests);
+        estimated_embedding_requests =
+            estimated_embedding_requests.saturating_add(if settings.provider_name() == "gemini" {
+                sampled_frames
+            } else {
+                u64::from(sampled_frames > 0)
+            });
         cost_files.push(cost::CostFile {
             sampled_frames,
             vision_requests,
@@ -298,6 +305,7 @@ fn plan_ai_analysis(
         transcription_model: settings.transcription_model().to_owned(),
         transcribes_audio: settings.transcribes_audio(),
         audio_seconds: estimated_audio_seconds,
+        embedding_requests: estimated_embedding_requests,
         budget_limit_usd: settings.budget_usd(),
         files: cost_files,
     });
@@ -353,20 +361,22 @@ fn analyze_media_folder_blocking(
         plan.estimated_cost.pricing_status,
         plan.estimated_cost.pricing_checked_at,
     );
-    let expected_request_count = plan
-        .estimated_vision_requests
-        .saturating_add(plan.estimated_sampled_frames)
-        .saturating_add(u64::from(plan.estimated_audio_seconds > 0))
-        .max(1);
     let usage_recorder = match (
         plan.estimated_cost.budget_limit_usd,
-        plan.estimated_cost.estimated_high_usd,
+        plan.estimated_cost.pricing_status,
     ) {
-        (Some(limit), Some(estimated_high)) => {
-            usage::AiBudgetGate::new(limit, estimated_high / expected_request_count as f64)
-                .map(|gate| recorder.clone().with_budget_gate(gate))
-                .unwrap_or(recorder)
-        }
+        (Some(limit), "known") => usage::AiBudgetGate::new(limit)
+            .map(|gate| {
+                recorder
+                    .clone()
+                    .with_budget_gate(gate)
+                    .with_request_budget_policy(usage::AiRequestBudgetPolicy {
+                        vision_usd: plan.estimated_cost.vision_request_reserve_usd,
+                        embedding_usd: plan.estimated_cost.embedding_request_reserve_usd,
+                        transcription_usd: plan.estimated_cost.transcription_request_reserve_usd,
+                    })
+            })
+            .unwrap_or(recorder),
         _ => recorder,
     };
     index

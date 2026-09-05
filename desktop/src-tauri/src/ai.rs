@@ -936,17 +936,20 @@ where
     let mut attempt = 0;
     loop {
         attempt += 1;
-        if let Some(recorder) = recorder {
-            if !recorder.try_reserve_request() {
-                recorder.record_budget_blocked(operation_name, model, attempt as u32);
-                return Err(
-                    "AI analysis stopped because the configured budget reserve is exhausted."
-                        .to_owned(),
-                );
+        let usage_event = if let Some(recorder) = recorder {
+            match recorder.begin_reserved_request(operation_name, model, attempt as u32) {
+                Some(handle) => Some(handle),
+                None => {
+                    recorder.record_budget_blocked(operation_name, model, attempt as u32);
+                    return Err(
+                        "AI analysis stopped because the configured budget reserve is exhausted."
+                            .to_owned(),
+                    );
+                }
             }
-        }
-        let usage_event =
-            recorder.map(|recorder| recorder.begin_request(operation_name, model, attempt as u32));
+        } else {
+            None
+        };
         let started = std::time::Instant::now();
         match make_request() {
             Ok(response) => {

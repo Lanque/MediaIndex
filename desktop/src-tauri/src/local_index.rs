@@ -130,6 +130,11 @@ CREATE UNIQUE INDEX ai_usage_events_local_event_id_idx
     WHERE local_event_id IS NOT NULL;
 "#;
 
+const MIGRATION_7: &str = r#"
+ALTER TABLE ai_usage_events ADD COLUMN reserved_cost_usd REAL;
+ALTER TABLE ai_usage_events ADD COLUMN budget_adjustment_usd REAL;
+"#;
+
 #[derive(Debug)]
 pub enum IndexError {
     Database(rusqlite::Error),
@@ -548,8 +553,9 @@ impl SqliteIndex {
                  local_event_id, run_id, operation, model, attempt, duration_ms, outcome,
                  status_code, request_id, usage_status, pricing_status,
                  pricing_checked_at, reported_input_tokens, reported_output_tokens,
-                 reported_audio_seconds, calculated_cost_usd, possible_cost
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                 reported_audio_seconds, calculated_cost_usd, reserved_cost_usd,
+                 budget_adjustment_usd, possible_cost
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 event.local_event_id,
                 event.run_id,
@@ -567,6 +573,8 @@ impl SqliteIndex {
                 event.reported_output_tokens,
                 event.reported_audio_seconds,
                 event.calculated_cost_usd,
+                event.reserved_cost_usd,
+                event.budget_adjustment_usd,
                 event.possible_cost,
             ],
         )?;
@@ -1055,6 +1063,7 @@ impl SqliteIndex {
             (4_i64, MIGRATION_4),
             (5_i64, MIGRATION_5),
             (6_i64, MIGRATION_6),
+            (7_i64, MIGRATION_7),
         ] {
             let applied: Option<i64> = connection
                 .query_row(
@@ -1568,7 +1577,7 @@ mod tests {
         let mut index = SqliteIndex::open_in_memory().expect("index should open");
         assert_eq!(
             index.schema_version().expect("version should be readable"),
-            6
+            7
         );
 
         let first = index
@@ -2583,6 +2592,8 @@ mod tests {
                 reported_output_tokens: None,
                 reported_audio_seconds: None,
                 calculated_cost_usd: None,
+                reserved_cost_usd: None,
+                budget_adjustment_usd: None,
                 possible_cost: true,
             })
             .expect("event should be inserted");
