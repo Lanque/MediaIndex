@@ -347,6 +347,7 @@ fn analyze_media_folder_blocking(
     let run_id = new_ai_run_id();
     let recorder = usage::AiUsageRecorder::new(
         run_id.clone(),
+        settings.provider_name(),
         plan.estimated_cost.pricing_status,
         plan.estimated_cost.pricing_checked_at,
     );
@@ -737,8 +738,12 @@ fn search_ai_blocking(
         ));
     }
     let run_id = new_ai_run_id();
-    let usage_recorder =
-        usage::AiUsageRecorder::new(run_id.clone(), "unknown", pricing::PRICING_CHECKED_AT);
+    let usage_recorder = usage::AiUsageRecorder::new(
+        run_id.clone(),
+        settings.provider_name(),
+        "unknown",
+        pricing::PRICING_CHECKED_AT,
+    );
     index
         .start_ai_analysis_run(&usage::AiRunSpec {
             run_id: run_id.clone(),
@@ -871,8 +876,12 @@ fn test_ai_connection_blocking(
     let settings = ai_settings(&app, config)?;
     let mut index = open_local_index(&app)?;
     let run_id = new_ai_run_id();
-    let usage_recorder =
-        usage::AiUsageRecorder::new(run_id.clone(), "unknown", pricing::PRICING_CHECKED_AT);
+    let usage_recorder = usage::AiUsageRecorder::new(
+        run_id.clone(),
+        settings.provider_name(),
+        "unknown",
+        pricing::PRICING_CHECKED_AT,
+    );
     let model_namespace = settings.model_namespace();
     index
         .start_ai_analysis_run(&usage::AiRunSpec {

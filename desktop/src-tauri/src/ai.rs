@@ -713,7 +713,12 @@ fn transcribe_openai_audio(
                 .send()
         },
     )?;
-    let body = read_json_response(response, "OpenAI speech transcription")?;
+    let body = read_json_response(
+        response,
+        "OpenAI speech transcription",
+        &settings.transcription_model,
+        settings.usage_recorder.as_ref(),
+    )?;
     let transcript: TimestampedTranscript = serde_json::from_value(body).map_err(|error| {
         format!("OpenAI speech transcription returned invalid timestamps: {error}")
     })?;
@@ -831,6 +836,8 @@ fn validate_vision_model(client: &Client, settings: &AiSettings) -> Result<(), S
             AiProvider::Gemini => "Gemini vision model check",
             AiProvider::Local => "Local AI vision model check",
         },
+        &settings.vision_model,
+        settings.usage_recorder.as_ref(),
     )?;
     Ok(())
 }
@@ -1316,7 +1323,12 @@ fn describe_openai(
                 .send()
         },
     )?;
-    let body = read_json_response(response, "OpenAI vision")?;
+    let body = read_json_response(
+        response,
+        "OpenAI vision",
+        &settings.vision_model,
+        settings.usage_recorder.as_ref(),
+    )?;
     response_text(&body).ok_or_else(|| "OpenAI vision returned no output text".to_owned())
 }
 
@@ -1365,7 +1377,12 @@ fn describe_gemini(
                 .send()
         },
     )?;
-    let body = read_json_response(response, "Gemini vision")?;
+    let body = read_json_response(
+        response,
+        "Gemini vision",
+        &settings.vision_model,
+        settings.usage_recorder.as_ref(),
+    )?;
     response_text(&body).ok_or_else(|| "Gemini vision returned no candidate text".to_owned())
 }
 
@@ -1396,7 +1413,12 @@ fn describe_local(
                 .send()
         },
     )?;
-    let body = read_json_response(response, "Local AI vision")?;
+    let body = read_json_response(
+        response,
+        "Local AI vision",
+        &settings.vision_model,
+        settings.usage_recorder.as_ref(),
+    )?;
     response_text(&body).ok_or_else(|| "Local AI returned no message content".to_owned())
 }
 
@@ -1477,7 +1499,12 @@ fn create_embeddings(
                         .send()
                 },
             )?;
-            let body = read_json_response(response, "OpenAI embedding")?;
+            let body = read_json_response(
+                response,
+                "OpenAI embedding",
+                &settings.embedding_model,
+                settings.usage_recorder.as_ref(),
+            )?;
             body.get("data")
                 .and_then(Value::as_array)
                 .map(|items| {
@@ -1509,7 +1536,12 @@ fn create_embeddings(
                         .send()
                 },
             )?;
-            let body = read_json_response(response, "Local AI embedding")?;
+            let body = read_json_response(
+                response,
+                "Local AI embedding",
+                &settings.embedding_model,
+                settings.usage_recorder.as_ref(),
+            )?;
             body.get("embeddings")
                 .and_then(Value::as_array)
                 .map(|items| {
@@ -1572,8 +1604,13 @@ fn request_single_gemini_embedding(
     )
     .map_err(|err| (false, err))?;
     let is_not_found = response.status() == reqwest::StatusCode::NOT_FOUND;
-    let body =
-        read_json_response(response, "Gemini embedding").map_err(|err| (is_not_found, err))?;
+    let body = read_json_response(
+        response,
+        "Gemini embedding",
+        &settings.embedding_model,
+        settings.usage_recorder.as_ref(),
+    )
+    .map_err(|err| (is_not_found, err))?;
     let embedding = body
         .get("embedding")
         .and_then(|embedding| embedding.get("values"))
@@ -1614,8 +1651,14 @@ fn values_to_embedding(values: &Vec<Value>) -> Vec<f32> {
         .collect()
 }
 
-fn read_json_response(response: Response, operation: &str) -> Result<Value, String> {
+fn read_json_response(
+    response: Response,
+    operation: &str,
+    model: &str,
+    recorder: Option<&AiUsageRecorder>,
+) -> Result<Value, String> {
     let status = response.status();
+    let request_id = response_request_id(&response);
     let raw = response
         .text()
         .map_err(|error| format!("{operation} returned an unreadable response: {error}"))?;
@@ -1625,6 +1668,17 @@ fn read_json_response(response: Response, operation: &str) -> Result<Value, Stri
             truncate(&raw, 500)
         )
     })?;
+    if let Some(recorder) = recorder {
+        let (input_tokens, output_tokens) = reported_token_usage(&body);
+        recorder.record_reported_usage(
+            operation,
+            model,
+            request_id.as_deref(),
+            input_tokens,
+            output_tokens,
+            None,
+        );
+    }
     if !status.is_success() {
         return Err(api_failure_message(
             operation,
@@ -1640,6 +1694,20 @@ fn read_json_response(response: Response, operation: &str) -> Result<Value, Stri
         ));
     }
     Ok(body)
+}
+
+fn reported_token_usage(body: &Value) -> (Option<u64>, Option<u64>) {
+    let input_tokens = body
+        .pointer("/usage/input_tokens")
+        .or_else(|| body.pointer("/usage/prompt_tokens"))
+        .or_else(|| body.pointer("/usageMetadata/promptTokenCount"))
+        .and_then(Value::as_u64);
+    let output_tokens = body
+        .pointer("/usage/output_tokens")
+        .or_else(|| body.pointer("/usage/completion_tokens"))
+        .or_else(|| body.pointer("/usageMetadata/candidatesTokenCount"))
+        .and_then(Value::as_u64);
+    (input_tokens, output_tokens)
 }
 
 fn api_failure_message(operation: &str, status: reqwest::StatusCode, detail: &str) -> String {

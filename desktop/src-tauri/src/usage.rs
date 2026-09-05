@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::pricing;
+
 #[derive(Clone, Debug)]
 pub struct AiRunSpec {
     pub run_id: String,
@@ -39,6 +41,7 @@ pub struct AiUsageEvent {
 #[derive(Clone, Debug)]
 pub struct AiUsageRecorder {
     run_id: String,
+    provider: String,
     pricing_status: String,
     pricing_checked_at: String,
     pending: Arc<Mutex<Vec<AiUsageEvent>>>,
@@ -85,11 +88,13 @@ impl AiBudgetGate {
 impl AiUsageRecorder {
     pub fn new(
         run_id: impl Into<String>,
+        provider: impl Into<String>,
         pricing_status: impl Into<String>,
         pricing_checked_at: impl Into<String>,
     ) -> Self {
         Self {
             run_id: run_id.into(),
+            provider: provider.into(),
             pricing_status: pricing_status.into(),
             pricing_checked_at: pricing_checked_at.into(),
             pending: Arc::new(Mutex::new(Vec::new())),
@@ -175,6 +180,43 @@ impl AiUsageRecorder {
         }
     }
 
+    pub fn record_reported_usage(
+        &self,
+        operation: &str,
+        model: &str,
+        request_id: Option<&str>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        audio_seconds: Option<f64>,
+    ) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        let event = pending.iter_mut().rev().find(|event| {
+            event.operation == operation
+                && event.model == model
+                && event.usage_status == "not_reported"
+                && request_id
+                    .is_none_or(|request_id| event.request_id.as_deref() == Some(request_id))
+        });
+        let Some(event) = event else {
+            return;
+        };
+        event.reported_input_tokens = input_tokens;
+        event.reported_output_tokens = output_tokens;
+        event.reported_audio_seconds = audio_seconds;
+        event.calculated_cost_usd = reported_cost(
+            &self.provider,
+            operation,
+            model,
+            input_tokens,
+            output_tokens,
+        );
+        if input_tokens.is_some() || output_tokens.is_some() || audio_seconds.is_some() {
+            event.usage_status = "reported".to_owned();
+        }
+    }
+
     pub fn drain(&self) -> Vec<AiUsageEvent> {
         self.pending
             .lock()
@@ -188,6 +230,35 @@ fn usd_to_micros(value: f64) -> Option<u64> {
         .then(|| (value * 1_000_000.0).ceil())
         .filter(|value| *value <= u64::MAX as f64)
         .map(|value| value as u64)
+}
+
+fn reported_cost(
+    provider: &str,
+    operation: &str,
+    model: &str,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+) -> Option<f64> {
+    let input_tokens = input_tokens.unwrap_or_default();
+    let output_tokens = output_tokens.unwrap_or_default();
+    if input_tokens == 0 && output_tokens == 0 {
+        return None;
+    }
+    match operation {
+        "OpenAI vision" | "Gemini vision" => {
+            let pricing = pricing::vision_pricing(provider, model)?;
+            Some(
+                input_tokens as f64 * pricing.input_usd_per_million.unwrap_or_default()
+                    / 1_000_000.0
+                    + output_tokens as f64 * pricing.output_usd_per_million.unwrap_or_default()
+                        / 1_000_000.0,
+            )
+        }
+        "OpenAI embedding" | "Gemini embedding" => {
+            Some(input_tokens as f64 * pricing::embedding_pricing(provider, model)? / 1_000_000.0)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -211,5 +282,35 @@ mod tests {
 
         assert_eq!(successes, 1);
         assert!((gate.reserved_usd(1.0) - 0.6).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn reported_embedding_usage_is_recorded_and_priced() {
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05");
+        recorder.record_request(
+            "OpenAI embedding",
+            "text-embedding-3-small",
+            1,
+            25,
+            "response_received",
+            Some(200),
+            Some("req_test".to_owned()),
+        );
+        recorder.record_reported_usage(
+            "OpenAI embedding",
+            "text-embedding-3-small",
+            Some("req_test"),
+            Some(1_000),
+            None,
+            None,
+        );
+
+        let event = recorder
+            .drain()
+            .pop()
+            .expect("usage event should be available");
+        assert_eq!(event.usage_status, "reported");
+        assert_eq!(event.reported_input_tokens, Some(1_000));
+        assert!(event.calculated_cost_usd.is_some_and(|cost| cost > 0.0));
     }
 }
