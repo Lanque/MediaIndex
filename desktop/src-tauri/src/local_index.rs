@@ -123,6 +123,13 @@ CREATE INDEX ai_usage_events_run_id_idx ON ai_usage_events(run_id);
 CREATE INDEX ai_usage_events_operation_idx ON ai_usage_events(operation);
 "#;
 
+const MIGRATION_6: &str = r#"
+ALTER TABLE ai_usage_events ADD COLUMN local_event_id TEXT;
+CREATE UNIQUE INDEX ai_usage_events_local_event_id_idx
+    ON ai_usage_events(local_event_id)
+    WHERE local_event_id IS NOT NULL;
+"#;
+
 #[derive(Debug)]
 pub enum IndexError {
     Database(rusqlite::Error),
@@ -538,12 +545,13 @@ impl SqliteIndex {
     pub fn record_ai_usage_event(&mut self, event: &AiUsageEvent) -> Result<(), IndexError> {
         self.connection.execute(
             "INSERT INTO ai_usage_events(
-                 run_id, operation, model, attempt, duration_ms, outcome,
+                 local_event_id, run_id, operation, model, attempt, duration_ms, outcome,
                  status_code, request_id, usage_status, pricing_status,
                  pricing_checked_at, reported_input_tokens, reported_output_tokens,
                  reported_audio_seconds, calculated_cost_usd, possible_cost
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
+                event.local_event_id,
                 event.run_id,
                 event.operation,
                 event.model,
@@ -1046,6 +1054,7 @@ impl SqliteIndex {
             (3_i64, MIGRATION_3),
             (4_i64, MIGRATION_4),
             (5_i64, MIGRATION_5),
+            (6_i64, MIGRATION_6),
         ] {
             let applied: Option<i64> = connection
                 .query_row(
@@ -1559,7 +1568,7 @@ mod tests {
         let mut index = SqliteIndex::open_in_memory().expect("index should open");
         assert_eq!(
             index.schema_version().expect("version should be readable"),
-            5
+            6
         );
 
         let first = index
@@ -2558,6 +2567,7 @@ mod tests {
             .expect("run should be inserted");
         index
             .record_ai_usage_event(&AiUsageEvent {
+                local_event_id: "run-test:1".to_owned(),
                 run_id: "run-test".to_owned(),
                 operation: "OpenAI embedding".to_owned(),
                 model: "text-embedding-3-small".to_owned(),
