@@ -123,6 +123,7 @@ fn index_media_folder_blocking(
                     size_bytes: file.size_bytes,
                     modified_unix_ms: file.modified_unix_ms,
                     content_hash: file.content_hash,
+                    identity_verified: file.identity_verified,
                 },
             )
         })
@@ -493,7 +494,7 @@ fn unique_indexed_files_under_root(
     files
         .into_iter()
         .filter(|file| Path::new(&file.path).starts_with(root))
-        .filter(|file| content_hashes.insert(file.content_hash.clone()))
+        .filter(|file| !file.identity_verified || content_hashes.insert(file.content_hash.clone()))
         .collect()
 }
 
@@ -506,7 +507,8 @@ fn select_ai_files(
     let mut files = Vec::with_capacity(indexed_files.len());
     let mut skipped_file_count = 0u64;
     for file in indexed_files {
-        let already_analyzed = !force
+        let already_analyzed = file.identity_verified
+            && !force
             && index
                 .has_ai_annotations_for_content_model(&file.content_hash, model)
                 .map_err(|error| error.to_string())?;
@@ -526,9 +528,10 @@ fn count_already_analyzed(
 ) -> Result<u64, String> {
     let mut count = 0u64;
     for file in indexed_files {
-        if index
-            .has_ai_annotations_for_content_model(&file.content_hash, model)
-            .map_err(|error| error.to_string())?
+        if file.identity_verified
+            && index
+                .has_ai_annotations_for_content_model(&file.content_hash, model)
+                .map_err(|error| error.to_string())?
         {
             count += 1;
         }
@@ -850,6 +853,7 @@ mod tests {
             size_bytes: 10,
             modified_unix_ms: None,
             status: local_index::LocalFileStatus::Active,
+            identity_verified: true,
         };
         index
             .reconcile(
@@ -937,6 +941,7 @@ mod tests {
                 size_bytes: 10,
                 modified_unix_ms: None,
                 status: local_index::LocalFileStatus::Active,
+                identity_verified: true,
             },
             local_index::IndexedFile {
                 path: "/library/b/copy.mp4".to_owned(),
@@ -944,6 +949,7 @@ mod tests {
                 size_bytes: 10,
                 modified_unix_ms: None,
                 status: local_index::LocalFileStatus::Active,
+                identity_verified: true,
             },
             local_index::IndexedFile {
                 path: "/library/b/unique.mp4".to_owned(),
@@ -951,6 +957,7 @@ mod tests {
                 size_bytes: 20,
                 modified_unix_ms: None,
                 status: local_index::LocalFileStatus::Active,
+                identity_verified: true,
             },
             local_index::IndexedFile {
                 path: "/outside/other.mp4".to_owned(),
@@ -958,6 +965,7 @@ mod tests {
                 size_bytes: 30,
                 modified_unix_ms: None,
                 status: local_index::LocalFileStatus::Active,
+                identity_verified: true,
             },
         ];
 
@@ -977,6 +985,7 @@ mod tests {
                 size_bytes: 10,
                 modified_unix_ms: None,
                 status: local_index::LocalFileStatus::Active,
+                identity_verified: true,
             },
             local_index::IndexedFile {
                 path: "/library/fortnite/day-two/clip-b.mp4".to_owned(),
@@ -984,6 +993,7 @@ mod tests {
                 size_bytes: 20,
                 modified_unix_ms: None,
                 status: local_index::LocalFileStatus::Active,
+                identity_verified: true,
             },
         ];
 

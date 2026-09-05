@@ -69,6 +69,11 @@ JOIN media_assets ON media_assets.content_hash = local_files.content_hash
 WHERE local_files.status = 'ACTIVE';
 "#;
 
+const MIGRATION_4: &str = r#"
+ALTER TABLE local_files ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 0
+    CHECK (identity_verified IN (0, 1));
+"#;
+
 #[derive(Debug)]
 pub enum IndexError {
     Database(rusqlite::Error),
@@ -140,6 +145,7 @@ pub struct IndexedFile {
     pub size_bytes: u64,
     pub modified_unix_ms: Option<u64>,
     pub status: LocalFileStatus,
+    pub identity_verified: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -378,7 +384,9 @@ impl SqliteIndex {
         Ok(self
             .connection
             .query_row(
-                "SELECT path, content_hash, size_bytes, modified_unix_ms, status FROM local_files WHERE path = ?1",
+                "SELECT path, content_hash, size_bytes, modified_unix_ms, status,
+                        identity_verified
+                 FROM local_files WHERE path = ?1",
                 params![path],
                 |row| {
                     let status: String = row.get(4)?;
@@ -388,6 +396,7 @@ impl SqliteIndex {
                         size_bytes: row.get(2)?,
                         modified_unix_ms: row.get(3)?,
                         status: parse_status(&status),
+                        identity_verified: row.get::<_, i64>(5)? != 0,
                     })
                 },
             )
@@ -396,7 +405,8 @@ impl SqliteIndex {
 
     pub fn known_files(&self) -> Result<Vec<IndexedFile>, IndexError> {
         let mut statement = self.connection.prepare(
-            "SELECT path, content_hash, size_bytes, modified_unix_ms, status
+            "SELECT path, content_hash, size_bytes, modified_unix_ms, status,
+                    identity_verified
              FROM local_files
              WHERE status = 'ACTIVE'
              ORDER BY path",
@@ -409,6 +419,7 @@ impl SqliteIndex {
                 size_bytes: row.get(2)?,
                 modified_unix_ms: row.get(3)?,
                 status: parse_status(&status),
+                identity_verified: row.get::<_, i64>(5)? != 0,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -496,7 +507,11 @@ impl SqliteIndex {
 
     pub fn ai_annotation_count_for_model(&self, model_namespace: &str) -> Result<u64, IndexError> {
         Ok(self.connection.query_row(
-            "SELECT COUNT(*) FROM ai_annotations WHERE model = ?1",
+            "SELECT COUNT(*)
+             FROM ai_annotations
+             JOIN local_files ON local_files.content_hash = ai_annotations.content_hash
+             WHERE local_files.identity_verified = 1
+               AND ai_annotations.model = ?1",
             params![model_namespace],
             |row| row.get(0),
         )?)
@@ -514,7 +529,8 @@ impl SqliteIndex {
             "SELECT local_files.path, local_files.content_hash, ai_annotations.timestamp_ms
              FROM ai_annotations
              JOIN local_files ON local_files.content_hash = ai_annotations.content_hash
-             WHERE ai_annotations.model = ?1",
+             WHERE local_files.identity_verified = 1
+               AND ai_annotations.model = ?1",
         )?;
         let rows = statement.query_map(params![model_namespace], |row| {
             Ok((
@@ -598,7 +614,8 @@ impl SqliteIndex {
                     local_files.path, local_files.content_hash, local_files.status
              FROM ai_annotations
              JOIN local_files ON local_files.content_hash = ai_annotations.content_hash
-             WHERE (?1 IS NULL OR ai_annotations.model = ?1)",
+             WHERE local_files.identity_verified = 1
+               AND (?1 IS NULL OR ai_annotations.model = ?1)",
         )?;
         let rows = statement.query_map(params![model_namespace], |row| {
             let timestamp_ms: u64 = row.get(0)?;
@@ -746,6 +763,9 @@ impl SqliteIndex {
         let Some(file) = self.get_file(path)? else {
             return Ok(Vec::new());
         };
+        if !file.identity_verified {
+            return Ok(Vec::new());
+        }
         let mut statement = self.connection.prepare(
             "SELECT timestamp_ms, description, labels_json, embedding_json,
                     confidence, model
@@ -896,6 +916,7 @@ impl SqliteIndex {
             (1_i64, MIGRATION_1),
             (2_i64, MIGRATION_2),
             (3_i64, MIGRATION_3),
+            (4_i64, MIGRATION_4),
         ] {
             let applied: Option<i64> = connection
                 .query_row(
@@ -949,13 +970,15 @@ fn upsert_file(
         params![file.content_hash, file.size_bytes, metadata_json],
     )?;
     transaction.execute(
-        "INSERT INTO local_files(path, content_hash, size_bytes, modified_unix_ms, status)
-         VALUES (?1, ?2, ?3, ?4, 'ACTIVE')
+        "INSERT INTO local_files(
+             path, content_hash, size_bytes, modified_unix_ms, status, identity_verified
+         ) VALUES (?1, ?2, ?3, ?4, 'ACTIVE', 1)
          ON CONFLICT(path) DO UPDATE SET
              content_hash = excluded.content_hash,
              size_bytes = excluded.size_bytes,
              modified_unix_ms = excluded.modified_unix_ms,
              status = 'ACTIVE',
+             identity_verified = 1,
              last_seen_at = CURRENT_TIMESTAMP",
         params![
             file.path,
@@ -1407,7 +1430,7 @@ mod tests {
         let mut index = SqliteIndex::open_in_memory().expect("index should open");
         assert_eq!(
             index.schema_version().expect("version should be readable"),
-            3
+            4
         );
 
         let first = index
@@ -1427,6 +1450,13 @@ mod tests {
         assert_eq!(second.changes[0].kind, IndexChangeKind::Unchanged);
         assert_eq!(index.asset_count().expect("asset count should work"), 1);
         assert_eq!(index.local_file_count().expect("file count should work"), 1);
+        assert!(
+            index
+                .get_file("/library/a.mp4")
+                .expect("file should load")
+                .expect("file should exist")
+                .identity_verified
+        );
         assert_eq!(
             index.active_file_count().expect("active count should work"),
             1
