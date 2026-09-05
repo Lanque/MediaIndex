@@ -9,7 +9,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::metadata::MediaMetadata;
-use crate::usage::AiUsageRecorder;
+use crate::usage::{AiUsageEventHandle, AiUsageRecorder};
 
 const DEFAULT_OPENAI_VISION_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_OPENAI_EMBEDDING_MODEL: &str = "text-embedding-3-small";
@@ -912,12 +912,23 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
         || status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
 }
 
+struct TrackedResponse {
+    response: Response,
+    usage_event: Option<AiUsageEventHandle>,
+}
+
+impl TrackedResponse {
+    fn status(&self) -> reqwest::StatusCode {
+        self.response.status()
+    }
+}
+
 fn execute_with_retry<F>(
     operation_name: &str,
     model: &str,
     recorder: Option<&AiUsageRecorder>,
     mut make_request: F,
-) -> Result<Response, String>
+) -> Result<TrackedResponse, String>
 where
     F: FnMut() -> Result<Response, reqwest::Error>,
 {
@@ -934,16 +945,15 @@ where
                 );
             }
         }
+        let usage_event =
+            recorder.map(|recorder| recorder.begin_request(operation_name, model, attempt as u32));
         let started = std::time::Instant::now();
         match make_request() {
             Ok(response) => {
                 let status = response.status();
                 let retryable = is_transient_status(status) && attempt < MAX_ATTEMPTS;
-                if let Some(recorder) = recorder {
-                    recorder.record_request(
-                        operation_name,
-                        model,
-                        attempt as u32,
+                if let Some(usage_event) = usage_event.as_ref() {
+                    usage_event.record_response(
                         started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                         if retryable {
                             "retryable_http_error"
@@ -957,6 +967,9 @@ where
                     );
                 }
                 if retryable {
+                    if let Some(usage_event) = usage_event.as_ref() {
+                        usage_event.finish();
+                    }
                     let delay_ms = match attempt {
                         1 => 1_500,
                         2 => 3_500,
@@ -965,16 +978,16 @@ where
                     std::thread::sleep(Duration::from_millis(delay_ms));
                     continue;
                 }
-                return Ok(response);
+                return Ok(TrackedResponse {
+                    response,
+                    usage_event,
+                });
             }
             Err(error) => {
                 let retryable =
                     (error.is_timeout() || error.is_connect()) && attempt < MAX_ATTEMPTS;
-                if let Some(recorder) = recorder {
-                    recorder.record_request(
-                        operation_name,
-                        model,
-                        attempt as u32,
+                if let Some(usage_event) = usage_event.as_ref() {
+                    usage_event.record_response(
                         started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                         if retryable {
                             "retryable_transport_error"
@@ -984,6 +997,7 @@ where
                         None,
                         None,
                     );
+                    usage_event.finish();
                 }
                 if retryable {
                     std::thread::sleep(Duration::from_millis(1_500 * attempt as u64));
@@ -1652,32 +1666,50 @@ fn values_to_embedding(values: &Vec<Value>) -> Vec<f32> {
 }
 
 fn read_json_response(
-    response: Response,
+    tracked_response: TrackedResponse,
     operation: &str,
-    model: &str,
-    recorder: Option<&AiUsageRecorder>,
+    _model: &str,
+    _recorder: Option<&AiUsageRecorder>,
 ) -> Result<Value, String> {
+    let TrackedResponse {
+        response,
+        usage_event,
+    } = tracked_response;
     let status = response.status();
-    let request_id = response_request_id(&response);
-    let raw = response
-        .text()
-        .map_err(|error| format!("{operation} returned an unreadable response: {error}"))?;
-    let body: Value = serde_json::from_str(&raw).map_err(|error| {
-        format!(
-            "{operation} failed (HTTP {status}) with non-JSON response: {} ({error})",
-            truncate(&raw, 500)
-        )
-    })?;
-    if let Some(recorder) = recorder {
+    let raw = match response.text() {
+        Ok(raw) => raw,
+        Err(error) => {
+            if let Some(usage_event) = usage_event.as_ref() {
+                usage_event.finish();
+            }
+            return Err(format!(
+                "{operation} returned an unreadable response: {error}"
+            ));
+        }
+    };
+    let body: Value = match serde_json::from_str(&raw) {
+        Ok(body) => body,
+        Err(error) => {
+            if let Some(usage_event) = usage_event.as_ref() {
+                usage_event.finish();
+            }
+            return Err(format!(
+                "{operation} failed (HTTP {status}) with non-JSON response: {} ({error})",
+                truncate(&raw, 500)
+            ));
+        }
+    };
+    if let Some(usage_event) = usage_event.as_ref() {
         let (input_tokens, output_tokens) = reported_token_usage(&body);
-        recorder.record_reported_usage(
-            operation,
-            model,
-            request_id.as_deref(),
+        usage_event.record_reported_usage(
+            _recorder
+                .map(|recorder| recorder.provider_name())
+                .unwrap_or_default(),
             input_tokens,
             output_tokens,
             None,
         );
+        usage_event.finish();
     }
     if !status.is_success() {
         return Err(api_failure_message(

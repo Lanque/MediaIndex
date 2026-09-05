@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -20,6 +21,7 @@ pub struct AiRunSpec {
 
 #[derive(Clone, Debug)]
 pub struct AiUsageEvent {
+    pub local_event_id: String,
     pub run_id: String,
     pub operation: String,
     pub model: String,
@@ -44,8 +46,21 @@ pub struct AiUsageRecorder {
     provider: String,
     pricing_status: String,
     pricing_checked_at: String,
-    pending: Arc<Mutex<Vec<AiUsageEvent>>>,
+    next_event_id: Arc<AtomicU64>,
+    state: Arc<Mutex<RecorderState>>,
     budget_gate: Option<AiBudgetGate>,
+}
+
+#[derive(Debug, Default)]
+struct RecorderState {
+    pending: HashMap<String, AiUsageEvent>,
+    completed: Vec<AiUsageEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AiUsageEventHandle {
+    local_event_id: String,
+    state: Arc<Mutex<RecorderState>>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,7 +112,8 @@ impl AiUsageRecorder {
             provider: provider.into(),
             pricing_status: pricing_status.into(),
             pricing_checked_at: pricing_checked_at.into(),
-            pending: Arc::new(Mutex::new(Vec::new())),
+            next_event_id: Arc::new(AtomicU64::new(1)),
+            state: Arc::new(Mutex::new(RecorderState::default())),
             budget_gate: None,
         }
     }
@@ -107,6 +123,10 @@ impl AiUsageRecorder {
         self
     }
 
+    pub fn provider_name(&self) -> &str {
+        &self.provider
+    }
+
     pub fn try_reserve_request(&self) -> bool {
         self.budget_gate
             .as_ref()
@@ -114,7 +134,9 @@ impl AiUsageRecorder {
     }
 
     pub fn record_budget_blocked(&self, operation: &str, model: &str, attempt: u32) {
+        let local_event_id = self.new_local_event_id();
         let event = AiUsageEvent {
+            local_event_id,
             run_id: self.run_id.clone(),
             operation: operation.to_owned(),
             model: model.to_owned(),
@@ -132,8 +154,8 @@ impl AiUsageRecorder {
             calculated_cost_usd: None,
             possible_cost: false,
         };
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.push(event);
+        if let Ok(mut state) = self.state.lock() {
+            state.completed.push(event);
         }
     }
 
@@ -157,15 +179,23 @@ impl AiUsageRecorder {
         status_code: Option<u16>,
         request_id: Option<String>,
     ) {
+        let handle = self.begin_request(operation, model, attempt);
+        handle.record_response(duration_ms, outcome, status_code, request_id);
+        handle.finish();
+    }
+
+    pub fn begin_request(&self, operation: &str, model: &str, attempt: u32) -> AiUsageEventHandle {
+        let local_event_id = self.new_local_event_id();
         let event = AiUsageEvent {
+            local_event_id: local_event_id.clone(),
             run_id: self.run_id.clone(),
             operation: operation.to_owned(),
             model: model.to_owned(),
             attempt,
-            duration_ms,
-            outcome: outcome.to_owned(),
-            status_code,
-            request_id,
+            duration_ms: 0,
+            outcome: "started".to_owned(),
+            status_code: None,
+            request_id: None,
             usage_status: "not_reported".to_owned(),
             pricing_status: self.pricing_status.clone(),
             pricing_checked_at: self.pricing_checked_at.clone(),
@@ -175,8 +205,12 @@ impl AiUsageRecorder {
             calculated_cost_usd: None,
             possible_cost: true,
         };
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.push(event);
+        if let Ok(mut state) = self.state.lock() {
+            state.pending.insert(local_event_id.clone(), event);
+        }
+        AiUsageEventHandle {
+            local_event_id,
+            state: self.state.clone(),
         }
     }
 
@@ -189,39 +223,103 @@ impl AiUsageRecorder {
         output_tokens: Option<u64>,
         audio_seconds: Option<f64>,
     ) {
-        let Ok(mut pending) = self.pending.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             return;
         };
-        let event = pending.iter_mut().rev().find(|event| {
+        let event = state.pending.values_mut().find(|event| {
             event.operation == operation
                 && event.model == model
                 && event.usage_status == "not_reported"
                 && request_id
                     .is_none_or(|request_id| event.request_id.as_deref() == Some(request_id))
         });
-        let Some(event) = event else {
-            return;
-        };
-        event.reported_input_tokens = input_tokens;
-        event.reported_output_tokens = output_tokens;
-        event.reported_audio_seconds = audio_seconds;
-        event.calculated_cost_usd = reported_cost(
-            &self.provider,
-            operation,
-            model,
-            input_tokens,
-            output_tokens,
-        );
-        if input_tokens.is_some() || output_tokens.is_some() || audio_seconds.is_some() {
-            event.usage_status = "reported".to_owned();
+        if let Some(event) = event {
+            update_reported_usage(
+                event,
+                &self.provider,
+                input_tokens,
+                output_tokens,
+                audio_seconds,
+            );
         }
     }
 
     pub fn drain(&self) -> Vec<AiUsageEvent> {
-        self.pending
+        self.state
             .lock()
-            .map(|mut pending| std::mem::take(&mut *pending))
+            .map(|mut state| std::mem::take(&mut state.completed))
             .unwrap_or_default()
+    }
+
+    fn new_local_event_id(&self) -> String {
+        format!(
+            "{}:{}",
+            self.run_id,
+            self.next_event_id.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+}
+
+impl AiUsageEventHandle {
+    pub fn record_response(
+        &self,
+        duration_ms: u64,
+        outcome: &str,
+        status_code: Option<u16>,
+        request_id: Option<String>,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(event) = state.pending.get_mut(&self.local_event_id) {
+                event.duration_ms = duration_ms;
+                event.outcome = outcome.to_owned();
+                event.status_code = status_code;
+                event.request_id = request_id;
+            }
+        }
+    }
+
+    pub fn record_reported_usage(
+        &self,
+        provider: &str,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        audio_seconds: Option<f64>,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(event) = state.pending.get_mut(&self.local_event_id) {
+                update_reported_usage(event, provider, input_tokens, output_tokens, audio_seconds);
+            }
+        }
+    }
+
+    pub fn finish(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(event) = state.pending.remove(&self.local_event_id) {
+                state.completed.push(event);
+            }
+        }
+    }
+}
+
+fn update_reported_usage(
+    event: &mut AiUsageEvent,
+    provider: &str,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    audio_seconds: Option<f64>,
+) {
+    event.reported_input_tokens = input_tokens;
+    event.reported_output_tokens = output_tokens;
+    event.reported_audio_seconds = audio_seconds;
+    event.calculated_cost_usd = reported_cost(
+        provider,
+        &event.operation,
+        &event.model,
+        input_tokens,
+        output_tokens,
+    );
+    if input_tokens.is_some() || output_tokens.is_some() || audio_seconds.is_some() {
+        event.usage_status = "reported".to_owned();
     }
 }
 
@@ -287,23 +385,16 @@ mod tests {
     #[test]
     fn reported_embedding_usage_is_recorded_and_priced() {
         let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05");
-        recorder.record_request(
-            "OpenAI embedding",
-            "text-embedding-3-small",
-            1,
+        let handle = recorder.begin_request("OpenAI embedding", "text-embedding-3-small", 1);
+        handle.record_response(
             25,
             "response_received",
             Some(200),
             Some("req_test".to_owned()),
         );
-        recorder.record_reported_usage(
-            "OpenAI embedding",
-            "text-embedding-3-small",
-            Some("req_test"),
-            Some(1_000),
-            None,
-            None,
-        );
+        assert!(recorder.drain().is_empty());
+        handle.record_reported_usage(recorder.provider_name(), Some(1_000), None, None);
+        handle.finish();
 
         let event = recorder
             .drain()
@@ -312,5 +403,31 @@ mod tests {
         assert_eq!(event.usage_status, "reported");
         assert_eq!(event.reported_input_tokens, Some(1_000));
         assert!(event.calculated_cost_usd.is_some_and(|cost| cost > 0.0));
+        assert_eq!(event.local_event_id, "run-test:1");
+    }
+
+    #[test]
+    fn response_usage_survives_a_concurrent_drain_attempt() {
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05");
+        let handle = recorder.begin_request("OpenAI embedding", "text-embedding-3-small", 1);
+        handle.record_response(
+            25,
+            "response_received",
+            Some(200),
+            Some("req_test".to_owned()),
+        );
+
+        let drained_before_body_parse = recorder.drain();
+        assert!(drained_before_body_parse.is_empty());
+
+        handle.record_reported_usage(recorder.provider_name(), Some(1_000), None, None);
+        handle.finish();
+
+        let event = recorder
+            .drain()
+            .pop()
+            .expect("completed event should be drainable");
+        assert_eq!(event.local_event_id, "run-test:1");
+        assert_eq!(event.usage_status, "reported");
     }
 }
