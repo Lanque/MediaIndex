@@ -348,14 +348,14 @@ fn analyze_media_folder_blocking(
     let worker_count = settings.parallel_file_limit().min(tasks.len());
     let tasks = Arc::new(Mutex::new(tasks));
     let file_progress = Arc::new(Mutex::new(vec![0u8; total_files as usize]));
-    let completed_files = Arc::new(AtomicU64::new(0));
+    let persisted_files = Arc::new(AtomicU64::new(0));
     let (sender, receiver) = mpsc::channel();
 
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
             let worker_tasks = Arc::clone(&tasks);
             let worker_progress = Arc::clone(&file_progress);
-            let worker_completed = Arc::clone(&completed_files);
+            let worker_persisted = Arc::clone(&persisted_files);
             let worker_sender = sender.clone();
             let worker_settings = settings.clone();
             let worker_provider = provider.clone();
@@ -380,7 +380,7 @@ fn analyze_media_folder_blocking(
                             update_overall_progress(&worker_progress, file_index, progress.percent);
                         emit_ai_progress(
                             &worker_app,
-                            worker_completed.load(Ordering::Relaxed),
+                            worker_persisted.load(Ordering::Relaxed),
                             total_files,
                             current_file.clone(),
                             worker_provider.clone(),
@@ -394,50 +394,41 @@ fn analyze_media_folder_blocking(
                     let _ = worker_sender.send((file_index, file, result));
                     break;
                 }
-                let percent = update_overall_progress(&worker_progress, file_index, 100);
-                let completed = worker_completed.fetch_add(1, Ordering::Relaxed) + 1;
-                let phase = if result.is_ok() {
-                    "Clip finished"
-                } else {
-                    "Clip finished with a warning"
-                };
-                emit_ai_progress(
-                    &worker_app,
-                    completed,
-                    total_files,
-                    current_file,
-                    worker_provider.clone(),
-                    percent,
-                    phase,
-                );
                 if worker_sender.send((file_index, file, result)).is_err() {
                     break;
                 }
             });
         }
-    });
-    drop(sender);
+        drop(sender);
 
-    let mut results = receiver.into_iter().collect::<Vec<_>>();
-    results.sort_by_key(|(file_index, _, _)| *file_index);
-    for (_, file, result) in results {
-        match result {
-            Ok(annotations) => {
-                report.analyzed_file_count += 1;
-                report.annotation_count += annotations.len() as u64;
-                index
-                    .replace_ai_annotations(&file.content_hash, &annotations)
-                    .map_err(|error| error.to_string())?;
+        while let Ok((file_index, file, result)) = receiver.recv() {
+            let outcome =
+                persist_ai_result(&mut index, &mut report, &file, result, &persisted_files)?;
+            let percent = update_overall_progress(&file_progress, file_index, 100);
+            match outcome {
+                AiResultOutcome::Committed => emit_ai_progress(
+                    &app,
+                    persisted_files.load(Ordering::Relaxed),
+                    total_files,
+                    file.path,
+                    provider.clone(),
+                    percent,
+                    "Clip saved",
+                ),
+                AiResultOutcome::Warning => emit_ai_progress(
+                    &app,
+                    persisted_files.load(Ordering::Relaxed),
+                    total_files,
+                    file.path,
+                    provider.clone(),
+                    percent,
+                    "Clip finished with a warning",
+                ),
+                AiResultOutcome::Cancelled => {}
             }
-            Err(error) if error == ai::AI_ANALYSIS_CANCELLED_MESSAGE => {
-                report.cancelled = true;
-            }
-            Err(error) => report.warnings.push(ai::AiWarning {
-                path: file.path,
-                message: error,
-            }),
         }
-    }
+        Ok::<(), String>(())
+    })?;
 
     report.cancelled |= control.is_cancelled();
 
@@ -454,6 +445,44 @@ fn analyze_media_folder_blocking(
     }
 
     Ok(report)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AiResultOutcome {
+    Committed,
+    Warning,
+    Cancelled,
+}
+
+fn persist_ai_result(
+    index: &mut local_index::SqliteIndex,
+    report: &mut ai::AiIndexReport,
+    file: &local_index::IndexedFile,
+    result: Result<Vec<ai::AiAnnotation>, String>,
+    persisted_files: &AtomicU64,
+) -> Result<AiResultOutcome, String> {
+    match result {
+        Ok(annotations) => {
+            index
+                .replace_ai_annotations(&file.content_hash, &annotations)
+                .map_err(|error| error.to_string())?;
+            report.analyzed_file_count += 1;
+            report.annotation_count += annotations.len() as u64;
+            persisted_files.fetch_add(1, Ordering::Relaxed);
+            Ok(AiResultOutcome::Committed)
+        }
+        Err(error) if error == ai::AI_ANALYSIS_CANCELLED_MESSAGE => {
+            report.cancelled = true;
+            Ok(AiResultOutcome::Cancelled)
+        }
+        Err(error) => {
+            report.warnings.push(ai::AiWarning {
+                path: file.path.clone(),
+                message: error,
+            });
+            Ok(AiResultOutcome::Warning)
+        }
+    }
 }
 
 fn unique_indexed_files_under_root(
@@ -810,6 +839,78 @@ mod tests {
         assert_eq!(update_overall_progress(&progress, 3, 100), 65);
         assert_eq!(update_overall_progress(&progress, 0, 100), 87);
         assert_eq!(update_overall_progress(&progress, 1, 100), 100);
+    }
+
+    #[test]
+    fn persisted_file_counter_changes_only_after_successful_sqlite_commit() {
+        let mut index = local_index::SqliteIndex::open_in_memory().expect("index should open");
+        let file = local_index::IndexedFile {
+            path: "/library/clip.mp4".to_owned(),
+            content_hash: "hash-clip".to_owned(),
+            size_bytes: 10,
+            modified_unix_ms: None,
+            status: local_index::LocalFileStatus::Active,
+        };
+        index
+            .reconcile(
+                &scanner::ScanReport {
+                    files: vec![scanner::DiscoveredFile {
+                        path: file.path.clone(),
+                        size_bytes: file.size_bytes,
+                        modified_unix_ms: file.modified_unix_ms,
+                        content_hash: file.content_hash.clone(),
+                    }],
+                    warnings: Vec::new(),
+                },
+                &HashMap::new(),
+            )
+            .expect("file should be indexed");
+
+        let mut report = ai::AiIndexReport {
+            analyzed_file_count: 0,
+            skipped_file_count: 0,
+            annotation_count: 0,
+            cancelled: false,
+            warnings: Vec::new(),
+        };
+        let persisted_files = AtomicU64::new(0);
+        let annotation = ai::AiAnnotation {
+            timestamp_ms: 1_000,
+            description: "A saved scene".to_owned(),
+            labels: vec!["scene".to_owned()],
+            embedding: vec![0.1, 0.2],
+            confidence: Some(0.9),
+            model: "openai:test".to_owned(),
+        };
+
+        assert_eq!(
+            persist_ai_result(
+                &mut index,
+                &mut report,
+                &file,
+                Ok(vec![annotation.clone()]),
+                &persisted_files,
+            )
+            .expect("result should be committed"),
+            AiResultOutcome::Committed
+        );
+        assert_eq!(persisted_files.load(Ordering::Relaxed), 1);
+        assert_eq!(index.ai_annotation_count().expect("count should load"), 1);
+
+        let missing_file = local_index::IndexedFile {
+            content_hash: "missing-hash".to_owned(),
+            ..file
+        };
+        assert!(persist_ai_result(
+            &mut index,
+            &mut report,
+            &missing_file,
+            Ok(vec![annotation]),
+            &persisted_files,
+        )
+        .is_err());
+        assert_eq!(persisted_files.load(Ordering::Relaxed), 1);
+        assert_eq!(report.analyzed_file_count, 1);
     }
 
     #[test]
