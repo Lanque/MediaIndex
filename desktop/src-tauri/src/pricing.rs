@@ -47,6 +47,7 @@ pub fn embedding_pricing(provider: &str, model: &str) -> Option<f64> {
 
 pub fn transcription_pricing(provider: &str, model: &str) -> Option<f64> {
     match (provider, model.to_ascii_lowercase().as_str()) {
+        ("openai", "whisper-1") => Some(0.006),
         ("openai", "gpt-transcribe") => Some(0.0045),
         ("openai", "gpt-4o-transcribe") => Some(0.006),
         ("openai", "gpt-4o-mini-transcribe") => Some(0.003),
@@ -59,5 +60,15 @@ pub fn embedding_source(provider: &str) -> &'static str {
         "openai" => OPENAI_EMBEDDING_SOURCE,
         "gemini" => GEMINI_PRICING_SOURCE,
         _ => "local runtime",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn includes_the_default_openai_whisper_price() {
+        assert_eq!(transcription_pricing("openai", "whisper-1"), Some(0.006));
     }
 }
