@@ -9,6 +9,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::metadata::MediaMetadata;
+use crate::usage::AiUsageRecorder;
 
 const DEFAULT_OPENAI_VISION_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_OPENAI_EMBEDDING_MODEL: &str = "text-embedding-3-small";
@@ -66,6 +67,7 @@ pub struct AiRequestConfig {
     pub context_hint: Option<String>,
     pub transcribe_audio: Option<bool>,
     pub transcription_model: Option<String>,
+    pub budget_usd: Option<f64>,
     pub auth_mode: Option<String>,
     pub google_project_id: Option<String>,
 }
@@ -132,6 +134,8 @@ pub struct AiSettings {
     context_hint: Option<String>,
     transcribe_audio: bool,
     transcription_model: String,
+    budget_usd: Option<f64>,
+    usage_recorder: Option<AiUsageRecorder>,
     gemini_uses_oauth: bool,
     google_project_id: Option<String>,
 }
@@ -278,6 +282,9 @@ impl AiSettings {
             provider == AiProvider::OpenAI && request.transcribe_audio.unwrap_or(false);
         let transcription_model = non_empty(request.transcription_model)
             .unwrap_or_else(|| DEFAULT_OPENAI_TRANSCRIPTION_MODEL.to_owned());
+        let budget_usd = request
+            .budget_usd
+            .filter(|value| value.is_finite() && *value > 0.0);
 
         Ok(Self {
             provider,
@@ -291,6 +298,8 @@ impl AiSettings {
             context_hint,
             transcribe_audio,
             transcription_model,
+            budget_usd,
+            usage_recorder: None,
             gemini_uses_oauth,
             google_project_id,
         })
@@ -352,6 +361,15 @@ impl AiSettings {
 
     pub(crate) fn transcription_model(&self) -> &str {
         &self.transcription_model
+    }
+
+    pub(crate) fn budget_usd(&self) -> Option<f64> {
+        self.budget_usd
+    }
+
+    pub(crate) fn with_usage_recorder(mut self, recorder: AiUsageRecorder) -> Self {
+        self.usage_recorder = Some(recorder);
+        self
     }
 }
 
@@ -675,21 +693,26 @@ fn transcribe_openai_audio(
             audio_path.display()
         )
     })?;
-    let response = execute_with_retry("OpenAI speech transcription", || {
-        let part = multipart::Part::bytes(audio.clone())
-            .file_name("speech.mp3")
-            .mime_str("audio/mpeg")?;
-        let form = multipart::Form::new()
-            .text("model", settings.transcription_model.clone())
-            .text("response_format", "verbose_json")
-            .text("timestamp_granularities[]", "segment")
-            .part("file", part);
-        client
-            .post(format!("{}/audio/transcriptions", settings.base_url))
-            .bearer_auth(&settings.api_key)
-            .multipart(form)
-            .send()
-    })?;
+    let response = execute_with_retry(
+        "OpenAI speech transcription",
+        &settings.transcription_model,
+        settings.usage_recorder.as_ref(),
+        || {
+            let part = multipart::Part::bytes(audio.clone())
+                .file_name("speech.mp3")
+                .mime_str("audio/mpeg")?;
+            let form = multipart::Form::new()
+                .text("model", settings.transcription_model.clone())
+                .text("response_format", "verbose_json")
+                .text("timestamp_granularities[]", "segment")
+                .part("file", part);
+            client
+                .post(format!("{}/audio/transcriptions", settings.base_url))
+                .bearer_auth(&settings.api_key)
+                .multipart(form)
+                .send()
+        },
+    )?;
     let body = read_json_response(response, "OpenAI speech transcription")?;
     let transcript: TimestampedTranscript = serde_json::from_value(body).map_err(|error| {
         format!("OpenAI speech transcription returned invalid timestamps: {error}")
@@ -766,25 +789,40 @@ pub fn test_connection(settings: &AiSettings) -> Result<AiConnectionReport, Stri
 fn validate_vision_model(client: &Client, settings: &AiSettings) -> Result<(), String> {
     let clean_model = settings.vision_model.trim_start_matches("models/").trim();
     let response = match settings.provider {
-        AiProvider::OpenAI => execute_with_retry("OpenAI vision model check", || {
-            client
-                .get(format!("{}/models/{clean_model}", settings.base_url))
-                .bearer_auth(&settings.api_key)
+        AiProvider::OpenAI => execute_with_retry(
+            "OpenAI vision model check",
+            &settings.vision_model,
+            settings.usage_recorder.as_ref(),
+            || {
+                client
+                    .get(format!("{}/models/{clean_model}", settings.base_url))
+                    .bearer_auth(&settings.api_key)
+                    .send()
+            },
+        )?,
+        AiProvider::Gemini => execute_with_retry(
+            "Gemini vision model check",
+            &settings.vision_model,
+            settings.usage_recorder.as_ref(),
+            || {
+                authorize_gemini(
+                    client.get(format!("{}/models/{clean_model}", settings.base_url)),
+                    settings,
+                )
                 .send()
-        })?,
-        AiProvider::Gemini => execute_with_retry("Gemini vision model check", || {
-            authorize_gemini(
-                client.get(format!("{}/models/{clean_model}", settings.base_url)),
-                settings,
-            )
-            .send()
-        })?,
-        AiProvider::Local => execute_with_retry("Local AI vision model check", || {
-            client
-                .post(format!("{}/api/show", settings.base_url))
-                .json(&json!({"model": clean_model}))
-                .send()
-        })?,
+            },
+        )?,
+        AiProvider::Local => execute_with_retry(
+            "Local AI vision model check",
+            &settings.vision_model,
+            settings.usage_recorder.as_ref(),
+            || {
+                client
+                    .post(format!("{}/api/show", settings.base_url))
+                    .json(&json!({"model": clean_model}))
+                    .send()
+            },
+        )?,
     };
     read_json_response(
         response,
@@ -867,7 +905,12 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
         || status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
 }
 
-fn execute_with_retry<F>(operation_name: &str, mut make_request: F) -> Result<Response, String>
+fn execute_with_retry<F>(
+    operation_name: &str,
+    model: &str,
+    recorder: Option<&AiUsageRecorder>,
+    mut make_request: F,
+) -> Result<Response, String>
 where
     F: FnMut() -> Result<Response, reqwest::Error>,
 {
@@ -875,10 +918,38 @@ where
     let mut attempt = 0;
     loop {
         attempt += 1;
+        if let Some(recorder) = recorder {
+            if !recorder.try_reserve_request() {
+                recorder.record_budget_blocked(operation_name, model, attempt as u32);
+                return Err(
+                    "AI analysis stopped because the configured budget reserve is exhausted."
+                        .to_owned(),
+                );
+            }
+        }
+        let started = std::time::Instant::now();
         match make_request() {
             Ok(response) => {
                 let status = response.status();
-                if is_transient_status(status) && attempt < MAX_ATTEMPTS {
+                let retryable = is_transient_status(status) && attempt < MAX_ATTEMPTS;
+                if let Some(recorder) = recorder {
+                    recorder.record_request(
+                        operation_name,
+                        model,
+                        attempt as u32,
+                        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                        if retryable {
+                            "retryable_http_error"
+                        } else if status.is_success() {
+                            "response_received"
+                        } else {
+                            "http_error"
+                        },
+                        Some(status.as_u16()),
+                        response_request_id(&response),
+                    );
+                }
+                if retryable {
                     let delay_ms = match attempt {
                         1 => 1_500,
                         2 => 3_500,
@@ -890,7 +961,24 @@ where
                 return Ok(response);
             }
             Err(error) => {
-                if (error.is_timeout() || error.is_connect()) && attempt < MAX_ATTEMPTS {
+                let retryable =
+                    (error.is_timeout() || error.is_connect()) && attempt < MAX_ATTEMPTS;
+                if let Some(recorder) = recorder {
+                    recorder.record_request(
+                        operation_name,
+                        model,
+                        attempt as u32,
+                        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                        if retryable {
+                            "retryable_transport_error"
+                        } else {
+                            "transport_error"
+                        },
+                        None,
+                        None,
+                    );
+                }
+                if retryable {
                     std::thread::sleep(Duration::from_millis(1_500 * attempt as u64));
                     continue;
                 }
@@ -898,6 +986,18 @@ where
             }
         }
     }
+}
+
+fn response_request_id(response: &Response) -> Option<String> {
+    ["x-request-id", "request-id", "x-goog-request-id"]
+        .iter()
+        .find_map(|header| {
+            response
+                .headers()
+                .get(*header)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        })
 }
 
 fn provider_from_environment() -> Option<AiProvider> {
@@ -1204,13 +1304,18 @@ fn describe_openai(
     if let Some(effort) = openai_reasoning_effort(&settings.vision_model) {
         request["reasoning"] = json!({"effort": effort});
     }
-    let response = execute_with_retry("OpenAI vision", || {
-        client
-            .post(format!("{}/responses", settings.base_url))
-            .bearer_auth(&settings.api_key)
-            .json(&request)
-            .send()
-    })?;
+    let response = execute_with_retry(
+        "OpenAI vision",
+        &settings.vision_model,
+        settings.usage_recorder.as_ref(),
+        || {
+            client
+                .post(format!("{}/responses", settings.base_url))
+                .bearer_auth(&settings.api_key)
+                .json(&request)
+                .send()
+        },
+    )?;
     let body = read_json_response(response, "OpenAI vision")?;
     response_text(&body).ok_or_else(|| "OpenAI vision returned no output text".to_owned())
 }
@@ -1250,11 +1355,16 @@ fn describe_gemini(
         }],
         "generationConfig": {"responseMimeType": "application/json"}
     });
-    let response = execute_with_retry("Gemini vision", || {
-        authorize_gemini(client.post(&url), settings)
-            .json(&payload)
-            .send()
-    })?;
+    let response = execute_with_retry(
+        "Gemini vision",
+        &settings.vision_model,
+        settings.usage_recorder.as_ref(),
+        || {
+            authorize_gemini(client.post(&url), settings)
+                .json(&payload)
+                .send()
+        },
+    )?;
     let body = read_json_response(response, "Gemini vision")?;
     response_text(&body).ok_or_else(|| "Gemini vision returned no candidate text".to_owned())
 }
@@ -1275,12 +1385,17 @@ fn describe_local(
         "format": "json",
         "stream": false
     });
-    let response = execute_with_retry("Local AI vision", || {
-        client
-            .post(format!("{}/api/chat", settings.base_url))
-            .json(&payload)
-            .send()
-    })?;
+    let response = execute_with_retry(
+        "Local AI vision",
+        &settings.vision_model,
+        settings.usage_recorder.as_ref(),
+        || {
+            client
+                .post(format!("{}/api/chat", settings.base_url))
+                .json(&payload)
+                .send()
+        },
+    )?;
     let body = read_json_response(response, "Local AI vision")?;
     response_text(&body).ok_or_else(|| "Local AI returned no message content".to_owned())
 }
@@ -1350,13 +1465,18 @@ fn create_embeddings(
                 "model": settings.embedding_model,
                 "input": texts
             });
-            let response = execute_with_retry("OpenAI embedding", || {
-                client
-                    .post(format!("{}/embeddings", settings.base_url))
-                    .bearer_auth(&settings.api_key)
-                    .json(&payload)
-                    .send()
-            })?;
+            let response = execute_with_retry(
+                "OpenAI embedding",
+                &settings.embedding_model,
+                settings.usage_recorder.as_ref(),
+                || {
+                    client
+                        .post(format!("{}/embeddings", settings.base_url))
+                        .bearer_auth(&settings.api_key)
+                        .json(&payload)
+                        .send()
+                },
+            )?;
             let body = read_json_response(response, "OpenAI embedding")?;
             body.get("data")
                 .and_then(Value::as_array)
@@ -1378,12 +1498,17 @@ fn create_embeddings(
                 "model": settings.embedding_model,
                 "input": texts
             });
-            let response = execute_with_retry("Local AI embedding", || {
-                client
-                    .post(format!("{}/api/embed", settings.base_url))
-                    .json(&payload)
-                    .send()
-            })?;
+            let response = execute_with_retry(
+                "Local AI embedding",
+                &settings.embedding_model,
+                settings.usage_recorder.as_ref(),
+                || {
+                    client
+                        .post(format!("{}/api/embed", settings.base_url))
+                        .json(&payload)
+                        .send()
+                },
+            )?;
             let body = read_json_response(response, "Local AI embedding")?;
             body.get("embeddings")
                 .and_then(Value::as_array)
@@ -1435,11 +1560,16 @@ fn request_single_gemini_embedding(
     } else {
         payload["taskType"] = json!(task_type);
     }
-    let response = execute_with_retry("Gemini embedding", || {
-        authorize_gemini(client.post(&url), settings)
-            .json(&payload)
-            .send()
-    })
+    let response = execute_with_retry(
+        "Gemini embedding",
+        &settings.embedding_model,
+        settings.usage_recorder.as_ref(),
+        || {
+            authorize_gemini(client.post(&url), settings)
+                .json(&payload)
+                .send()
+        },
+    )
     .map_err(|err| (false, err))?;
     let is_not_found = response.status() == reqwest::StatusCode::NOT_FOUND;
     let body =

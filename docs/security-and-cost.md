@@ -38,6 +38,12 @@ path is an active SQLite-indexed file, confirms it still exists, and authorizes
 only that file for the current process. System-player opening applies the same
 index and availability checks.
 
+AI request attempts are recorded locally with operation/model, retry number,
+duration, HTTP status, optional provider request ID, pricing status, and an
+explicit possible-charge flag. Request bodies, media bytes, API keys, and
+response content are excluded; missing provider usage remains visible as
+unknown rather than being inferred as zero.
+
 Windows installers built locally or in pull-request CI are intentionally
 unsigned until the release owner provides an Authenticode certificate through
 the release environment. Certificate material and passwords must never be
@@ -96,7 +102,9 @@ delivery, stale cursors, authorization failures, and worker crashes.
   the provider may finish before cancellation takes effect.
 - Focused search limits low-ranking results, videos, and moments without making
   another vision request. Query embeddings remain the only AI call during
-  search.
+  search and are recorded as a separate usage operation.
+- Connection tests are also recorded separately from analysis; their network
+  requests can therefore be distinguished from indexed-media usage.
 - Best-moment thumbnails are extracted and cached locally with FFmpeg. The
   thumbnail command accepts only active paths already present in the SQLite
   index and never uploads the source frame.

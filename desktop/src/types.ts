@@ -84,6 +84,8 @@ export type AiCostEstimate = {
   audio_seconds: number;
   pricing_checked_at: string;
   pricing_source: string;
+  budget_limit_usd: number | null;
+  budget_status: "not_configured" | "within_limit" | "exceeds_limit" | "unknown" | "local";
   assumptions: string[];
 };
 
@@ -113,6 +115,7 @@ export type AiConfig = {
   contextHint: string;
   transcribeAudio: boolean;
   transcriptionModel: string;
+  budgetUsd: number | null;
   reanalyzeExisting: boolean;
 };
 

@@ -65,3 +65,12 @@ AI analysis is explicit and samples frames through the local FFmpeg executable.
 The application sends those sampled images to the configured AI provider only
 after the user presses **Analyze with AI**; ordinary folder scanning never
 invokes the AI provider.
+
+AI runs are recorded in `ai_analysis_runs`, and every provider attempt is
+recorded in `ai_usage_events`. The register stores the operation, exact model,
+retry attempt, elapsed time, HTTP status, optional provider request ID, pricing
+status, and whether the attempt may have incurred a charge. Response usage is
+kept explicitly unknown until a provider reports it; API keys, prompts, frame
+bytes, and response content are never written to the register. Search
+embeddings and connection checks are separate run operations from media
+analysis.
