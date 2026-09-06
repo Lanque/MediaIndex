@@ -2104,6 +2104,7 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage::AiBudgetGate;
 
     fn read_stub_request(stream: &mut std::net::TcpStream) -> (String, Vec<String>, Value) {
         use std::io::Read;
@@ -2199,16 +2200,129 @@ mod tests {
     }
 
     fn write_stub_response(stream: &mut std::net::TcpStream, body: &Value) {
+        let body = serde_json::to_string(body).expect("stub response should serialize");
+        write_stub_response_with_status(stream, 200, "OK", body.as_bytes());
+    }
+
+    fn write_stub_response_with_status(
+        stream: &mut std::net::TcpStream,
+        status: u16,
+        reason: &str,
+        body: &[u8],
+    ) {
         use std::io::Write;
 
-        let body = serde_json::to_string(body).expect("stub response should serialize");
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         stream
             .write_all(response.as_bytes())
+            .and_then(|_| stream.write_all(body))
             .expect("stub response should write");
+    }
+
+    fn spawn_single_json_stub(body: Value) -> (String, std::thread::JoinHandle<()>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("stub should accept a request");
+            let _ = read_stub_request(&mut stream);
+            write_stub_response(&mut stream, &body);
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn spawn_timeout_stub() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("stub should accept a request");
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = read_stub_request(&mut stream);
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        (format!("http://{address}"), requests, handle)
+    }
+
+    fn spawn_truncated_response_stub() -> (String, std::thread::JoinHandle<()>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let handle = std::thread::spawn(move || {
+            use std::io::Write;
+
+            let (mut stream, _) = listener.accept().expect("stub should accept a request");
+            let _ = read_stub_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{}",
+                )
+                .expect("stub response should write");
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn spawn_parallel_retry_budget_stub() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        listener
+            .set_nonblocking(true)
+            .expect("stub should support nonblocking accepts");
+        let address = listener.local_addr().expect("stub should have an address");
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let handle = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut last_accept = started;
+            let mut workers = Vec::new();
+            while started.elapsed() < Duration::from_secs(4)
+                && (request_count.load(std::sync::atomic::Ordering::SeqCst) < 3
+                    || last_accept.elapsed() < Duration::from_secs(2))
+            {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let sequence =
+                            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        last_accept = std::time::Instant::now();
+                        workers.push(std::thread::spawn(move || {
+                            let _ = read_stub_request(&mut stream);
+                            if sequence == 1 {
+                                write_stub_response_with_status(
+                                    &mut stream,
+                                    500,
+                                    "Internal Server Error",
+                                    br#"{"error":{"message":"temporary failure"}}"#,
+                                );
+                            } else {
+                                write_stub_response_with_status(&mut stream, 200, "OK", b"{}");
+                            }
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("stub accept failed: {error}"),
+                }
+            }
+            for worker in workers {
+                worker.join().expect("stub worker should finish");
+            }
+        });
+        (format!("http://{address}"), requests, handle)
     }
 
     fn spawn_openai_stub() -> (String, std::thread::JoinHandle<()>) {
@@ -2468,6 +2582,204 @@ mod tests {
 
         assert!(!response_body_reports_error(&body));
         assert!(response_text(&body).is_some());
+    }
+
+    #[test]
+    fn successful_json_without_usage_keeps_the_entire_request_reserve() {
+        let (base_url, server) = spawn_single_json_stub(json!({"status": "completed"}));
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("test client should build");
+        let response = execute_with_retry(
+            "OpenAI vision",
+            "gpt-5.6-luna",
+            Some(&recorder),
+            Some(0.6),
+            || client.get(&base_url).send(),
+        )
+        .expect("successful stub response should be returned");
+        let body = read_json_response(
+            response,
+            "OpenAI vision",
+            "gpt-5.6-luna",
+            Some(&recorder),
+            None,
+        )
+        .expect("successful JSON should parse");
+        server.join().expect("stub should finish");
+
+        assert_eq!(
+            body.get("status").and_then(Value::as_str),
+            Some("completed")
+        );
+        assert!((recorder.reserved_budget_usd(Some(1.0)).unwrap() - 0.6).abs() < 0.000_001);
+        let event = recorder
+            .drain()
+            .pop()
+            .expect("usage event should be available");
+        assert_eq!(event.usage_status, "not_reported");
+        assert_eq!(event.calculated_cost_usd, None);
+    }
+
+    #[test]
+    fn api_error_without_usage_keeps_the_request_reserve_unknown() {
+        let (base_url, server) =
+            spawn_single_json_stub(json!({"error": {"message": "quota exceeded"}}));
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("test client should build");
+        let response = execute_with_retry(
+            "OpenAI vision",
+            "gpt-5.6-luna",
+            Some(&recorder),
+            Some(0.6),
+            || client.get(&base_url).send(),
+        )
+        .expect("HTTP response should be returned for body parsing");
+        let error = read_json_response(
+            response,
+            "OpenAI vision",
+            "gpt-5.6-luna",
+            Some(&recorder),
+            None,
+        )
+        .expect_err("API error body should fail the request");
+        server.join().expect("stub should finish");
+
+        assert!(error.contains("quota exceeded"));
+        assert!((recorder.reserved_budget_usd(Some(1.0)).unwrap() - 0.6).abs() < 0.000_001);
+        let event = recorder
+            .drain()
+            .pop()
+            .expect("usage event should be available");
+        assert_eq!(event.usage_status, "not_reported");
+        assert_eq!(event.outcome, "response_received");
+    }
+
+    #[test]
+    fn timeout_keeps_the_request_reserve_as_unknown() {
+        let (base_url, requests, server) = spawn_timeout_stub();
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
+        let client = Client::builder()
+            .connect_timeout(Duration::from_millis(100))
+            .timeout(Duration::from_millis(50))
+            .build()
+            .expect("test client should build");
+        let result = execute_with_retry(
+            "OpenAI vision",
+            "gpt-5.6-luna",
+            Some(&recorder),
+            Some(0.6),
+            || client.get(&base_url).send(),
+        );
+        server.join().expect("timeout stub should finish");
+
+        assert!(result.is_err());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!((recorder.reserved_budget_usd(Some(1.0)).unwrap() - 0.6).abs() < 0.000_001);
+        let event = recorder
+            .drain()
+            .into_iter()
+            .find(|event| event.outcome != "budget_blocked")
+            .expect("timeout usage event should be available");
+        assert!(matches!(
+            event.outcome.as_str(),
+            "retryable_transport_error" | "transport_error"
+        ));
+        assert_eq!(event.usage_status, "not_reported");
+    }
+
+    #[test]
+    fn unreadable_response_keeps_the_request_reserve_as_unknown() {
+        let (base_url, server) = spawn_truncated_response_stub();
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("test client should build");
+        let response = execute_with_retry(
+            "OpenAI vision",
+            "gpt-5.6-luna",
+            Some(&recorder),
+            Some(0.6),
+            || client.get(&base_url).send(),
+        )
+        .expect("HTTP response should be returned for body parsing");
+        let error = read_json_response(
+            response,
+            "OpenAI vision",
+            "gpt-5.6-luna",
+            Some(&recorder),
+            None,
+        )
+        .expect_err("truncated response should be unreadable");
+        server.join().expect("truncated stub should finish");
+
+        assert!(error.contains("unreadable response"));
+        assert!((recorder.reserved_budget_usd(Some(1.0)).unwrap() - 0.6).abs() < 0.000_001);
+        let event = recorder
+            .drain()
+            .pop()
+            .expect("usage event should be available");
+        assert_eq!(event.usage_status, "not_reported");
+        assert_eq!(event.outcome, "response_received");
+    }
+
+    #[test]
+    fn parallel_requests_and_retry_do_not_send_a_request_over_the_budget() {
+        let (base_url, requests, server) = spawn_parallel_retry_budget_stub();
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("test client should build");
+        let workers = (0..2)
+            .map(|_| {
+                let client = client.clone();
+                let base_url = base_url.clone();
+                let recorder = recorder.clone();
+                std::thread::spawn(move || {
+                    let result = execute_with_retry(
+                        "OpenAI vision",
+                        "gpt-5.6-luna",
+                        Some(&recorder),
+                        Some(0.5),
+                        || client.get(&base_url).send(),
+                    );
+                    match result {
+                        Ok(response) => {
+                            if let Some(usage_event) = response.usage_event.as_ref() {
+                                usage_event.finish();
+                            }
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("request worker should finish"))
+            .collect::<Vec<Result<(), String>>>();
+        server.join().expect("parallel stub should finish");
+
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert!(
+            (recorder.reserved_budget_usd(Some(1.0)).unwrap() - 1.0).abs() < 0.000_001,
+            "both unknown requests must remain committed"
+        );
     }
 
     #[test]
