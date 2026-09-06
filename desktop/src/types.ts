@@ -32,6 +32,10 @@ export type SearchResult = {
   ai_description?: string;
   match_score?: number;
   ai_annotation_count?: number;
+  ai_coverage_status?: "complete" | "partial" | "failed" | "legacy" | "coverage_unknown";
+  ai_coverage_warning?: string | null;
+  ai_successful_frame_count?: number | null;
+  ai_planned_frame_count?: number | null;
   metadata: {
     duration_ms: number | null;
     container: string | null;
@@ -47,6 +51,8 @@ export type AiIndexReport = {
   analyzed_file_count: number;
   skipped_file_count: number;
   annotation_count: number;
+  partial_file_count: number;
+  failed_file_count: number;
   cancelled: boolean;
   warnings: Array<{ path: string; message: string }>;
 };
@@ -56,6 +62,9 @@ export type AiAnalysisPlan = {
   analyze_file_count: number;
   skipped_file_count: number;
   already_analyzed_file_count: number;
+  partial_file_count: number;
+  coverage_unknown_file_count: number;
+  requires_explicit_coverage_confirmation: boolean;
   max_frames_per_file: number;
   max_sampled_frames: number;
   max_vision_requests: number;
@@ -141,6 +150,10 @@ export type AiSearchResult = {
   description: string;
   labels: string[];
   available: boolean;
+  ai_coverage_status?: "complete" | "partial" | "failed" | "legacy" | "coverage_unknown";
+  ai_coverage_warning?: string | null;
+  ai_successful_frame_count?: number | null;
+  ai_planned_frame_count?: number | null;
 };
 
 export type SavedAiMoment = {
@@ -150,6 +163,8 @@ export type SavedAiMoment = {
   labels: string[];
   confidence: number | null;
   model: string;
+  ai_coverage_status?: "complete" | "partial" | "failed" | "legacy" | "coverage_unknown";
+  ai_coverage_warning?: string | null;
 };
 
 export type ModelPreset = {

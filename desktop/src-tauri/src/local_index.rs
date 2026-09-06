@@ -1,4 +1,4 @@
-use crate::ai::AiAnnotation;
+use crate::ai::{AiAnnotation, AiFileAnalysisResult, AiFrameBatchFailure};
 use crate::metadata::MediaMetadata;
 use crate::scanner::{DiscoveredFile, ScanReport, ScanWarning};
 use crate::usage::{AiRunSpec, AiUsageEvent};
@@ -139,6 +139,41 @@ const MIGRATION_8: &str = r#"
 ALTER TABLE ai_usage_events ADD COLUMN estimated_audio_seconds REAL;
 "#;
 
+const MIGRATION_9: &str = r#"
+CREATE TABLE ai_analysis_coverage (
+    coverage_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_hash TEXT NOT NULL REFERENCES media_assets(content_hash),
+    model TEXT NOT NULL,
+    settings_fingerprint TEXT NOT NULL,
+    run_id TEXT,
+    status TEXT NOT NULL
+        CHECK (status IN ('complete', 'partial', 'failed', 'legacy', 'coverage_unknown')),
+    planned_frame_count INTEGER NOT NULL DEFAULT 0,
+    successful_frame_count INTEGER NOT NULL DEFAULT 0,
+    failed_batches_json TEXT NOT NULL DEFAULT '[]',
+    warning TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX ai_analysis_coverage_content_model_idx
+    ON ai_analysis_coverage(content_hash, model, coverage_id);
+
+INSERT INTO ai_analysis_coverage(
+    content_hash, model, settings_fingerprint, status,
+    planned_frame_count, successful_frame_count, failed_batches_json, warning
+)
+SELECT DISTINCT
+    content_hash,
+    model,
+    'legacy-unknown',
+    'legacy',
+    0,
+    0,
+    '[]',
+    'Pre-migration AI annotations have unknown frame coverage.'
+FROM ai_annotations;
+"#;
+
 #[derive(Debug)]
 pub enum IndexError {
     Database(rusqlite::Error),
@@ -261,6 +296,10 @@ pub struct SearchResult {
     pub available: bool,
     pub metadata: Option<MediaMetadata>,
     pub ai_annotation_count: u64,
+    pub ai_coverage_status: Option<String>,
+    pub ai_coverage_warning: Option<String>,
+    pub ai_successful_frame_count: Option<u64>,
+    pub ai_planned_frame_count: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -273,6 +312,10 @@ pub struct AiSearchResult {
     pub description: String,
     pub labels: Vec<String>,
     pub available: bool,
+    pub ai_coverage_status: Option<String>,
+    pub ai_coverage_warning: Option<String>,
+    pub ai_successful_frame_count: Option<u64>,
+    pub ai_planned_frame_count: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -283,6 +326,18 @@ pub struct SavedAiMoment {
     pub labels: Vec<String>,
     pub confidence: Option<f32>,
     pub model: String,
+    pub ai_coverage_status: Option<String>,
+    pub ai_coverage_warning: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AiAnalysisCoverage {
+    pub status: String,
+    pub settings_fingerprint: String,
+    pub planned_frame_count: u64,
+    pub successful_frame_count: u64,
+    pub failed_batches: Vec<AiFrameBatchFailure>,
+    pub warning: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -628,24 +683,194 @@ impl SqliteIndex {
             )?;
         }
         for annotation in annotations {
-            transaction.execute(
-                "INSERT INTO ai_annotations(
-                    content_hash, timestamp_ms, description, labels_json,
-                    embedding_json, confidence, model
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    content_hash,
-                    annotation.timestamp_ms,
-                    annotation.description,
-                    serde_json::to_string(&annotation.labels)?,
-                    serde_json::to_string(&annotation.embedding)?,
-                    annotation.confidence,
-                    annotation.model,
-                ],
-            )?;
+            insert_ai_annotation(&transaction, content_hash, annotation)?;
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn record_ai_analysis_result(
+        &mut self,
+        content_hash: &str,
+        model: &str,
+        settings_fingerprint: &str,
+        run_id: Option<&str>,
+        result: &AiFileAnalysisResult,
+    ) -> Result<u64, IndexError> {
+        let transaction = self.connection.transaction()?;
+        let has_protected_annotations: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM ai_analysis_coverage
+                WHERE content_hash = ?1 AND model = ?2
+                  AND status IN ('complete', 'legacy', 'coverage_unknown')
+            ) OR (
+                NOT EXISTS(
+                    SELECT 1 FROM ai_analysis_coverage
+                    WHERE content_hash = ?1 AND model = ?2
+                )
+                AND EXISTS(
+                    SELECT 1 FROM ai_annotations
+                    WHERE content_hash = ?1 AND model = ?2
+                )
+            )",
+            params![content_hash, model],
+            |row| row.get(0),
+        )?;
+
+        let should_store_annotations = match result.status.as_str() {
+            "complete" => true,
+            "partial" => !has_protected_annotations && !result.annotations.is_empty(),
+            "failed" => false,
+            _ => false,
+        };
+        let stored_annotation_count = if should_store_annotations {
+            transaction.execute(
+                "DELETE FROM ai_annotations WHERE content_hash = ?1 AND model = ?2",
+                params![content_hash, model],
+            )?;
+            for annotation in &result.annotations {
+                insert_ai_annotation(&transaction, content_hash, annotation)?;
+            }
+            result.annotations.len() as u64
+        } else {
+            0
+        };
+
+        transaction.execute(
+            "INSERT INTO ai_analysis_coverage(
+                content_hash, model, settings_fingerprint, run_id, status,
+                planned_frame_count, successful_frame_count, failed_batches_json, warning
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                content_hash,
+                model,
+                settings_fingerprint,
+                run_id,
+                result.status.as_str(),
+                result.planned_frame_count,
+                result.successful_frame_count,
+                serde_json::to_string(&result.failed_batches)?,
+                result.warning,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(stored_annotation_count)
+    }
+
+    pub fn latest_ai_analysis_coverage(
+        &self,
+        content_hash: &str,
+        model: &str,
+        settings_fingerprint: &str,
+    ) -> Result<Option<AiAnalysisCoverage>, IndexError> {
+        self.load_latest_ai_analysis_coverage(content_hash, model, Some(settings_fingerprint))
+    }
+
+    pub fn latest_ai_analysis_coverage_for_content_model(
+        &self,
+        content_hash: &str,
+        model: &str,
+    ) -> Result<Option<AiAnalysisCoverage>, IndexError> {
+        self.load_latest_ai_analysis_coverage(content_hash, model, None)
+    }
+
+    pub fn latest_ai_analysis_coverage_or_unknown(
+        &self,
+        content_hash: &str,
+        model: &str,
+    ) -> Result<Option<AiAnalysisCoverage>, IndexError> {
+        if let Some(coverage) =
+            self.latest_ai_analysis_coverage_for_content_model(content_hash, model)?
+        {
+            return Ok(Some(coverage));
+        }
+        if self.has_ai_annotations_for_content_model(content_hash, model)? {
+            return Ok(Some(AiAnalysisCoverage {
+                status: "coverage_unknown".to_owned(),
+                settings_fingerprint: "legacy-unknown".to_owned(),
+                planned_frame_count: 0,
+                successful_frame_count: 0,
+                failed_batches: Vec::new(),
+                warning: Some(
+                    "AI annotations have unknown frame coverage; run an explicit full analysis to verify them."
+                        .to_owned(),
+                ),
+            }));
+        }
+        Ok(None)
+    }
+
+    fn load_latest_ai_analysis_coverage(
+        &self,
+        content_hash: &str,
+        model: &str,
+        settings_fingerprint: Option<&str>,
+    ) -> Result<Option<AiAnalysisCoverage>, IndexError> {
+        let row: Option<(String, String, u64, u64, String, Option<String>)> =
+            if let Some(settings_fingerprint) = settings_fingerprint {
+                self.connection
+                    .query_row(
+                        "SELECT status, settings_fingerprint, planned_frame_count,
+                                successful_frame_count, failed_batches_json, warning
+                         FROM ai_analysis_coverage
+                         WHERE content_hash = ?1 AND model = ?2 AND settings_fingerprint = ?3
+                         ORDER BY coverage_id DESC LIMIT 1",
+                        params![content_hash, model, settings_fingerprint],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+            } else {
+                self.connection
+                    .query_row(
+                        "SELECT status, settings_fingerprint, planned_frame_count,
+                                successful_frame_count, failed_batches_json, warning
+                         FROM ai_analysis_coverage
+                         WHERE content_hash = ?1 AND model = ?2
+                         ORDER BY coverage_id DESC LIMIT 1",
+                        params![content_hash, model],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+            };
+
+        row.map(
+            |(
+                status,
+                settings_fingerprint,
+                planned_frame_count,
+                successful_frame_count,
+                failed_batches_json,
+                warning,
+            )| {
+                Ok(AiAnalysisCoverage {
+                    status,
+                    settings_fingerprint,
+                    planned_frame_count,
+                    successful_frame_count,
+                    failed_batches: serde_json::from_str(&failed_batches_json)?,
+                    warning,
+                })
+            },
+        )
+        .transpose()
     }
 
     pub fn ai_annotation_count(&self) -> Result<u64, IndexError> {
@@ -760,7 +985,35 @@ impl SqliteIndex {
         let mut statement = self.connection.prepare(
             "SELECT ai_annotations.timestamp_ms, ai_annotations.description,
                     ai_annotations.labels_json, ai_annotations.embedding_json,
-                    local_files.path, local_files.content_hash, local_files.status
+                    local_files.path, local_files.content_hash, local_files.status,
+                    ai_annotations.model,
+                    COALESCE(
+                        (SELECT coverage.status
+                         FROM ai_analysis_coverage coverage
+                         WHERE coverage.content_hash = ai_annotations.content_hash
+                           AND coverage.model = ai_annotations.model
+                         ORDER BY coverage.coverage_id DESC LIMIT 1),
+                        CASE WHEN EXISTS(
+                            SELECT 1 FROM ai_annotations legacy
+                            WHERE legacy.content_hash = ai_annotations.content_hash
+                              AND legacy.model = ai_annotations.model
+                        ) THEN 'coverage_unknown' END
+                    ),
+                    (SELECT coverage.warning
+                     FROM ai_analysis_coverage coverage
+                     WHERE coverage.content_hash = ai_annotations.content_hash
+                       AND coverage.model = ai_annotations.model
+                     ORDER BY coverage.coverage_id DESC LIMIT 1),
+                    (SELECT coverage.successful_frame_count
+                     FROM ai_analysis_coverage coverage
+                     WHERE coverage.content_hash = ai_annotations.content_hash
+                       AND coverage.model = ai_annotations.model
+                     ORDER BY coverage.coverage_id DESC LIMIT 1),
+                    (SELECT coverage.planned_frame_count
+                     FROM ai_analysis_coverage coverage
+                     WHERE coverage.content_hash = ai_annotations.content_hash
+                       AND coverage.model = ai_annotations.model
+                     ORDER BY coverage.coverage_id DESC LIMIT 1)
              FROM ai_annotations
              JOIN local_files ON local_files.content_hash = ai_annotations.content_hash
              WHERE local_files.identity_verified = 1
@@ -788,6 +1041,11 @@ impl SqliteIndex {
             let path: String = row.get(4)?;
             let content_hash: String = row.get(5)?;
             let status: String = row.get(6)?;
+            let model: String = row.get(7)?;
+            let coverage_status: Option<String> = row.get(8)?;
+            let coverage_warning: Option<String> = row.get(9)?;
+            let successful_frame_count: Option<u64> = row.get(10)?;
+            let planned_frame_count: Option<u64> = row.get(11)?;
             Ok((
                 timestamp_ms,
                 description,
@@ -796,6 +1054,11 @@ impl SqliteIndex {
                 path,
                 content_hash,
                 status,
+                model,
+                coverage_status,
+                coverage_warning,
+                successful_frame_count,
+                planned_frame_count,
             ))
         })?;
 
@@ -804,8 +1067,20 @@ impl SqliteIndex {
 
         let mut unique_annotations = HashMap::<(String, u64), RankedAiAnnotation>::new();
         for row in rows.filter_map(Result::ok) {
-            let (timestamp_ms, description, labels, stored_embedding, path, content_hash, status) =
-                row;
+            let (
+                timestamp_ms,
+                description,
+                labels,
+                stored_embedding,
+                path,
+                content_hash,
+                status,
+                _model,
+                coverage_status,
+                coverage_warning,
+                successful_frame_count,
+                planned_frame_count,
+            ) = row;
             if root.is_some_and(|root| !Path::new(&path).starts_with(root)) {
                 continue;
             }
@@ -825,6 +1100,10 @@ impl SqliteIndex {
                     available: status == "ACTIVE" && Path::new(&path).is_file(),
                     path,
                     content_hash: content_hash.clone(),
+                    ai_coverage_status: coverage_status,
+                    ai_coverage_warning: coverage_warning,
+                    ai_successful_frame_count: successful_frame_count,
+                    ai_planned_frame_count: planned_frame_count,
                 },
                 embedding: stored_embedding,
             };
@@ -917,7 +1196,20 @@ impl SqliteIndex {
         }
         let mut statement = self.connection.prepare(
             "SELECT timestamp_ms, description, labels_json, embedding_json,
-                    confidence, model
+                    confidence, model,
+                    COALESCE(
+                        (SELECT coverage.status
+                         FROM ai_analysis_coverage coverage
+                         WHERE coverage.content_hash = ai_annotations.content_hash
+                           AND coverage.model = ai_annotations.model
+                         ORDER BY coverage.coverage_id DESC LIMIT 1),
+                        'coverage_unknown'
+                    ),
+                    (SELECT coverage.warning
+                     FROM ai_analysis_coverage coverage
+                     WHERE coverage.content_hash = ai_annotations.content_hash
+                       AND coverage.model = ai_annotations.model
+                     ORDER BY coverage.coverage_id DESC LIMIT 1)
              FROM ai_annotations
              WHERE content_hash = ?1
              ORDER BY model, timestamp_ms",
@@ -946,12 +1238,23 @@ impl SqliteIndex {
                 embedding,
                 row.get::<_, Option<f32>>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
 
         let mut by_model = HashMap::<String, Vec<(RankedAiAnnotation, Option<f32>)>>::new();
         for row in rows {
-            let (timestamp_ms, description, labels, embedding, confidence, model) = row?;
+            let (
+                timestamp_ms,
+                description,
+                labels,
+                embedding,
+                confidence,
+                model,
+                coverage_status,
+                coverage_warning,
+            ) = row?;
             by_model.entry(model).or_default().push((
                 RankedAiAnnotation {
                     result: AiSearchResult {
@@ -964,6 +1267,10 @@ impl SqliteIndex {
                         labels,
                         available: file.status == LocalFileStatus::Active
                             && Path::new(&file.path).is_file(),
+                        ai_coverage_status: Some(coverage_status),
+                        ai_coverage_warning: coverage_warning,
+                        ai_successful_frame_count: None,
+                        ai_planned_frame_count: None,
                     },
                     embedding,
                 },
@@ -973,6 +1280,12 @@ impl SqliteIndex {
 
         let mut moments = Vec::new();
         for (model, annotations) in by_model {
+            let coverage_status = annotations
+                .first()
+                .and_then(|(annotation, _)| annotation.result.ai_coverage_status.clone());
+            let coverage_warning = annotations
+                .first()
+                .and_then(|(annotation, _)| annotation.result.ai_coverage_warning.clone());
             let confidence_by_timestamp = annotations
                 .iter()
                 .map(|(annotation, confidence)| (annotation.result.timestamp_ms, *confidence))
@@ -997,6 +1310,8 @@ impl SqliteIndex {
                     description: result.description,
                     labels: result.labels,
                     model: model.clone(),
+                    ai_coverage_status: coverage_status.clone(),
+                    ai_coverage_warning: coverage_warning.clone(),
                 });
             }
         }
@@ -1012,7 +1327,23 @@ impl SqliteIndex {
         let mut statement = self.connection.prepare(
             "SELECT local_files.path, local_files.content_hash, local_files.size_bytes,
                     local_files.modified_unix_ms, local_files.status, media_assets.metadata_json,
-                    (SELECT COUNT(*) FROM ai_annotations WHERE ai_annotations.content_hash = local_files.content_hash) AS ai_count
+                    (SELECT COUNT(*) FROM ai_annotations WHERE ai_annotations.content_hash = local_files.content_hash) AS ai_count,
+                    (SELECT coverage.status
+                     FROM ai_analysis_coverage coverage
+                     WHERE coverage.content_hash = local_files.content_hash
+                     ORDER BY coverage.coverage_id DESC LIMIT 1) AS coverage_status,
+                    (SELECT coverage.warning
+                     FROM ai_analysis_coverage coverage
+                     WHERE coverage.content_hash = local_files.content_hash
+                     ORDER BY coverage.coverage_id DESC LIMIT 1) AS coverage_warning,
+                    (SELECT coverage.successful_frame_count
+                     FROM ai_analysis_coverage coverage
+                     WHERE coverage.content_hash = local_files.content_hash
+                     ORDER BY coverage.coverage_id DESC LIMIT 1) AS successful_frame_count,
+                    (SELECT coverage.planned_frame_count
+                     FROM ai_analysis_coverage coverage
+                     WHERE coverage.content_hash = local_files.content_hash
+                     ORDER BY coverage.coverage_id DESC LIMIT 1) AS planned_frame_count
              FROM local_files
              JOIN media_assets ON media_assets.content_hash = local_files.content_hash
              ORDER BY local_files.path",
@@ -1028,6 +1359,10 @@ impl SqliteIndex {
             let status: LocalFileStatus = parse_status(&row.get::<_, String>(4)?);
             let metadata_json: Option<String> = row.get(5)?;
             let ai_annotation_count: u64 = row.get(6)?;
+            let ai_coverage_status: Option<String> = row.get(7)?;
+            let ai_coverage_warning: Option<String> = row.get(8)?;
+            let ai_successful_frame_count: Option<u64> = row.get(9)?;
+            let ai_planned_frame_count: Option<u64> = row.get(10)?;
             let metadata = metadata_json
                 .map(|value| serde_json::from_str(&value))
                 .transpose()?;
@@ -1040,6 +1375,11 @@ impl SqliteIndex {
                 status,
                 metadata,
                 ai_annotation_count,
+                ai_coverage_status: ai_coverage_status
+                    .or_else(|| (ai_annotation_count > 0).then(|| "coverage_unknown".to_owned())),
+                ai_coverage_warning,
+                ai_successful_frame_count,
+                ai_planned_frame_count,
             };
 
             if matches_query(&result, query) {
@@ -1070,6 +1410,7 @@ impl SqliteIndex {
             (6_i64, MIGRATION_6),
             (7_i64, MIGRATION_7),
             (8_i64, MIGRATION_8),
+            (9_i64, MIGRATION_9),
         ] {
             let applied: Option<i64> = connection
                 .query_row(
@@ -1105,6 +1446,29 @@ impl SqliteIndex {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+}
+
+fn insert_ai_annotation(
+    transaction: &Transaction<'_>,
+    content_hash: &str,
+    annotation: &AiAnnotation,
+) -> Result<(), IndexError> {
+    transaction.execute(
+        "INSERT INTO ai_annotations(
+            content_hash, timestamp_ms, description, labels_json,
+            embedding_json, confidence, model
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            content_hash,
+            annotation.timestamp_ms,
+            annotation.description,
+            serde_json::to_string(&annotation.labels)?,
+            serde_json::to_string(&annotation.embedding)?,
+            annotation.confidence,
+            annotation.model,
+        ],
+    )?;
+    Ok(())
 }
 
 fn upsert_file(
@@ -1560,7 +1924,10 @@ fn path_key(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::AiFileAnalysisStatus;
     use crate::scanner::{DiscoveredFile, ScanReport};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn file(path: &str, hash: &str) -> DiscoveredFile {
         DiscoveredFile {
@@ -1578,12 +1945,60 @@ mod tests {
         }
     }
 
+    fn test_annotation(model: &str, timestamp_ms: u64, description: &str) -> AiAnnotation {
+        AiAnnotation {
+            timestamp_ms,
+            description: description.to_owned(),
+            labels: vec!["fixture".to_owned()],
+            embedding: vec![1.0, 0.0],
+            confidence: Some(0.9),
+            model: model.to_owned(),
+        }
+    }
+
+    fn test_analysis_result(
+        model: &str,
+        timestamp_ms: u64,
+        description: &str,
+        status: AiFileAnalysisStatus,
+        planned_frame_count: u64,
+        successful_frame_count: u64,
+        failed_batches: Vec<AiFrameBatchFailure>,
+    ) -> AiFileAnalysisResult {
+        let warning = match status {
+            AiFileAnalysisStatus::Complete => None,
+            AiFileAnalysisStatus::Partial => Some("Partial frame coverage".to_owned()),
+            AiFileAnalysisStatus::Failed => Some("Analysis failed".to_owned()),
+        };
+        AiFileAnalysisResult {
+            annotations: (status != AiFileAnalysisStatus::Failed)
+                .then(|| vec![test_annotation(model, timestamp_ms, description)])
+                .unwrap_or_default(),
+            planned_frame_count,
+            successful_frame_count,
+            failed_batches,
+            status,
+            warning,
+        }
+    }
+
+    fn test_database_path(label: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "mediaindex-{label}-{}-{stamp}.sqlite3",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn creates_a_versioned_schema_and_is_idempotent() {
         let mut index = SqliteIndex::open_in_memory().expect("index should open");
         assert_eq!(
             index.schema_version().expect("version should be readable"),
-            8
+            9
         );
 
         let first = index
@@ -1614,6 +2029,303 @@ mod tests {
             index.active_file_count().expect("active count should work"),
             1
         );
+    }
+
+    #[test]
+    fn persists_one_successful_and_one_failed_vision_batch_as_partial_coverage() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/partial.mp4", "hash-partial")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        let failed_batch = AiFrameBatchFailure {
+            start_timestamp_ms: 8_000,
+            end_timestamp_ms: 15_000,
+            message: "vision request failed".to_owned(),
+        };
+        let result = test_analysis_result(
+            "model-a",
+            1_000,
+            "First frame succeeded",
+            AiFileAnalysisStatus::Partial,
+            2,
+            1,
+            vec![failed_batch.clone()],
+        );
+
+        assert_eq!(
+            index
+                .record_ai_analysis_result(
+                    "hash-partial",
+                    "model-a",
+                    "fingerprint-a",
+                    None,
+                    &result,
+                )
+                .expect("partial result should persist"),
+            1
+        );
+        let coverage = index
+            .latest_ai_analysis_coverage("hash-partial", "model-a", "fingerprint-a")
+            .expect("coverage should load")
+            .expect("coverage should exist");
+        assert_eq!(coverage.status, "partial");
+        assert_eq!(coverage.planned_frame_count, 2);
+        assert_eq!(coverage.successful_frame_count, 1);
+        assert_eq!(coverage.failed_batches, vec![failed_batch]);
+        assert!(coverage
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("Partial frame coverage")));
+        assert_eq!(index.ai_annotation_count().expect("count should load"), 1);
+
+        let search_results = index
+            .search(&SearchQuery::default())
+            .expect("library search should load coverage");
+        assert_eq!(
+            search_results[0].ai_coverage_status.as_deref(),
+            Some("partial")
+        );
+        let ai_results = index
+            .search_ai("first frame", &[1.0, 0.0], 10, Some("model-a"))
+            .expect("AI search should load coverage");
+        assert_eq!(ai_results[0].ai_coverage_status.as_deref(), Some("partial"));
+        assert_eq!(ai_results[0].ai_successful_frame_count, Some(1));
+        let saved_moments = index
+            .saved_ai_moments_for_path("/library/partial.mp4")
+            .expect("saved moments should load coverage");
+        assert_eq!(
+            saved_moments[0].ai_coverage_status.as_deref(),
+            Some("partial")
+        );
+    }
+
+    #[test]
+    fn analysis_coverage_survives_index_restart() {
+        let path = test_database_path("coverage-restart");
+        {
+            let mut index = SqliteIndex::open(&path).expect("index should open");
+            index
+                .reconcile(
+                    &report(vec![file("/library/restart.mp4", "hash-restart")]),
+                    &HashMap::new(),
+                )
+                .expect("fixture should be indexed");
+            index
+                .record_ai_analysis_result(
+                    "hash-restart",
+                    "model-a",
+                    "fingerprint-a",
+                    Some("run-restart"),
+                    &test_analysis_result(
+                        "model-a",
+                        1_000,
+                        "Restart-safe partial",
+                        AiFileAnalysisStatus::Partial,
+                        4,
+                        2,
+                        Vec::new(),
+                    ),
+                )
+                .expect("coverage should persist");
+        }
+
+        let reopened = SqliteIndex::open(&path).expect("index should reopen");
+        let coverage = reopened
+            .latest_ai_analysis_coverage("hash-restart", "model-a", "fingerprint-a")
+            .expect("coverage should load after restart")
+            .expect("coverage should remain after restart");
+        assert_eq!(coverage.status, "partial");
+        assert_eq!(coverage.successful_frame_count, 2);
+        assert_eq!(
+            reopened
+                .ai_annotation_count()
+                .expect("annotations should load"),
+            1
+        );
+        drop(reopened);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_reanalysis_preserves_prior_complete_annotations() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/protected.mp4", "hash-protected")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        index
+            .record_ai_analysis_result(
+                "hash-protected",
+                "model-a",
+                "fingerprint-a",
+                None,
+                &test_analysis_result(
+                    "model-a",
+                    1_000,
+                    "Prior complete result",
+                    AiFileAnalysisStatus::Complete,
+                    2,
+                    2,
+                    Vec::new(),
+                ),
+            )
+            .expect("complete result should persist");
+        index
+            .record_ai_analysis_result(
+                "hash-protected",
+                "model-a",
+                "fingerprint-a",
+                None,
+                &test_analysis_result(
+                    "model-a",
+                    2_000,
+                    "Failed replacement",
+                    AiFileAnalysisStatus::Failed,
+                    2,
+                    0,
+                    vec![AiFrameBatchFailure {
+                        start_timestamp_ms: 0,
+                        end_timestamp_ms: 7_000,
+                        message: "provider unavailable".to_owned(),
+                    }],
+                ),
+            )
+            .expect("failed retry diagnostics should persist");
+
+        let moments = index
+            .saved_ai_moments_for_path("/library/protected.mp4")
+            .expect("saved moments should load");
+        assert_eq!(moments.len(), 1);
+        assert_eq!(moments[0].description, "Prior complete result");
+        assert_eq!(
+            index
+                .ai_annotation_count()
+                .expect("annotation count should load"),
+            1
+        );
+        assert_eq!(
+            index
+                .latest_ai_analysis_coverage("hash-protected", "model-a", "fingerprint-a")
+                .expect("latest coverage should load")
+                .expect("latest coverage should exist")
+                .status,
+            "failed"
+        );
+    }
+
+    #[test]
+    fn analysis_history_for_other_models_is_preserved() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/models.mp4", "hash-models")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        for (model, description) in [("model-a", "Model A"), ("model-b", "Model B")] {
+            index
+                .record_ai_analysis_result(
+                    "hash-models",
+                    model,
+                    &format!("fingerprint-{model}"),
+                    None,
+                    &test_analysis_result(
+                        model,
+                        if model == "model-a" { 1_000 } else { 2_000 },
+                        description,
+                        AiFileAnalysisStatus::Complete,
+                        1,
+                        1,
+                        Vec::new(),
+                    ),
+                )
+                .expect("model result should persist");
+        }
+
+        assert_eq!(index.ai_annotation_count().expect("count should load"), 2);
+        assert!(index
+            .has_ai_annotations_for_content_model("hash-models", "model-a")
+            .expect("model A should remain"));
+        assert!(index
+            .has_ai_annotations_for_content_model("hash-models", "model-b")
+            .expect("model B should remain"));
+        let moments = index
+            .saved_ai_moments_for_path("/library/models.mp4")
+            .expect("saved moments should load");
+        assert_eq!(moments.len(), 2);
+    }
+
+    #[test]
+    fn settings_change_does_not_reuse_complete_coverage() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/settings.mp4", "hash-settings")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        index
+            .record_ai_analysis_result(
+                "hash-settings",
+                "model-a",
+                "fingerprint-old-settings",
+                None,
+                &test_analysis_result(
+                    "model-a",
+                    1_000,
+                    "Old settings",
+                    AiFileAnalysisStatus::Complete,
+                    4,
+                    4,
+                    Vec::new(),
+                ),
+            )
+            .expect("old result should persist");
+
+        assert!(index
+            .latest_ai_analysis_coverage("hash-settings", "model-a", "fingerprint-new-settings")
+            .expect("new fingerprint should be queryable")
+            .is_none());
+        assert_eq!(
+            index
+                .latest_ai_analysis_coverage_for_content_model("hash-settings", "model-a")
+                .expect("history should load")
+                .expect("old history should exist")
+                .status,
+            "complete"
+        );
+    }
+
+    #[test]
+    fn legacy_annotations_are_exposed_as_unknown_coverage() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file("/library/legacy.mp4", "hash-legacy")]),
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        index
+            .replace_ai_annotations(
+                "hash-legacy",
+                &[test_annotation("model-a", 1_000, "Legacy result")],
+            )
+            .expect("legacy annotation should persist");
+
+        let coverage = index
+            .latest_ai_analysis_coverage_or_unknown("hash-legacy", "model-a")
+            .expect("legacy coverage should load")
+            .expect("legacy coverage should be visible");
+        assert_eq!(coverage.status, "coverage_unknown");
+        assert_eq!(coverage.settings_fingerprint, "legacy-unknown");
+        assert!(index
+            .has_ai_annotations_for_content_model("hash-legacy", "model-a")
+            .expect("legacy annotation should remain"));
     }
 
     #[test]

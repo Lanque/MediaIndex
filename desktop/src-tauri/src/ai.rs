@@ -2,6 +2,7 @@ use base64::Engine;
 use reqwest::blocking::{multipart, Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::error::Error as StdError;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,7 @@ const MAX_THUMBNAIL_WIDTH: u32 = 640;
 const AI_CONNECT_TIMEOUT_SECONDS: u64 = 20;
 const AI_REQUEST_TIMEOUT_SECONDS: u64 = 180;
 pub const AI_ANALYSIS_CANCELLED_MESSAGE: &str = "AI analysis cancelled by user";
+pub const AI_ANALYSIS_PROMPT_VERSION: &str = "2026-09-05-v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub enum AiProvider {
@@ -83,6 +85,41 @@ pub struct AiAnnotation {
     pub model: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiFileAnalysisStatus {
+    Complete,
+    Partial,
+    Failed,
+}
+
+impl AiFileAnalysisStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiFrameBatchFailure {
+    pub start_timestamp_ms: u64,
+    pub end_timestamp_ms: u64,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AiFileAnalysisResult {
+    pub annotations: Vec<AiAnnotation>,
+    pub planned_frame_count: u64,
+    pub successful_frame_count: u64,
+    pub failed_batches: Vec<AiFrameBatchFailure>,
+    pub status: AiFileAnalysisStatus,
+    pub warning: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AiWarning {
     pub path: String,
@@ -94,6 +131,8 @@ pub struct AiIndexReport {
     pub analyzed_file_count: u64,
     pub skipped_file_count: u64,
     pub annotation_count: u64,
+    pub partial_file_count: u64,
+    pub failed_file_count: u64,
     pub cancelled: bool,
     pub warnings: Vec<AiWarning>,
 }
@@ -320,6 +359,23 @@ impl AiSettings {
         }
     }
 
+    pub fn analysis_settings_fingerprint(&self) -> String {
+        let payload = format!(
+            "prompt_version={AI_ANALYSIS_PROMPT_VERSION}\nprovider={}\nvision_model={}\nembedding_model={}\nsample_interval_ms={}\nmax_frames_per_file={}\nvision_batch_size={}\ncontext_hint={}\ntranscribe_audio={}\ntranscription_model={}",
+            self.provider.name(),
+            self.vision_model,
+            self.embedding_model,
+            self.sample_interval_ms,
+            self.max_frames_per_file,
+            self.vision_batch_size(),
+            self.context_hint.as_deref().unwrap_or_default(),
+            self.transcribe_audio,
+            self.transcription_model,
+        );
+        let digest = Sha256::digest(payload.as_bytes());
+        format!("sha256:{digest:x}")
+    }
+
     pub fn parallel_file_limit(&self) -> usize {
         if self.provider.is_remote() {
             REMOTE_PARALLEL_FILE_LIMIT
@@ -411,6 +467,7 @@ where
     F: Fn(AiFileProgress),
 {
     analyze_file_with_progress_and_cancel(path, metadata, settings, progress, || false)
+        .map(|result| result.annotations)
 }
 
 pub fn analyze_file_with_progress_and_cancel<F, C>(
@@ -419,7 +476,7 @@ pub fn analyze_file_with_progress_and_cancel<F, C>(
     settings: &AiSettings,
     progress: F,
     is_cancelled: C,
-) -> Result<Vec<AiAnnotation>, String>
+) -> Result<AiFileAnalysisResult, String>
 where
     F: Fn(AiFileProgress),
     C: Fn() -> bool,
@@ -430,7 +487,17 @@ where
         percent: 1,
         phase: "Extracting frames",
     });
-    let frames = extract_frames(path, settings)?;
+    let frames = match extract_frames(path, settings) {
+        Ok(frames) => frames,
+        Err(error) => {
+            return Ok(failed_file_analysis_result(
+                0,
+                0,
+                Vec::new(),
+                format!("frame extraction failed for {}: {error}", path.display()),
+            ));
+        }
+    };
     ensure_analysis_not_cancelled(&is_cancelled)?;
     progress(AiFileProgress {
         percent: 10,
@@ -455,16 +522,20 @@ where
                         .zip(batch),
                 );
             }
-            Ok(batch) => frame_errors.push(format!(
-                "vision returned {} analyses for {} frames",
-                batch.len(),
-                frame_batch.len()
-            )),
-            Err(error) => frame_errors.push(format!(
-                "{}-{} ms: {error}",
-                frame_batch.first().map(|frame| frame.0).unwrap_or_default(),
-                frame_batch.last().map(|frame| frame.0).unwrap_or_default()
-            )),
+            Ok(batch) => frame_errors.push(AiFrameBatchFailure {
+                start_timestamp_ms: frame_batch.first().map(|frame| frame.0).unwrap_or_default(),
+                end_timestamp_ms: frame_batch.last().map(|frame| frame.0).unwrap_or_default(),
+                message: format!(
+                    "vision returned {} analyses for {} frames",
+                    batch.len(),
+                    frame_batch.len()
+                ),
+            }),
+            Err(error) => frame_errors.push(AiFrameBatchFailure {
+                start_timestamp_ms: frame_batch.first().map(|frame| frame.0).unwrap_or_default(),
+                end_timestamp_ms: frame_batch.last().map(|frame| frame.0).unwrap_or_default(),
+                message: error,
+            }),
         }
         ensure_analysis_not_cancelled(&is_cancelled)?;
         processed_frames += frame_batch.len();
@@ -475,13 +546,18 @@ where
         });
     }
     if analyses.is_empty() {
-        return Err(format!(
-            "AI vision produced no usable frames for {}: {}",
-            path.display(),
-            frame_errors
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "no frame analysis was returned".to_owned())
+        let detail = frame_errors
+            .first()
+            .map(|failure| failure.message.clone())
+            .unwrap_or_else(|| "no frame analysis was returned".to_owned());
+        return Ok(failed_file_analysis_result(
+            frames.len(),
+            0,
+            frame_errors,
+            format!(
+                "AI vision produced no usable frames for {}: {detail}",
+                path.display()
+            ),
         ));
     }
 
@@ -491,7 +567,17 @@ where
             phase: "Extracting speech audio",
         });
         ensure_analysis_not_cancelled(&is_cancelled)?;
-        let extracted_audio = extract_audio_track(path, settings)?;
+        let extracted_audio = match extract_audio_track(path, settings) {
+            Ok(audio) => audio,
+            Err(error) => {
+                return Ok(failed_file_analysis_result(
+                    frames.len(),
+                    analyses.len(),
+                    frame_errors,
+                    format!("audio extraction failed for {}: {error}", path.display()),
+                ));
+            }
+        };
         progress(AiFileProgress {
             percent: 78,
             phase: "Transcribing speech",
@@ -499,7 +585,20 @@ where
         let transcription =
             transcribe_openai_audio(&client, &extracted_audio, settings, &is_cancelled);
         let _ = fs::remove_file(&extracted_audio.path);
-        let transcript_segments = transcription?;
+        let transcript_segments = match transcription {
+            Ok(segments) => segments,
+            Err(error) => {
+                return Ok(failed_file_analysis_result(
+                    frames.len(),
+                    analyses.len(),
+                    frame_errors,
+                    format!(
+                        "speech transcription failed for {}: {error}",
+                        path.display()
+                    ),
+                ));
+            }
+        };
         ensure_analysis_not_cancelled(&is_cancelled)?;
         attach_transcript_segments(&mut analyses, &transcript_segments);
         progress(AiFileProgress {
@@ -529,21 +628,56 @@ where
         phase: "Creating search index",
     });
     ensure_analysis_not_cancelled(&is_cancelled)?;
-    let embeddings = create_embeddings(
+    let embeddings = match create_embeddings(
         &client,
         &embedding_texts,
         settings,
         EmbeddingKind::Document,
         &is_cancelled,
-    )?;
+    ) {
+        Ok(embeddings) => embeddings,
+        Err(error) if error == AI_ANALYSIS_CANCELLED_MESSAGE => return Err(error),
+        Err(error) => {
+            return Ok(failed_file_analysis_result(
+                frames.len(),
+                analyses.len(),
+                frame_errors,
+                format!("embedding creation failed for {}: {error}", path.display()),
+            ));
+        }
+    };
     ensure_analysis_not_cancelled(&is_cancelled)?;
     if embeddings.len() != analyses.len() {
-        return Err(format!(
-            "AI returned {} embeddings for {} analyzed frames",
-            embeddings.len(),
-            analyses.len()
+        return Ok(failed_file_analysis_result(
+            frames.len(),
+            analyses.len(),
+            frame_errors,
+            format!(
+                "AI returned {} embeddings for {} analyzed frames",
+                embeddings.len(),
+                analyses.len()
+            ),
         ));
     }
+
+    let successful_frame_count = analyses.len() as u64;
+    let status = if frame_errors.is_empty() && analyses.len() == frames.len() {
+        AiFileAnalysisStatus::Complete
+    } else {
+        AiFileAnalysisStatus::Partial
+    };
+    let warning = match status {
+        AiFileAnalysisStatus::Complete => None,
+        AiFileAnalysisStatus::Partial => Some(partial_coverage_warning(
+            path,
+            frames.len() as u64,
+            successful_frame_count,
+            &frame_errors,
+        )),
+        AiFileAnalysisStatus::Failed => {
+            unreachable!("failed results return before annotation construction")
+        }
+    };
 
     let mut annotations = Vec::with_capacity(analyses.len());
     for ((timestamp_ms, analysis), embedding) in analyses.into_iter().zip(embeddings) {
@@ -606,9 +740,62 @@ where
 
     progress(AiFileProgress {
         percent: 100,
-        phase: "Finished",
+        phase: if status == AiFileAnalysisStatus::Complete {
+            "Finished"
+        } else {
+            "Finished with partial coverage"
+        },
     });
-    Ok(annotations)
+    Ok(AiFileAnalysisResult {
+        annotations,
+        planned_frame_count: frames.len() as u64,
+        successful_frame_count,
+        failed_batches: frame_errors,
+        status,
+        warning,
+    })
+}
+
+fn failed_file_analysis_result(
+    planned_frame_count: usize,
+    successful_frame_count: usize,
+    failed_batches: Vec<AiFrameBatchFailure>,
+    warning: String,
+) -> AiFileAnalysisResult {
+    AiFileAnalysisResult {
+        annotations: Vec::new(),
+        planned_frame_count: planned_frame_count as u64,
+        successful_frame_count: successful_frame_count as u64,
+        failed_batches,
+        status: AiFileAnalysisStatus::Failed,
+        warning: Some(warning),
+    }
+}
+
+fn partial_coverage_warning(
+    path: &Path,
+    planned_frame_count: u64,
+    successful_frame_count: u64,
+    failed_batches: &[AiFrameBatchFailure],
+) -> String {
+    let ranges = failed_batches
+        .iter()
+        .map(|failure| {
+            format!(
+                "{}-{} ms ({})",
+                failure.start_timestamp_ms, failure.end_timestamp_ms, failure.message
+            )
+        })
+        .collect::<Vec<_>>();
+    let failed_summary = if ranges.is_empty() {
+        "one or more frame batches did not complete".to_owned()
+    } else {
+        ranges.join(", ")
+    };
+    format!(
+        "Partial AI analysis for {}: {successful_frame_count}/{planned_frame_count} frames succeeded; failed batches: {failed_summary}. Rerun explicitly to complete coverage.",
+        path.display()
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -3518,6 +3705,40 @@ mod tests {
         assert_eq!(
             settings.model_namespace(),
             "openai:vision-test:embedding-test"
+        );
+    }
+
+    #[test]
+    fn analysis_fingerprint_changes_with_coverage_settings() {
+        let settings =
+            |sample_interval_seconds: u64, max_frames: u64, context_hint: Option<&str>| {
+                AiSettings::from_request(Some(AiRequestConfig {
+                    provider: Some(AiProvider::OpenAI),
+                    api_key: Some("test-key".to_owned()),
+                    sample_interval_seconds: Some(sample_interval_seconds),
+                    max_frames: Some(max_frames),
+                    context_hint: context_hint.map(str::to_owned),
+                    ..Default::default()
+                }))
+                .expect("fingerprint fixture should be valid")
+            };
+
+        let base = settings(5, 120, None);
+        assert_eq!(
+            base.analysis_settings_fingerprint(),
+            settings(5, 120, None).analysis_settings_fingerprint()
+        );
+        assert_ne!(
+            base.analysis_settings_fingerprint(),
+            settings(10, 120, None).analysis_settings_fingerprint()
+        );
+        assert_ne!(
+            base.analysis_settings_fingerprint(),
+            settings(5, 60, None).analysis_settings_fingerprint()
+        );
+        assert_ne!(
+            base.analysis_settings_fingerprint(),
+            settings(5, 120, Some("sports footage")).analysis_settings_fingerprint()
         );
     }
 
