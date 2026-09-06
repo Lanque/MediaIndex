@@ -59,6 +59,7 @@ export type AiIndexReport = {
   failed_file_count: number;
   cancelled: boolean;
   warnings: Array<{ path: string; message: string }>;
+  diagnostics_path?: string;
 };
 
 export type AiAnalysisPlan = {
