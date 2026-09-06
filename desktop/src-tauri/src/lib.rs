@@ -1135,6 +1135,108 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_keeps_a_completed_clip_and_stops_the_next_worker_result() {
+        let mut index = local_index::SqliteIndex::open_in_memory().expect("index should open");
+        let file = local_index::IndexedFile {
+            path: "/library/clip.mp4".to_owned(),
+            content_hash: "hash-cancelled-clip".to_owned(),
+            size_bytes: 10,
+            modified_unix_ms: None,
+            status: local_index::LocalFileStatus::Active,
+            identity_verified: true,
+        };
+        index
+            .reconcile(
+                &scanner::ScanReport {
+                    files: vec![scanner::DiscoveredFile {
+                        path: file.path.clone(),
+                        size_bytes: file.size_bytes,
+                        modified_unix_ms: file.modified_unix_ms,
+                        content_hash: file.content_hash.clone(),
+                    }],
+                    warnings: Vec::new(),
+                },
+                &HashMap::new(),
+            )
+            .expect("file should be indexed");
+
+        let annotation = ai::AiAnnotation {
+            timestamp_ms: 1_000,
+            description: "A completed scene".to_owned(),
+            labels: vec!["scene".to_owned()],
+            embedding: vec![0.1, 0.2],
+            confidence: Some(0.9),
+            model: "openai:test".to_owned(),
+        };
+        let control = AiAnalysisControl::default();
+        let _guard = control.begin().expect("analysis should start");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let completed_annotation = annotation.clone();
+        let completed_worker = std::thread::spawn(move || {
+            ready_tx
+                .send(())
+                .expect("test should observe completed work");
+            Ok::<Vec<ai::AiAnnotation>, String>(vec![completed_annotation])
+        });
+        let next_worker_control = control.clone();
+        let next_worker = std::thread::spawn(move || {
+            stop_rx.recv().expect("test should release the next worker");
+            if next_worker_control.is_cancelled() {
+                Err(ai::AI_ANALYSIS_CANCELLED_MESSAGE.to_owned())
+            } else {
+                Ok(Vec::new())
+            }
+        });
+
+        ready_rx
+            .recv()
+            .expect("first worker should finish before cancellation");
+        assert!(control.request_cancel());
+        stop_tx.send(()).expect("next worker should be released");
+        let completed_result = completed_worker
+            .join()
+            .expect("completed worker should finish");
+        let cancelled_result = next_worker.join().expect("cancelled worker should finish");
+
+        let mut report = ai::AiIndexReport {
+            analyzed_file_count: 0,
+            skipped_file_count: 0,
+            annotation_count: 0,
+            cancelled: false,
+            warnings: Vec::new(),
+        };
+        let persisted_files = AtomicU64::new(0);
+        assert_eq!(
+            persist_ai_result(
+                &mut index,
+                &mut report,
+                &file,
+                completed_result,
+                &persisted_files,
+            )
+            .expect("completed clip should still be committed"),
+            AiResultOutcome::Committed
+        );
+        assert_eq!(
+            persist_ai_result(
+                &mut index,
+                &mut report,
+                &file,
+                cancelled_result,
+                &persisted_files,
+            )
+            .expect("cancellation should be handled"),
+            AiResultOutcome::Cancelled
+        );
+        report.cancelled = true;
+
+        assert_eq!(persisted_files.load(Ordering::Relaxed), 1);
+        assert_eq!(index.ai_annotation_count().expect("count should load"), 1);
+        assert!(report.cancelled);
+    }
+
+    #[test]
     fn analysis_control_prevents_overlap_and_resets_after_cancellation() {
         let control = AiAnalysisControl::default();
         let guard = control.begin().expect("first analysis should start");

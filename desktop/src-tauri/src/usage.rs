@@ -379,6 +379,17 @@ impl AiUsageRecorder {
 }
 
 impl AiUsageEventHandle {
+    pub fn cancel_before_send(&self) {
+        if let Some(budget_gate) = self.budget_gate.as_ref() {
+            if !self.reservation_adjusted.swap(true, Ordering::AcqRel) {
+                budget_gate.settle(&self.local_event_id, Some(0.0));
+            }
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.pending.remove(&self.local_event_id);
+        }
+    }
+
     pub fn record_response(
         &self,
         duration_ms: u64,
