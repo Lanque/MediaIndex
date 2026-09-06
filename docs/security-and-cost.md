@@ -104,8 +104,14 @@ delivery, stale cursors, authorization failures, and worker crashes.
   clearly states that same-model annotations will be replaced.
 - Only one AI analysis can run at a time. The stop control prevents additional
   files and frame batches from starting, keeps completed clip annotations, and
-  lets a later run continue with missing clips. A cloud request already sent to
-  the provider may finish before cancellation takes effect.
+  lets a later run continue with missing clips. The shared cancellation check
+  runs before each budget reservation and network send, between individual
+  Gemini embedding requests, and during retry backoff. A stop before sending
+  creates no paid-attempt event and releases any race-created reservation. A
+  cloud request already sent to the provider may finish before cancellation
+  takes effect; its usage event is retained and unknown usage remains reserved.
+  Search and Test connection use independent request paths and are not stopped
+  by an analysis run cancellation.
 - Focused search limits low-ranking results, videos, and moments without making
   another vision request. Query embeddings remain the only AI call during
   search and are recorded as a separate usage operation.
