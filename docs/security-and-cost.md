@@ -102,6 +102,20 @@ delivery, stale cursors, authorization failures, and worker crashes.
   provider/model namespace. Reanalysis is a one-run checkbox that is never
   persisted and resets after the run. Reanalysis requires confirmation and
   clearly states that same-model annotations will be replaced.
+- AI analysis coverage is durable and keyed by content hash, provider/model
+  namespace, and a settings fingerprint. The fingerprint includes the prompt
+  version, sampling interval, frame cap, batch shape, context hint, and speech
+  settings. Each attempt records complete, partial, or failed status, planned
+  and successful frame counts, failed timestamp ranges, and a user-visible
+  warning. Pre-migration annotations are marked coverage-unknown and are not
+  automatically sent to a paid queue.
+- Partial or failed retries are an explicit user choice. Their conservative
+  full-attempt estimate is shown before confirmation. A partial result can
+  remain searchable, but it is labeled as incomplete; a failed or partial
+  retry never deletes a prior complete same-model result. Different model
+  histories remain independent. A complete, explicitly confirmed retry may
+  replace the prior same-model annotations after the new result is fully
+  available.
 - Only one AI analysis can run at a time. The stop control prevents additional
   files and frame batches from starting, keeps completed clip annotations, and
   lets a later run continue with missing clips. The shared cancellation check
