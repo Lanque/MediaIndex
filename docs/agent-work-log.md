@@ -168,6 +168,82 @@
 - Stage-wise performance instrumentation, batch-level continuation across
   audio/embedding, and precise ETA calibration remain future work.
 
+## 2026-09-06 — MI-05 stage diagnostics and repeatable local benchmark
+
+- Baseline: `ecf7950` (`docs: record MI-04R plan reconciliation safeguards`).
+- Implementation commit: `2dad997` (`feat: add stage-based AI diagnostics`).
+- Scope: per-run and per-file wall time, frame extraction and encoding,
+  checkpoint lookup/save acknowledgement, vision HTTP attempts, response-body
+  parsing, retry waits, audio extraction/duration probe, transcription,
+  embeddings, final SQLite commit, and run start/usage/run-finish SQLite
+  stages. HTTP timing ends after the response headers/transport completes;
+  response body reading and JSON/usage parsing are measured separately.
+  Diagnostics count new versus reused vision frames and batches and preserve
+  succeeded/failed/cancelled outcomes. A successful or failed production run
+  exports an atomic JSON file under the Tauri app-local
+  `ai-diagnostics/<run-id>.json` directory, retaining at most 12 `run-*.json`
+  files. The export contains content IDs and run metadata only: no media bytes,
+  prompts, API keys, or absolute private paths. The desktop report exposes the
+  resulting path when export succeeds.
+- No paid provider requests were made. The manual benchmark uses real local
+  FFmpeg-generated MP4 files and a loopback OpenAI-compatible HTTP stub with a
+  fixed 15 ms response delay. It uses 1-second sampling, a 12-frame cap,
+  speech enabled, a 3-second 320x180 clip, a 12-second 640x360 clip, and one
+  sequential worker. The benchmark runs fresh, ready-repeat, partial-resume,
+  and downstream-retry scenarios for both clips; the failed statuses below
+  are intentional simulated downstream failures that preserve checkpoints.
+
+### MI-05 measured benchmark
+
+FFmpeg: `2026-03-30-git-e54e117998-essentials_build` (Windows local build).
+The run-level diagnostic JSON reported 2,353 ms wall time, 8 scenario files,
+one worker, and 16 stub requests. Values below are milliseconds unless marked
+as counts; `new/reused` is a frame count, and `vision HTTP` is request count /
+elapsed time.
+
+| Scenario | Status | Wall | New/reused | Vision HTTP | Frame extraction | Audio extraction | Transcription HTTP | Embedding HTTP | Final SQLite |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| short:fresh | failed* | 422 | 3/0 | 1/19 | 129 | 230 | 1/19 | 1/17 | 0 |
+| short:ready_repeat | skipped | 0 | 0/0 | 0/0 | 0 | 0 | 0/0 | 0/0 | 0 |
+| short:partial_resume | failed* | 374 | 0/3 | 0/0 | 141 | 194 | 1/18 | 1/17 | 0 |
+| short:downstream_retry | complete | 349 | 0/3 | 0/0 | 114 | 194 | 1/18 | 1/18 | 0 |
+| long:fresh | failed* | 431 | 12/0 | 2/39 | 138 | 212 | 1/17 | 1/17 | 0 |
+| long:ready_repeat | skipped | 0 | 0/0 | 0/0 | 0 | 0 | 0/0 | 0/0 | 0 |
+| long:partial_resume | failed* | 400 | 4/8 | 1/20 | 131 | 208 | 1/18 | 1/17 | 0 |
+| long:downstream_retry | complete | 374 | 0/12 | 0/0 | 130 | 204 | 1/19 | 1/17 | 1 |
+
+The checkpoint lookup and save-acknowledgement, response parsing, frame
+encoding, and audio-duration probe metrics are also present in the JSON; the
+SQLite lookup/save and response parsing values were below the 1 ms export
+resolution in this run. The long partial run demonstrates that only the
+missing four frames caused a new vision request; the retry reused both saved
+vision batches. Frame/audio FFmpeg work remained larger than the delayed HTTP
+portion, so this benchmark establishes the bottleneck baseline but does not
+claim that analysis speed or ETA calibration is solved. The sequential setup
+also does not measure production worker overlap.
+
+### Checks
+
+- `cargo test --manifest-path desktop/src-tauri/Cargo.toml --offline`:
+  119 passed, 0 failed, 2 ignored (the real-media smoke test and this manual
+  benchmark).
+- Manual benchmark:
+  `cargo test --manifest-path desktop/src-tauri/Cargo.toml --offline mi05_benchmark_real_ffmpeg_with_delayed_local_stub -- --ignored --nocapture` — passed; it printed the JSON output path.
+- `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check`: passed.
+- `git diff --check`: passed apart from the repository's existing LF/CRLF
+  normalization warnings.
+
+### Remaining risks
+
+- This is instrumentation and a repeatable local baseline, not a new
+  parallelism policy, batch-level audio/embedding continuation, or ETA model.
+- Production file wall time now includes the final SQLite commit, while the
+  run wall time remains independent of the sum of per-file stage durations;
+  additional multi-worker calibration is still required.
+- Multiple saved frame-plan variants for the same content/settings are still a
+  known planner edge; MI-05 records their runtime cost but does not refactor
+  plan selection.
+
 ## 2026-09-06 — MI-04R actual frame-plan reconciliation and dispatcher safety
 
 - Baseline: `4d5c919` (`docs: note MI-04 downstream recovery test`).
