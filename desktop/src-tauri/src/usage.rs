@@ -42,13 +42,6 @@ pub struct AiUsageEvent {
     pub possible_cost: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AiRequestBudgetPolicy {
-    pub vision_usd: Option<f64>,
-    pub embedding_usd: Option<f64>,
-    pub transcription_usd: Option<f64>,
-}
-
 #[derive(Clone, Debug)]
 pub struct AiUsageRecorder {
     run_id: String,
@@ -59,6 +52,13 @@ pub struct AiUsageRecorder {
     state: Arc<Mutex<RecorderState>>,
     budget_gate: Option<AiBudgetGate>,
     request_budget_policy: Option<AiRequestBudgetPolicy>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AiRequestBudgetPolicy {
+    pub vision_usd: Option<f64>,
+    pub embedding_usd: Option<f64>,
+    pub transcription_usd: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -78,59 +78,84 @@ pub struct AiUsageEventHandle {
 
 #[derive(Clone, Debug)]
 pub struct AiBudgetGate {
-    remaining_micros: Arc<AtomicU64>,
-    spent_micros: Arc<AtomicU64>,
+    state: Arc<Mutex<BudgetState>>,
+}
+
+#[derive(Debug)]
+struct BudgetState {
+    limit_micros: u64,
+    settled_micros: u64,
+    uncertain_micros: u64,
+    reservations: HashMap<String, u64>,
 }
 
 impl AiBudgetGate {
     pub fn new(limit_usd: f64) -> Option<Self> {
         let limit_micros = usd_to_micros(limit_usd)?;
         Some(Self {
-            remaining_micros: Arc::new(AtomicU64::new(limit_micros)),
-            spent_micros: Arc::new(AtomicU64::new(0)),
+            state: Arc::new(Mutex::new(BudgetState {
+                limit_micros,
+                settled_micros: 0,
+                uncertain_micros: 0,
+                reservations: HashMap::new(),
+            })),
         })
     }
 
-    pub fn try_reserve(&self, reserve_usd: f64) -> Option<u64> {
-        let reserve_micros = usd_to_micros(reserve_usd)?;
-        self.remaining_micros
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                if remaining >= reserve_micros {
-                    Some(remaining - reserve_micros)
-                } else {
-                    None
-                }
-            })
-            .ok()
-            .map(|_| {
-                self.spent_micros
-                    .fetch_add(reserve_micros, Ordering::AcqRel);
-                reserve_micros
-            })
+    pub fn try_reserve(&self, local_event_id: &str, reserve_usd: f64) -> Option<u64> {
+        let reserve_micros = usd_to_nonnegative_micros(reserve_usd)?;
+        let mut state = self.state.lock().ok()?;
+        if state.reservations.contains_key(local_event_id) {
+            return None;
+        }
+        let active_micros = state
+            .reservations
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        let committed_micros = state
+            .settled_micros
+            .saturating_add(state.uncertain_micros)
+            .saturating_add(active_micros);
+        if committed_micros.saturating_add(reserve_micros) > state.limit_micros {
+            return None;
+        }
+        state
+            .reservations
+            .insert(local_event_id.to_owned(), reserve_micros);
+        Some(reserve_micros)
     }
 
-    pub fn adjust_reservation(&self, reserved_micros: u64, actual_usd: f64) {
-        let Some(actual_micros) = usd_to_micros(actual_usd) else {
+    pub fn settle(&self, local_event_id: &str, actual_usd: Option<f64>) {
+        let Ok(mut state) = self.state.lock() else {
             return;
         };
-        if actual_micros > reserved_micros {
-            let extra = actual_micros - reserved_micros;
-            self.spent_micros.fetch_add(extra, Ordering::AcqRel);
-            self.remaining_micros
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                    Some(remaining.saturating_sub(extra))
-                })
-                .ok();
-        } else if reserved_micros > actual_micros {
-            let released = reserved_micros - actual_micros;
-            self.spent_micros.fetch_sub(released, Ordering::AcqRel);
-            self.remaining_micros.fetch_add(released, Ordering::AcqRel);
+        let Some(reserved_micros) = state.reservations.remove(local_event_id) else {
+            return;
+        };
+        if let Some(actual_usd) = actual_usd {
+            state.settled_micros = state
+                .settled_micros
+                .saturating_add(usd_to_nonnegative_micros(actual_usd).unwrap_or(reserved_micros));
+        } else {
+            state.uncertain_micros = state.uncertain_micros.saturating_add(reserved_micros);
         }
     }
 
-    pub fn reserved_usd(&self, limit_usd: f64) -> f64 {
-        let _ = limit_usd;
-        self.spent_micros.load(Ordering::Acquire) as f64 / 1_000_000.0
+    pub fn reserved_usd(&self, _limit_usd: f64) -> f64 {
+        let Ok(state) = self.state.lock() else {
+            return 0.0;
+        };
+        let active_micros = state
+            .reservations
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        state
+            .settled_micros
+            .saturating_add(state.uncertain_micros)
+            .saturating_add(active_micros) as f64
+            / 1_000_000.0
     }
 }
 
@@ -221,7 +246,16 @@ impl AiUsageRecorder {
     }
 
     pub fn begin_request(&self, operation: &str, model: &str, attempt: u32) -> AiUsageEventHandle {
-        self.begin_request_with_reservation(operation, model, attempt, None, None, None)
+        let local_event_id = self.new_local_event_id();
+        self.begin_request_with_reservation(
+            local_event_id,
+            operation,
+            model,
+            attempt,
+            None,
+            None,
+            None,
+        )
     }
 
     pub fn begin_reserved_request(
@@ -230,10 +264,11 @@ impl AiUsageRecorder {
         model: &str,
         attempt: u32,
     ) -> Option<AiUsageEventHandle> {
+        let local_event_id = self.new_local_event_id();
         let (budget_gate, reserved_micros, reserved_cost_usd) =
             if let Some(budget_gate) = self.budget_gate.as_ref() {
                 let reserve_usd = self.request_reserve_usd(operation)?;
-                let reserved_micros = budget_gate.try_reserve(reserve_usd)?;
+                let reserved_micros = budget_gate.try_reserve(&local_event_id, reserve_usd)?;
                 (
                     Some(budget_gate.clone()),
                     Some(reserved_micros),
@@ -243,6 +278,7 @@ impl AiUsageRecorder {
                 (None, None, None)
             };
         Some(self.begin_request_with_reservation(
+            local_event_id,
             operation,
             model,
             attempt,
@@ -252,8 +288,22 @@ impl AiUsageRecorder {
         ))
     }
 
+    fn request_reserve_usd(&self, operation: &str) -> Option<f64> {
+        let policy = self.request_budget_policy?;
+        if operation.ends_with("vision") {
+            policy.vision_usd
+        } else if operation.ends_with("embedding") {
+            policy.embedding_usd
+        } else if operation.contains("speech transcription") {
+            policy.transcription_usd
+        } else {
+            None
+        }
+    }
+
     fn begin_request_with_reservation(
         &self,
+        local_event_id: String,
         operation: &str,
         model: &str,
         attempt: u32,
@@ -261,7 +311,6 @@ impl AiUsageRecorder {
         reserved_micros: Option<u64>,
         reserved_cost_usd: Option<f64>,
     ) -> AiUsageEventHandle {
-        let local_event_id = self.new_local_event_id();
         let event = AiUsageEvent {
             local_event_id: local_event_id.clone(),
             run_id: self.run_id.clone(),
@@ -292,19 +341,6 @@ impl AiUsageRecorder {
             budget_gate,
             reserved_micros,
             reservation_adjusted: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    fn request_reserve_usd(&self, operation: &str) -> Option<f64> {
-        let policy = self.request_budget_policy?;
-        if operation.ends_with("vision") {
-            policy.vision_usd
-        } else if operation.ends_with("embedding") {
-            policy.embedding_usd
-        } else if operation.contains("speech transcription") {
-            policy.transcription_usd
-        } else {
-            None
         }
     }
 
@@ -388,13 +424,13 @@ impl AiUsageEventHandle {
                     output_tokens,
                     audio_seconds,
                 );
-                if let (Some(budget_gate), Some(reserved_micros), Some(actual_cost_usd)) = (
+                if let (Some(budget_gate), Some(_reserved_micros), Some(actual_cost_usd)) = (
                     self.budget_gate.as_ref(),
                     self.reserved_micros,
                     calculated_cost_usd,
                 ) {
                     if !self.reservation_adjusted.swap(true, Ordering::AcqRel) {
-                        budget_gate.adjust_reservation(reserved_micros, actual_cost_usd);
+                        budget_gate.settle(&self.local_event_id, Some(actual_cost_usd));
                         event.budget_adjustment_usd = event
                             .reserved_cost_usd
                             .map(|reserved| actual_cost_usd - reserved);
@@ -405,6 +441,11 @@ impl AiUsageEventHandle {
     }
 
     pub fn finish(&self) {
+        if let Some(budget_gate) = self.budget_gate.as_ref() {
+            if !self.reservation_adjusted.swap(true, Ordering::AcqRel) {
+                budget_gate.settle(&self.local_event_id, None);
+            }
+        }
         if let Ok(mut state) = self.state.lock() {
             if let Some(event) = state.pending.remove(&self.local_event_id) {
                 state.completed.push(event);
@@ -429,7 +470,6 @@ fn update_reported_usage(
         &event.model,
         input_tokens,
         output_tokens,
-        audio_seconds,
     );
     event.calculated_cost_usd = calculated_cost_usd;
     if input_tokens.is_some() || output_tokens.is_some() || audio_seconds.is_some() {
@@ -439,7 +479,11 @@ fn update_reported_usage(
 }
 
 fn usd_to_micros(value: f64) -> Option<u64> {
-    (value.is_finite() && value > 0.0)
+    usd_to_nonnegative_micros(value).filter(|value| *value > 0)
+}
+
+fn usd_to_nonnegative_micros(value: f64) -> Option<u64> {
+    (value.is_finite() && value >= 0.0)
         .then(|| (value * 1_000_000.0).ceil())
         .filter(|value| *value <= u64::MAX as f64)
         .map(|value| value as u64)
@@ -451,13 +495,9 @@ fn reported_cost(
     model: &str,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
-    audio_seconds: Option<f64>,
 ) -> Option<f64> {
     let input_tokens = input_tokens.unwrap_or_default();
     let output_tokens = output_tokens.unwrap_or_default();
-    if input_tokens == 0 && output_tokens == 0 && audio_seconds.unwrap_or_default() <= 0.0 {
-        return None;
-    }
     match operation {
         "OpenAI vision" | "Gemini vision" => {
             let pricing = pricing::vision_pricing(provider, model)?;
@@ -471,10 +511,6 @@ fn reported_cost(
         "OpenAI embedding" | "Gemini embedding" => {
             Some(input_tokens as f64 * pricing::embedding_pricing(provider, model)? / 1_000_000.0)
         }
-        "OpenAI speech transcription" => Some(
-            audio_seconds.unwrap_or_default() / 60.0
-                * pricing::transcription_pricing(provider, model)?,
-        ),
         _ => None,
     }
 }
@@ -489,8 +525,8 @@ mod tests {
         let first = gate.clone();
         let second = gate.clone();
         let handles = [
-            std::thread::spawn(move || first.try_reserve(0.6).is_some()),
-            std::thread::spawn(move || second.try_reserve(0.6).is_some()),
+            std::thread::spawn(move || first.try_reserve("run-test:1", 0.6).is_some()),
+            std::thread::spawn(move || second.try_reserve("run-test:2", 0.6).is_some()),
         ];
         let successes = handles
             .into_iter()
@@ -500,6 +536,36 @@ mod tests {
 
         assert_eq!(successes, 1);
         assert!((gate.reserved_usd(1.0) - 0.6).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn budget_deficit_is_not_hidden_when_reservations_settle_in_either_order() {
+        for settle_first in [true, false] {
+            let gate = AiBudgetGate::new(1.0).expect("valid budget should create a gate");
+            assert!(gate.try_reserve("run-test:1", 0.5).is_some());
+            assert!(gate.try_reserve("run-test:2", 0.5).is_some());
+
+            if settle_first {
+                gate.settle("run-test:1", Some(1.2));
+                gate.settle("run-test:2", Some(0.1));
+            } else {
+                gate.settle("run-test:2", Some(0.1));
+                gate.settle("run-test:1", Some(1.2));
+            }
+
+            assert!(gate.try_reserve("run-test:3", 0.01).is_none());
+            assert!(gate.reserved_usd(1.0) > 1.0);
+        }
+    }
+
+    #[test]
+    fn settling_the_same_request_twice_does_not_release_extra_budget() {
+        let gate = AiBudgetGate::new(1.0).expect("valid budget should create a gate");
+        assert!(gate.try_reserve("run-test:1", 0.5).is_some());
+        gate.settle("run-test:1", Some(0.1));
+        gate.settle("run-test:1", Some(0.1));
+
+        assert!(gate.try_reserve("run-test:2", 0.9).is_some());
     }
 
     #[test]
