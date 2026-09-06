@@ -129,6 +129,17 @@ delivery, stale cursors, authorization failures, and worker crashes.
   takes effect; its usage event is retained and unknown usage remains reserved.
   Search and Test connection use independent request paths and are not stopped
   by an analysis run cancellation.
+- Vision frame batches are checkpointed locally only after a validated provider
+  response and a committed SQLite transaction. A checkpoint contains normalized
+  analysis metadata and text, never source media, frame bytes, API keys, or OAuth
+  tokens. Reuse requires the content hash, settings/prompt fingerprint, batch
+  schema version, complete ordered timestamp plan, and exact batch slice to
+  match. The continuation preflight charges only missing vision work while
+  retaining the full embedding and configured speech estimate; the user must
+  explicitly choose continuation, and full reanalysis bypasses checkpoints.
+  Checkpoints survive cancellation, restart, and failed audio/embedding work,
+  are cleared with a successful complete annotation commit, and are bounded by
+  deterministic retention.
 - Focused search limits low-ranking results, videos, and moments without making
   another vision request. Query embeddings remain the only AI call during
   search and are recorded as a separate usage operation.
