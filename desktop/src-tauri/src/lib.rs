@@ -310,22 +310,18 @@ fn plan_ai_analysis(
             .get_asset_metadata(&file.content_hash)
             .map_err(|error| error.to_string())?;
         let duration_ms = metadata.as_ref().and_then(|metadata| metadata.duration_ms);
-        let sampled_frames = duration_ms
-            .map(|duration| {
-                duration
-                    .max(1)
-                    .div_ceil(settings.sample_interval_ms().max(1))
-                    .max(1)
-                    .min(max_frames_per_file)
-            })
-            .unwrap_or(max_frames_per_file);
-        estimated_sampled_frames = estimated_sampled_frames.saturating_add(sampled_frames);
-        let vision_requests = sampled_frames.div_ceil(vision_batch_size);
-        estimated_vision_requests = estimated_vision_requests.saturating_add(vision_requests);
         let available_checkpoint_summary = checkpoint_summaries
             .get(&file.content_hash)
             .cloned()
             .unwrap_or_default();
+        let sampled_frames = if resume_checkpoints && available_checkpoint_summary.frame_count > 0 {
+            available_checkpoint_summary.frame_count
+        } else {
+            estimated_sampled_frame_count(duration_ms, &settings)
+        };
+        estimated_sampled_frames = estimated_sampled_frames.saturating_add(sampled_frames);
+        let vision_requests = sampled_frames.div_ceil(vision_batch_size);
+        estimated_vision_requests = estimated_vision_requests.saturating_add(vision_requests);
         let checkpoint_summary = if resume_checkpoints {
             available_checkpoint_summary
         } else {
@@ -541,6 +537,7 @@ fn analyze_media_folder_blocking(
             let checkpoint_store_sender = worker_sender.clone();
             let worker_settings_fingerprint = settings_fingerprint.clone();
             let allow_checkpoint_resume = resume_checkpoints && !force;
+            let worker_resumable_content_hashes = resumable_content_hashes.clone();
 
             scope.spawn(move || loop {
                 if worker_control.is_cancelled() {
@@ -557,6 +554,8 @@ fn analyze_media_folder_blocking(
                 let checkpoint_store_settings_fingerprint = worker_settings_fingerprint.clone();
                 let task_checkpoint_load_sender = checkpoint_load_sender.clone();
                 let task_checkpoint_store_sender = checkpoint_store_sender.clone();
+                let require_checkpoint_match = allow_checkpoint_resume
+                    && worker_resumable_content_hashes.contains(&file.content_hash);
                 let result = ai::analyze_file_with_progress_and_cancel_with_checkpoints(
                     Path::new(&current_file),
                     metadata.as_ref(),
@@ -589,9 +588,17 @@ fn analyze_media_folder_blocking(
                                 acknowledgement: acknowledgement_sender,
                             })
                             .map_err(|_| "AI analysis worker channel closed".to_owned())?;
-                        acknowledgement_receiver
+                        let checkpoints = acknowledgement_receiver
                             .recv()
-                            .map_err(|_| "AI checkpoint reader stopped responding".to_owned())?
+                            .map_err(|_| "AI checkpoint reader stopped responding".to_owned())?;
+                        let checkpoints = checkpoints?;
+                        if require_checkpoint_match && checkpoints.is_empty() {
+                            return Err(
+                                "saved vision checkpoint plan no longer matches the frames extracted from this clip; review the analysis estimate before continuing"
+                                    .to_owned(),
+                            );
+                        }
+                        Ok(checkpoints)
                     },
                     move |checkpoint| {
                         let (acknowledgement_sender, acknowledgement_receiver) = mpsc::channel();
@@ -632,111 +639,74 @@ fn analyze_media_folder_blocking(
 
         let mut fatal_error = None;
         while let Ok(message) = receiver.recv() {
-            match message {
-                AiWorkerMessage::LoadVisionCheckpoints {
-                    content_hash,
-                    settings_fingerprint,
-                    frame_timestamps,
-                    batch_size,
-                    acknowledgement,
-                } => {
-                    let result = index
-                        .load_ai_vision_checkpoints(
-                            &content_hash,
-                            &settings_fingerprint,
-                            ai::AI_VISION_CHECKPOINT_VERSION,
-                            &frame_timestamps,
-                            batch_size,
-                        )
-                        .map_err(|error| error.to_string());
-                    if let Err(error) = &result {
-                        fatal_error.get_or_insert_with(|| error.clone());
-                        control.request_cancel();
-                    }
-                    let _ = acknowledgement.send(result);
+            let Some(message) =
+                handle_ai_checkpoint_message(message, &mut index, control, &mut fatal_error)
+            else {
+                continue;
+            };
+            let AiWorkerMessage::Result {
+                file_index,
+                file,
+                result,
+            } = message
+            else {
+                unreachable!("checkpoint handler must consume checkpoint messages");
+            };
+            if fatal_error.is_some() {
+                continue;
+            }
+            if let Err(error) = persist_ai_usage_events(&mut index, &usage_recorder) {
+                fatal_error.get_or_insert(error);
+                control.request_cancel();
+                continue;
+            }
+            let outcome = match persist_ai_result(
+                &mut index,
+                &mut report,
+                &file,
+                &provider,
+                &run_id,
+                &settings_fingerprint,
+                result,
+                &persisted_files,
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    fatal_error.get_or_insert(error);
+                    control.request_cancel();
+                    continue;
                 }
-                AiWorkerMessage::StoreVisionCheckpoint {
-                    content_hash,
-                    settings_fingerprint,
-                    checkpoint,
-                    acknowledgement,
-                } => {
-                    let result = index
-                        .store_ai_vision_checkpoint(
-                            &content_hash,
-                            &settings_fingerprint,
-                            ai::AI_VISION_CHECKPOINT_VERSION,
-                            &checkpoint,
-                        )
-                        .map_err(|error| error.to_string());
-                    if let Err(error) = &result {
-                        fatal_error.get_or_insert_with(|| error.clone());
-                        control.request_cancel();
-                    }
-                    let _ = acknowledgement.send(result);
-                }
-                AiWorkerMessage::Result {
-                    file_index,
-                    file,
-                    result,
-                } => {
-                    if fatal_error.is_some() {
-                        continue;
-                    }
-                    if let Err(error) = persist_ai_usage_events(&mut index, &usage_recorder) {
-                        fatal_error.get_or_insert(error);
-                        control.request_cancel();
-                        continue;
-                    }
-                    let outcome = match persist_ai_result(
-                        &mut index,
-                        &mut report,
-                        &file,
-                        &provider,
-                        &run_id,
-                        &settings_fingerprint,
-                        result,
-                        &persisted_files,
-                    ) {
-                        Ok(outcome) => outcome,
-                        Err(error) => {
-                            fatal_error.get_or_insert(error);
-                            control.request_cancel();
-                            continue;
-                        }
-                    };
-                    let percent = update_overall_progress(&file_progress, file_index, 100);
-                    match outcome {
-                        AiResultOutcome::Committed => emit_ai_progress(
-                            &app,
-                            persisted_files.load(Ordering::Relaxed),
-                            total_files,
-                            file.path,
-                            provider.clone(),
-                            percent,
-                            "Clip saved",
-                        ),
-                        AiResultOutcome::Warning => emit_ai_progress(
-                            &app,
-                            persisted_files.load(Ordering::Relaxed),
-                            total_files,
-                            file.path,
-                            provider.clone(),
-                            percent,
-                            "Clip finished with a warning",
-                        ),
-                        AiResultOutcome::Partial => emit_ai_progress(
-                            &app,
-                            persisted_files.load(Ordering::Relaxed),
-                            total_files,
-                            file.path,
-                            provider.clone(),
-                            percent,
-                            "Clip saved with partial coverage",
-                        ),
-                        AiResultOutcome::Cancelled => {}
-                    }
-                }
+            };
+            let percent = update_overall_progress(&file_progress, file_index, 100);
+            match outcome {
+                AiResultOutcome::Committed => emit_ai_progress(
+                    &app,
+                    persisted_files.load(Ordering::Relaxed),
+                    total_files,
+                    file.path,
+                    provider.clone(),
+                    percent,
+                    "Clip saved",
+                ),
+                AiResultOutcome::Warning => emit_ai_progress(
+                    &app,
+                    persisted_files.load(Ordering::Relaxed),
+                    total_files,
+                    file.path,
+                    provider.clone(),
+                    percent,
+                    "Clip finished with a warning",
+                ),
+                AiResultOutcome::Partial => emit_ai_progress(
+                    &app,
+                    persisted_files.load(Ordering::Relaxed),
+                    total_files,
+                    file.path,
+                    provider.clone(),
+                    percent,
+                    "Clip saved with partial coverage",
+                ),
+                AiResultOutcome::Cancelled => {}
             }
         }
         if let Some(error) = fatal_error {
@@ -800,6 +770,61 @@ enum AiWorkerMessage {
         file: local_index::IndexedFile,
         result: Result<ai::AiFileAnalysisResult, String>,
     },
+}
+
+fn handle_ai_checkpoint_message(
+    message: AiWorkerMessage,
+    index: &mut local_index::SqliteIndex,
+    control: &AiAnalysisControl,
+    fatal_error: &mut Option<String>,
+) -> Option<AiWorkerMessage> {
+    match message {
+        AiWorkerMessage::LoadVisionCheckpoints {
+            content_hash,
+            settings_fingerprint,
+            frame_timestamps,
+            batch_size,
+            acknowledgement,
+        } => {
+            let result = index
+                .load_ai_vision_checkpoints(
+                    &content_hash,
+                    &settings_fingerprint,
+                    ai::AI_VISION_CHECKPOINT_VERSION,
+                    &frame_timestamps,
+                    batch_size,
+                )
+                .map_err(|error| error.to_string());
+            if let Err(error) = &result {
+                fatal_error.get_or_insert_with(|| error.clone());
+                control.request_cancel();
+            }
+            let _ = acknowledgement.send(result);
+            None
+        }
+        AiWorkerMessage::StoreVisionCheckpoint {
+            content_hash,
+            settings_fingerprint,
+            checkpoint,
+            acknowledgement,
+        } => {
+            let result = index
+                .store_ai_vision_checkpoint(
+                    &content_hash,
+                    &settings_fingerprint,
+                    ai::AI_VISION_CHECKPOINT_VERSION,
+                    &checkpoint,
+                )
+                .map_err(|error| error.to_string());
+            if let Err(error) = &result {
+                fatal_error.get_or_insert_with(|| error.clone());
+                control.request_cancel();
+            }
+            let _ = acknowledgement.send(result);
+            None
+        }
+        message @ AiWorkerMessage::Result { .. } => Some(message),
+    }
 }
 
 fn new_ai_run_id() -> String {
@@ -986,9 +1011,10 @@ fn select_ai_files_with_options(
         let coverage_state =
             ai_coverage_state(index, &file.content_hash, model, settings_fingerprint)?;
         let has_resumable_checkpoint = resumable_content_hashes.contains(&file.content_hash);
-        if !force
-            && coverage_state != AiCoverageState::New
-            && !(resume_checkpoints && has_resumable_checkpoint)
+        let checkpoint_requires_explicit_resume = has_resumable_checkpoint && !resume_checkpoints;
+        let covered_file_requires_explicit_resume = coverage_state != AiCoverageState::New
+            && !(resume_checkpoints && has_resumable_checkpoint);
+        if !force && (checkpoint_requires_explicit_resume || covered_file_requires_explicit_resume)
         {
             skipped_file_count += 1;
             match coverage_state {
@@ -1016,25 +1042,30 @@ fn ai_vision_checkpoint_summaries(
 ) -> Result<HashMap<String, local_index::AiVisionCheckpointSummary>, String> {
     let mut summaries = HashMap::new();
     for file in indexed_files {
-        let metadata = index
-            .get_asset_metadata(&file.content_hash)
-            .map_err(|error| error.to_string())?;
-        let frame_timestamps = ai::planned_frame_timestamps(
-            metadata.as_ref().and_then(|metadata| metadata.duration_ms),
-            settings,
-        );
         let summary = index
-            .ai_vision_checkpoint_summary(
+            .ai_vision_checkpoint_summary_for_any_plan(
                 &file.content_hash,
                 settings_fingerprint,
                 ai::AI_VISION_CHECKPOINT_VERSION,
-                &frame_timestamps,
                 settings.vision_batch_size(),
             )
             .map_err(|error| error.to_string())?;
         summaries.insert(file.content_hash.clone(), summary);
     }
     Ok(summaries)
+}
+
+fn estimated_sampled_frame_count(duration_ms: Option<u64>, settings: &ai::AiSettings) -> u64 {
+    let max_frames = settings.max_frames_per_file().max(1) as u64;
+    duration_ms
+        .map(|duration| {
+            duration
+                .max(1)
+                .div_ceil(settings.sample_interval_ms().max(1))
+                .max(1)
+                .min(max_frames)
+        })
+        .unwrap_or(max_frames)
 }
 
 struct AiFileSelection {
@@ -1497,6 +1528,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn overall_ai_progress_is_averaged_and_monotonic() {
@@ -1604,6 +1636,155 @@ mod tests {
         .is_err());
         assert_eq!(persisted_files.load(Ordering::Relaxed), 1);
         assert_eq!(report.analyzed_file_count, 1);
+    }
+
+    #[test]
+    fn checkpoint_dispatcher_acks_two_workers_and_stops_after_a_write_error() {
+        use std::sync::atomic::AtomicUsize;
+
+        let mut index = local_index::SqliteIndex::open_in_memory().expect("index should open");
+        let file = local_index::IndexedFile {
+            path: "/library/dispatcher.mp4".to_owned(),
+            content_hash: "hash-dispatcher".to_owned(),
+            size_bytes: 10,
+            modified_unix_ms: None,
+            status: local_index::LocalFileStatus::Active,
+            identity_verified: true,
+        };
+        index
+            .reconcile(
+                &scanner::ScanReport {
+                    files: vec![scanner::DiscoveredFile {
+                        path: file.path.clone(),
+                        size_bytes: file.size_bytes,
+                        modified_unix_ms: file.modified_unix_ms,
+                        content_hash: file.content_hash.clone(),
+                    }],
+                    warnings: Vec::new(),
+                },
+                &HashMap::new(),
+            )
+            .expect("dispatcher fixture should be indexed");
+
+        let control = AiAnalysisControl::default();
+        let _guard = control.begin().expect("dispatcher run should start");
+        let (sender, receiver) = mpsc::channel();
+        let (invalid_store_sent, invalid_store_ready) = mpsc::channel();
+        let (worker_one_done, worker_one_done_rx) = mpsc::channel();
+        let (worker_two_done, worker_two_done_rx) = mpsc::channel();
+        let next_paid_attempts = Arc::new(AtomicUsize::new(0));
+
+        let worker_one_sender = sender.clone();
+        let worker_one = std::thread::spawn(move || {
+            let (acknowledgement_sender, acknowledgement_receiver) = mpsc::channel();
+            worker_one_sender
+                .send(AiWorkerMessage::StoreVisionCheckpoint {
+                    content_hash: "hash-dispatcher".to_owned(),
+                    settings_fingerprint: "fingerprint-dispatcher".to_owned(),
+                    checkpoint: ai::AiVisionCheckpointBatch {
+                        batch_index: 0,
+                        frame_timestamps: Vec::new(),
+                        batch_timestamps: Vec::new(),
+                        analyses: Vec::new(),
+                    },
+                    acknowledgement: acknowledgement_sender,
+                })
+                .expect("worker one should enqueue its store");
+            invalid_store_sent
+                .send(())
+                .expect("test should observe worker one");
+            let result = acknowledgement_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("worker one should receive a write ACK");
+            assert!(result.is_err(), "invalid checkpoint write must fail");
+            worker_one_done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("worker one should be released");
+        });
+
+        invalid_store_ready
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker one should enqueue before worker two starts");
+        let worker_two_sender = sender.clone();
+        let worker_two_control = control.clone();
+        let worker_two_attempts = next_paid_attempts.clone();
+        let worker_two = std::thread::spawn(move || {
+            let (load_ack_sender, load_ack_receiver) = mpsc::channel();
+            worker_two_sender
+                .send(AiWorkerMessage::LoadVisionCheckpoints {
+                    content_hash: "hash-dispatcher".to_owned(),
+                    settings_fingerprint: "fingerprint-dispatcher".to_owned(),
+                    frame_timestamps: vec![0],
+                    batch_size: 1,
+                    acknowledgement: load_ack_sender,
+                })
+                .expect("worker two should enqueue its load");
+            let (store_ack_sender, store_ack_receiver) = mpsc::channel();
+            worker_two_sender
+                .send(AiWorkerMessage::StoreVisionCheckpoint {
+                    content_hash: "hash-dispatcher".to_owned(),
+                    settings_fingerprint: "fingerprint-dispatcher".to_owned(),
+                    checkpoint: ai::AiVisionCheckpointBatch {
+                        batch_index: 0,
+                        frame_timestamps: vec![0],
+                        batch_timestamps: vec![0],
+                        analyses: vec![ai::FrameAnalysis {
+                            description: "Dispatcher fixture".to_owned(),
+                            labels: Vec::new(),
+                            visible_text: Vec::new(),
+                            entities: Vec::new(),
+                            actions: Vec::new(),
+                            dialogue: Vec::new(),
+                            setting: None,
+                            situation: None,
+                            confidence: Some(0.9),
+                        }],
+                    },
+                    acknowledgement: store_ack_sender,
+                })
+                .expect("worker two should enqueue its store");
+            assert!(load_ack_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("worker two should receive a load ACK")
+                .is_ok());
+            assert!(store_ack_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("worker two should receive a store ACK")
+                .is_ok());
+            worker_two_done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("worker two should be released");
+            if !worker_two_control.is_cancelled() {
+                worker_two_attempts.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let mut fatal_error = None;
+        for _ in 0..3 {
+            let message = receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("dispatcher should receive every bounded worker message");
+            assert!(
+                handle_ai_checkpoint_message(message, &mut index, &control, &mut fatal_error)
+                    .is_none()
+            );
+        }
+        worker_one_done
+            .send(())
+            .expect("worker one should be released after dispatch");
+        worker_two_done
+            .send(())
+            .expect("worker two should be released after dispatch");
+        worker_one
+            .join()
+            .expect("worker one should finish without deadlock");
+        worker_two
+            .join()
+            .expect("worker two should finish without deadlock");
+
+        assert!(fatal_error.is_some());
+        assert!(control.is_cancelled());
+        assert_eq!(next_paid_attempts.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1888,6 +2069,19 @@ mod tests {
             status: local_index::LocalFileStatus::Active,
             identity_verified: true,
         };
+        let metadata = metadata::MediaMetadata {
+            duration_ms: Some(1),
+            size_bytes: Some(file.size_bytes),
+            container: None,
+            video_codec: None,
+            audio_codec: None,
+            width: None,
+            height: None,
+            frame_rate: None,
+            start_time: None,
+            creation_time: None,
+        };
+        let metadata_by_path = HashMap::from([(file.path.clone(), metadata)]);
         index
             .reconcile(
                 &scanner::ScanReport {
@@ -1899,19 +2093,22 @@ mod tests {
                     }],
                     warnings: Vec::new(),
                 },
-                &HashMap::new(),
+                &metadata_by_path,
             )
             .expect("fixture should be indexed");
         let settings = ai::AiSettings::from_request(Some(ai::AiRequestConfig {
             provider: Some(ai::AiProvider::OpenAI),
             api_key: Some("test-key".to_owned()),
             sample_interval_seconds: Some(1),
-            max_frames: Some(8),
+            max_frames: Some(60),
             ..Default::default()
         }))
         .expect("settings should be valid");
         let settings_fingerprint = settings.analysis_settings_fingerprint();
-        let frame_timestamps = ai::planned_frame_timestamps(None, &settings);
+        // Metadata-only preflight must use this persisted two-frame plan, not the
+        // short metadata estimate that would predict one frame.
+        let frame_timestamps = vec![0, 1_000];
+        assert_eq!(estimated_sampled_frame_count(Some(1), &settings), 1);
         index
             .store_ai_vision_checkpoint(
                 &file.content_hash,
@@ -1946,8 +2143,8 @@ mod tests {
                 None,
                 &ai::AiFileAnalysisResult {
                     annotations: Vec::new(),
-                    planned_frame_count: 8,
-                    successful_frame_count: 8,
+                    planned_frame_count: 2,
+                    successful_frame_count: 2,
                     failed_batches: Vec::new(),
                     status: ai::AiFileAnalysisStatus::Failed,
                     warning: Some("embedding failed after vision".to_owned()),
@@ -1962,8 +2159,13 @@ mod tests {
             &settings_fingerprint,
         )
         .expect("checkpoint summary should load");
-        assert_eq!(summaries[&file.content_hash].reusable_frame_count, 8);
+        assert_eq!(summaries[&file.content_hash].reusable_frame_count, 2);
         assert_eq!(summaries[&file.content_hash].reusable_batch_count, 1);
+        assert_eq!(summaries[&file.content_hash].frame_count, 2);
+        assert_eq!(
+            summaries[&file.content_hash].frame_timestamps.as_deref(),
+            Some(frame_timestamps.as_slice())
+        );
         let no_resume = select_ai_files_with_options(
             &index,
             vec![file.clone()],
