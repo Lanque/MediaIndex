@@ -167,3 +167,41 @@
   in-flight provider request may finish and remain recorded.
 - Stage-wise performance instrumentation, batch-level continuation across
   audio/embedding, and precise ETA calibration remain future work.
+
+## 2026-09-06 — MI-04R actual frame-plan reconciliation and dispatcher safety
+
+- Baseline: `4d5c919` (`docs: note MI-04 downstream recovery test`).
+- Implementation commit: `1c2a398` (`fix: reconcile vision checkpoints with
+  actual frames`).
+- UI guard commit: `870490e` (`fix: keep declined checkpoint work out of
+  no-op runs`).
+- Scope: metadata-independent discovery of the latest valid persisted frame
+  plan, actual-plan frame-count/cost reporting, explicit runtime failure when a
+  saved plan no longer matches extracted frames, and a production
+  request/acknowledgement dispatcher test with two workers. Declining saved
+  work now ends a checkpoint-only UI run without starting a no-op analysis.
+- The preflight regression covers a short metadata estimate predicting one
+  frame while the committed plan contains two frames. A separate file-backed
+  SQLite/local HTTP test uses two actual frames with missing metadata, reopens
+  the database, and confirms the resumed run sends zero new vision requests.
+- No paid provider requests were made; the dispatcher and AI tests use local
+  SQLite fixtures and a loopback HTTP stub.
+
+### Checks
+
+- Full offline Rust test suite: 117 passed, 0 failed, 1 ignored.
+- `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check`: passed.
+- `npm.cmd run build`: passed.
+- `git diff --check`: passed apart from the repository's existing LF/CRLF
+  normalization warnings.
+
+### Remaining risks
+
+- FFmpeg extraction still runs before checkpoint lookup, and its deterministic
+  output timestamps remain the runtime source of truth; MI-04R does not remove
+  frame extraction or JPEG memory cost.
+- A runtime plan mismatch is recorded as a visible per-file analysis failure;
+  the user must review the estimate/scan and explicitly retry rather than
+  silently falling back to a paid plan.
+- Stage-wise performance instrumentation, batch-level continuation across
+  audio/embedding, and precise ETA calibration remain future work.

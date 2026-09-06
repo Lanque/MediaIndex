@@ -134,9 +134,13 @@ delivery, stale cursors, authorization failures, and worker crashes.
   analysis metadata and text, never source media, frame bytes, API keys, or OAuth
   tokens. Reuse requires the content hash, settings/prompt fingerprint, batch
   schema version, complete ordered timestamp plan, and exact batch slice to
-  match. The continuation preflight charges only missing vision work while
-  retaining the full embedding and configured speech estimate; the user must
-  explicitly choose continuation, and full reanalysis bypasses checkpoints.
+  match. Metadata-only preflight discovers a persisted plan for the same
+  content/settings/version instead of treating a duration estimate as the
+  checkpoint identity; runtime extraction must reproduce that exact plan before
+  reusing it, and a mismatch stops the file before a new paid vision request.
+  The continuation preflight charges only missing vision work while retaining
+  the full embedding and configured speech estimate; the user must explicitly
+  choose continuation, and full reanalysis bypasses checkpoints.
   Checkpoints survive cancellation, restart, and failed audio/embedding work,
   are cleared with a successful complete annotation commit, and are bounded by
   deterministic retention.
