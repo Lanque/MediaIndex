@@ -133,6 +133,8 @@
   `ff89ed1` (`docs: add MI-04 vision checkpoint ADR`).
 - Implementation commits: `84eac50` (`feat: persist resumable vision
   checkpoints`) and `24dbec9` (`feat: expose vision checkpoint continuation`).
+- Follow-up test commit: `eece660` (`test: cover downstream checkpoint
+  recovery`).
 - Scope: migration 11 for local vision-batch checkpoints, exact content/settings/
   version/timestamp identity, validated metadata-only reuse, SQLite-owner
   request/acknowledgement writes, failure-before-next-batch behavior, bounded
