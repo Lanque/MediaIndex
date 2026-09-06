@@ -446,7 +446,7 @@ where
     let mut processed_frames = 0usize;
     for frame_batch in frames.chunks(settings.vision_batch_size()) {
         ensure_analysis_not_cancelled(&is_cancelled)?;
-        match describe_frames(&client, frame_batch, settings) {
+        match describe_frames(&client, frame_batch, settings, &is_cancelled) {
             Ok(batch) if batch.len() == frame_batch.len() => {
                 analyses.extend(
                     frame_batch
@@ -496,7 +496,8 @@ where
             percent: 78,
             phase: "Transcribing speech",
         });
-        let transcription = transcribe_openai_audio(&client, &extracted_audio, settings);
+        let transcription =
+            transcribe_openai_audio(&client, &extracted_audio, settings, &is_cancelled);
         let _ = fs::remove_file(&extracted_audio.path);
         let transcript_segments = transcription?;
         ensure_analysis_not_cancelled(&is_cancelled)?;
@@ -528,8 +529,13 @@ where
         phase: "Creating search index",
     });
     ensure_analysis_not_cancelled(&is_cancelled)?;
-    let embeddings =
-        create_embeddings(&client, &embedding_texts, settings, EmbeddingKind::Document)?;
+    let embeddings = create_embeddings(
+        &client,
+        &embedding_texts,
+        settings,
+        EmbeddingKind::Document,
+        &is_cancelled,
+    )?;
     ensure_analysis_not_cancelled(&is_cancelled)?;
     if embeddings.len() != analyses.len() {
         return Err(format!(
@@ -762,10 +768,11 @@ fn parse_audio_duration(raw_duration: &str) -> Option<f64> {
     (duration_seconds.is_finite() && duration_seconds > 0.0).then_some(duration_seconds)
 }
 
-fn transcribe_openai_audio(
+fn transcribe_openai_audio<C: Fn() -> bool>(
     client: &Client,
     audio: &ExtractedAudio,
     settings: &AiSettings,
+    is_cancelled: &C,
 ) -> Result<Vec<TranscriptSegment>, String> {
     if settings.provider != AiProvider::OpenAI {
         return Ok(Vec::new());
@@ -776,7 +783,7 @@ fn transcribe_openai_audio(
             audio.path.display()
         )
     })?;
-    let response = execute_with_retry(
+    let response = execute_with_retry_cancellable(
         "OpenAI speech transcription",
         &settings.transcription_model,
         settings.usage_recorder.as_ref(),
@@ -785,6 +792,7 @@ fn transcribe_openai_audio(
             &settings.transcription_model,
             audio.duration_seconds,
         ),
+        is_cancelled,
         || {
             let part = multipart::Part::bytes(audio_bytes.clone())
                 .file_name("speech.mp3")
@@ -1021,14 +1029,39 @@ fn execute_with_retry<F>(
     model: &str,
     recorder: Option<&AiUsageRecorder>,
     request_reserve_usd: Option<f64>,
-    mut make_request: F,
+    make_request: F,
 ) -> Result<TrackedResponse, String>
 where
     F: FnMut() -> Result<Response, reqwest::Error>,
 {
+    execute_with_retry_cancellable(
+        operation_name,
+        model,
+        recorder,
+        request_reserve_usd,
+        &never_cancelled,
+        make_request,
+    )
+}
+
+fn execute_with_retry_cancellable<F, C>(
+    operation_name: &str,
+    model: &str,
+    recorder: Option<&AiUsageRecorder>,
+    request_reserve_usd: Option<f64>,
+    is_cancelled: &C,
+    mut make_request: F,
+) -> Result<TrackedResponse, String>
+where
+    F: FnMut() -> Result<Response, reqwest::Error>,
+    C: Fn() -> bool,
+{
     const MAX_ATTEMPTS: usize = 4;
     let mut attempt = 0;
     loop {
+        if is_cancelled() {
+            return Err(AI_ANALYSIS_CANCELLED_MESSAGE.to_owned());
+        }
         attempt += 1;
         let usage_event = if let Some(recorder) = recorder {
             match recorder.begin_reserved_request(
@@ -1049,6 +1082,12 @@ where
         } else {
             None
         };
+        if is_cancelled() {
+            if let Some(usage_event) = usage_event.as_ref() {
+                usage_event.cancel_before_send();
+            }
+            return Err(AI_ANALYSIS_CANCELLED_MESSAGE.to_owned());
+        }
         let started = std::time::Instant::now();
         match make_request() {
             Ok(response) => {
@@ -1077,7 +1116,9 @@ where
                         2 => 3_500,
                         _ => 6_000,
                     };
-                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    if wait_for_retry_or_cancel(delay_ms, is_cancelled) {
+                        return Err(AI_ANALYSIS_CANCELLED_MESSAGE.to_owned());
+                    }
                     continue;
                 }
                 return Ok(TrackedResponse {
@@ -1102,13 +1143,31 @@ where
                     usage_event.finish();
                 }
                 if retryable {
-                    std::thread::sleep(Duration::from_millis(1_500 * attempt as u64));
+                    if wait_for_retry_or_cancel(1_500 * attempt as u64, is_cancelled) {
+                        return Err(AI_ANALYSIS_CANCELLED_MESSAGE.to_owned());
+                    }
                     continue;
                 }
                 return Err(request_failure(operation_name, &error));
             }
         }
     }
+}
+
+fn wait_for_retry_or_cancel<C: Fn() -> bool>(delay_ms: u64, is_cancelled: &C) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(delay_ms);
+    while !is_cancelled() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+    true
+}
+
+fn never_cancelled() -> bool {
+    false
 }
 
 fn response_request_id(response: &Response) -> Option<String> {
@@ -1335,10 +1394,11 @@ enum EmbeddingKind {
     Query,
 }
 
-fn describe_frames(
+fn describe_frames<C: Fn() -> bool>(
     client: &Client,
     frames: &[(u64, Vec<u8>)],
     settings: &AiSettings,
+    is_cancelled: &C,
 ) -> Result<Vec<FrameAnalysis>, String> {
     let encoded_frames = frames
         .iter()
@@ -1375,23 +1435,36 @@ fn describe_frames(
         "Analyze these ordered video frames for a general-purpose searchable media library. The frame timestamps, in order, are: {timestamps}. {library_context} Use adjacent frames as temporal context so recurring subjects stay consistent and an ongoing action or situation is understood as a sequence. Return only a JSON object with a frames array containing exactly one object per input frame, in the same order. Each frame object must contain: description (one concise factual sentence covering who or what is visible, what is happening, and the important context); entities (lowercase array of confidently recognizable fictional characters, game characters, creatures, teams, franchises, products, vehicles, landmarks, or named objects); actions (lowercase array of concrete actions and interactions); setting (short lowercase location or environment, or an empty string); situation (short lowercase event or circumstance such as conversation, ceremony, chase, battle, tutorial, performance, sports play, accident, travel, gameplay event, or an empty string); dialogue (array of exact dialogue that is visibly shown in subtitles, captions, or speech bubbles; never infer unheard audio); labels (lowercase array covering useful subjects, objects, genre, visual style, mood, shot type, and concepts); visible_text (array of exact readable words or short phrases from subtitles, signs, titles, HUD, menus, score overlays, or logos); and confidence (number from 0 to 1). Name a well-known fictional character or franchise only when distinctive visual evidence supports it; otherwise describe appearance and role precisely. Never identify a real person from their face alone—use a real person's name only when readable on-screen text establishes it. Inspect the full frame, including background details and small UI text. Add useful search synonyms only when supported by the image. Do not invent identities, actions, relationships, locations, events, audio, or text. Use empty arrays or strings when evidence is insufficient."
     );
     let text = match settings.provider {
-        AiProvider::OpenAI => {
-            describe_openai(client, &encoded_frames, &dimensions, &prompt, settings)?
+        AiProvider::OpenAI => describe_openai(
+            client,
+            &encoded_frames,
+            &dimensions,
+            &prompt,
+            settings,
+            is_cancelled,
+        )?,
+        AiProvider::Gemini => describe_gemini(
+            client,
+            &encoded_frames,
+            &dimensions,
+            &prompt,
+            settings,
+            is_cancelled,
+        )?,
+        AiProvider::Local => {
+            describe_local(client, &encoded_frames, &prompt, settings, is_cancelled)?
         }
-        AiProvider::Gemini => {
-            describe_gemini(client, &encoded_frames, &dimensions, &prompt, settings)?
-        }
-        AiProvider::Local => describe_local(client, &encoded_frames, &prompt, settings)?,
     };
     parse_frame_analyses(&text)
 }
 
-fn describe_openai(
+fn describe_openai<C: Fn() -> bool>(
     client: &Client,
     encoded_frames: &[(u64, String)],
     dimensions: &[cost::ImageDimensions],
     prompt: &str,
     settings: &AiSettings,
+    is_cancelled: &C,
 ) -> Result<String, String> {
     let mut content = vec![json!({"type": "input_text", "text": prompt})];
     content.extend(encoded_frames.iter().map(|(_, encoded)| {
@@ -1479,7 +1552,7 @@ fn describe_openai(
     if let Some(effort) = openai_reasoning_effort(&settings.vision_model) {
         request["reasoning"] = json!({"effort": effort});
     }
-    let response = execute_with_retry(
+    let response = execute_with_retry_cancellable(
         "OpenAI vision",
         &settings.vision_model,
         settings.usage_recorder.as_ref(),
@@ -1490,6 +1563,7 @@ fn describe_openai(
             cost::text_tokens_upper(prompt).saturating_add(8_192),
             output_token_limit as u64,
         ),
+        is_cancelled,
         || {
             client
                 .post(format!("{}/responses", settings.base_url))
@@ -1519,12 +1593,13 @@ fn openai_reasoning_effort(model: &str) -> Option<&'static str> {
     }
 }
 
-fn describe_gemini(
+fn describe_gemini<C: Fn() -> bool>(
     client: &Client,
     encoded_frames: &[(u64, String)],
     dimensions: &[cost::ImageDimensions],
     prompt: &str,
     settings: &AiSettings,
+    is_cancelled: &C,
 ) -> Result<String, String> {
     let clean_model = settings.vision_model.trim_start_matches("models/").trim();
     let mut parts = vec![json!({"text": prompt})];
@@ -1544,7 +1619,7 @@ fn describe_gemini(
         }],
         "generationConfig": {"responseMimeType": "application/json"}
     });
-    let response = execute_with_retry(
+    let response = execute_with_retry_cancellable(
         "Gemini vision",
         &settings.vision_model,
         settings.usage_recorder.as_ref(),
@@ -1555,6 +1630,7 @@ fn describe_gemini(
             cost::text_tokens_upper(prompt),
             encoded_frames.len() as u64 * 640,
         ),
+        is_cancelled,
         || {
             authorize_gemini(client.post(&url), settings)
                 .json(&payload)
@@ -1571,11 +1647,12 @@ fn describe_gemini(
     response_text(&body).ok_or_else(|| "Gemini vision returned no candidate text".to_owned())
 }
 
-fn describe_local(
+fn describe_local<C: Fn() -> bool>(
     client: &Client,
     encoded_frames: &[(u64, String)],
     prompt: &str,
     settings: &AiSettings,
+    is_cancelled: &C,
 ) -> Result<String, String> {
     let payload = json!({
         "model": settings.vision_model,
@@ -1587,11 +1664,12 @@ fn describe_local(
         "format": "json",
         "stream": false
     });
-    let response = execute_with_retry(
+    let response = execute_with_retry_cancellable(
         "Local AI vision",
         &settings.vision_model,
         settings.usage_recorder.as_ref(),
         Some(0.0),
+        is_cancelled,
         || {
             client
                 .post(format!("{}/api/chat", settings.base_url))
@@ -1652,17 +1730,18 @@ fn create_embedding(
     settings: &AiSettings,
     kind: EmbeddingKind,
 ) -> Result<Vec<f32>, String> {
-    create_embeddings(client, &[text.to_owned()], settings, kind)?
+    create_embeddings(client, &[text.to_owned()], settings, kind, &never_cancelled)?
         .into_iter()
         .next()
         .ok_or_else(|| "AI embedding returned no vector".to_owned())
 }
 
-fn create_embeddings(
+fn create_embeddings<C: Fn() -> bool>(
     client: &Client,
     texts: &[String],
     settings: &AiSettings,
     kind: EmbeddingKind,
+    is_cancelled: &C,
 ) -> Result<Vec<Vec<f32>>, String> {
     if texts.is_empty() {
         return Ok(Vec::new());
@@ -1674,7 +1753,7 @@ fn create_embeddings(
                 "model": settings.embedding_model,
                 "input": texts
             });
-            let response = execute_with_retry(
+            let response = execute_with_retry_cancellable(
                 "OpenAI embedding",
                 &settings.embedding_model,
                 settings.usage_recorder.as_ref(),
@@ -1683,6 +1762,7 @@ fn create_embeddings(
                     &settings.embedding_model,
                     texts.iter().map(|text| cost::text_tokens_upper(text)).sum(),
                 ),
+                is_cancelled,
                 || {
                     client
                         .post(format!("{}/embeddings", settings.base_url))
@@ -1709,20 +1789,31 @@ fn create_embeddings(
                 })
                 .ok_or_else(|| "OpenAI embedding returned no vectors".to_owned())?
         }
-        AiProvider::Gemini => texts
-            .iter()
-            .map(|text| create_gemini_embedding(client, text, settings, kind))
-            .collect::<Result<Vec<_>, _>>()?,
+        AiProvider::Gemini => {
+            let mut embeddings = Vec::with_capacity(texts.len());
+            for text in texts {
+                ensure_analysis_not_cancelled(is_cancelled)?;
+                embeddings.push(create_gemini_embedding(
+                    client,
+                    text,
+                    settings,
+                    kind,
+                    is_cancelled,
+                )?);
+            }
+            embeddings
+        }
         AiProvider::Local => {
             let payload = json!({
                 "model": settings.embedding_model,
                 "input": texts
             });
-            let response = execute_with_retry(
+            let response = execute_with_retry_cancellable(
                 "Local AI embedding",
                 &settings.embedding_model,
                 settings.usage_recorder.as_ref(),
                 Some(0.0),
+                is_cancelled,
                 || {
                     client
                         .post(format!("{}/api/embed", settings.base_url))
@@ -1760,12 +1851,13 @@ fn create_embeddings(
     Ok(embeddings)
 }
 
-fn request_single_gemini_embedding(
+fn request_single_gemini_embedding<C: Fn() -> bool>(
     client: &Client,
     model: &str,
     text: &str,
     settings: &AiSettings,
     task_type: &str,
+    is_cancelled: &C,
 ) -> Result<Vec<f32>, (bool, String)> {
     let clean_model = model.trim_start_matches("models/").trim();
     let url = format!("{}/models/{}:embedContent", settings.base_url, clean_model);
@@ -1787,7 +1879,7 @@ fn request_single_gemini_embedding(
     } else {
         payload["taskType"] = json!(task_type);
     }
-    let response = execute_with_retry(
+    let response = execute_with_retry_cancellable(
         "Gemini embedding",
         &settings.embedding_model,
         settings.usage_recorder.as_ref(),
@@ -1796,6 +1888,7 @@ fn request_single_gemini_embedding(
             &settings.embedding_model,
             cost::text_tokens_upper(&prepared_text),
         ),
+        is_cancelled,
         || {
             authorize_gemini(client.post(&url), settings)
                 .json(&payload)
@@ -1830,18 +1923,26 @@ fn request_single_gemini_embedding(
         .ok_or_else(|| (false, "Gemini embedding returned no vector".to_owned()))
 }
 
-fn create_gemini_embedding(
+fn create_gemini_embedding<C: Fn() -> bool>(
     client: &Client,
     text: &str,
     settings: &AiSettings,
     kind: EmbeddingKind,
+    is_cancelled: &C,
 ) -> Result<Vec<f32>, String> {
     let task_type = match kind {
         EmbeddingKind::Document => "RETRIEVAL_DOCUMENT",
         EmbeddingKind::Query => "RETRIEVAL_QUERY",
     };
-    request_single_gemini_embedding(client, &settings.embedding_model, text, settings, task_type)
-        .map_err(|(_, err)| err)
+    request_single_gemini_embedding(
+        client,
+        &settings.embedding_model,
+        text,
+        settings,
+        task_type,
+        is_cancelled,
+    )
+    .map_err(|(_, err)| err)
 }
 
 fn values_to_embedding(values: &Vec<Value>) -> Vec<f32> {
@@ -2325,6 +2426,117 @@ mod tests {
         (format!("http://{address}"), requests, handle)
     }
 
+    fn spawn_cancel_on_retry_stub(
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        worker_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::mpsc::Receiver<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let (response_sent, response_sent_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("stub should accept a request");
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = read_stub_request(&mut stream);
+            write_stub_response_with_status(
+                &mut stream,
+                500,
+                "Internal Server Error",
+                br#"{"error":{"message":"temporary failure"}}"#,
+            );
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            response_sent
+                .send(())
+                .expect("test should receive cancellation signal");
+
+            listener
+                .set_nonblocking(true)
+                .expect("stub should support nonblocking accepts");
+            let started = std::time::Instant::now();
+            let mut done_since = None;
+            while started.elapsed() < Duration::from_secs(3) {
+                if worker_done.load(std::sync::atomic::Ordering::SeqCst) {
+                    done_since.get_or_insert_with(std::time::Instant::now);
+                    if done_since
+                        .as_ref()
+                        .is_some_and(|finished| finished.elapsed() >= Duration::from_millis(300))
+                    {
+                        break;
+                    }
+                }
+                match listener.accept() {
+                    Ok((mut retry_stream, _)) => {
+                        request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = read_stub_request(&mut retry_stream);
+                        write_stub_response(&mut retry_stream, &json!({}));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("stub accept failed: {error}"),
+                }
+            }
+        });
+        (
+            format!("http://{address}"),
+            requests,
+            response_sent_rx,
+            handle,
+        )
+    }
+
+    fn spawn_gemini_embedding_stop_stub(
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("stub should accept a request");
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = read_stub_request(&mut stream);
+            write_stub_response(
+                &mut stream,
+                &json!({"embedding": {"values": [0.5, 0.25, 0.125]}}),
+            );
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            listener
+                .set_nonblocking(true)
+                .expect("stub should support nonblocking accepts");
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut retry_stream, _)) => {
+                        request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = read_stub_request(&mut retry_stream);
+                        write_stub_response(
+                            &mut retry_stream,
+                            &json!({"embedding": {"values": [0.5, 0.25, 0.125]}}),
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("stub accept failed: {error}"),
+                }
+            }
+        });
+        (format!("http://{address}"), requests, handle)
+    }
+
     fn spawn_openai_stub() -> (String, std::thread::JoinHandle<()>) {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
@@ -2783,6 +2995,163 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_before_first_request_sends_no_request_or_usage_event() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        listener
+            .set_nonblocking(true)
+            .expect("stub should support nonblocking accepts");
+        let address = listener.local_addr().expect("stub should have an address");
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
+        let client = Client::builder()
+            .connect_timeout(Duration::from_millis(100))
+            .timeout(Duration::from_millis(100))
+            .build()
+            .expect("test client should build");
+        let is_cancelled = || true;
+        let result = execute_with_retry_cancellable(
+            "OpenAI vision",
+            "gpt-5.6-luna",
+            Some(&recorder),
+            Some(0.6),
+            &is_cancelled,
+            || client.get(format!("http://{address}")).send(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(error) if error == AI_ANALYSIS_CANCELLED_MESSAGE
+        ));
+        assert_eq!(recorder.drain().len(), 0);
+        assert_eq!(recorder.reserved_budget_usd(Some(1.0)), Some(0.0));
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn cancellation_after_reservation_releases_it_without_a_paid_attempt_event() {
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let sent = std::sync::atomic::AtomicUsize::new(0);
+        let is_cancelled = || checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0;
+        let result = execute_with_retry_cancellable(
+            "OpenAI vision",
+            "gpt-5.6-luna",
+            Some(&recorder),
+            Some(0.6),
+            &is_cancelled,
+            || {
+                sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                panic!("cancelled request must not be sent");
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(error) if error == AI_ANALYSIS_CANCELLED_MESSAGE
+        ));
+        assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(recorder.reserved_budget_usd(Some(1.0)), Some(0.0));
+        assert!(recorder.drain().is_empty());
+    }
+
+    #[test]
+    fn cancellation_during_retry_wait_skips_the_next_request_quickly() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (base_url, requests, response_sent, server) =
+            spawn_cancel_on_retry_stub(cancelled.clone(), worker_done.clone());
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("test client should build");
+        let worker_recorder = recorder.clone();
+        let worker_cancelled = cancelled.clone();
+        let worker_done_flag = worker_done.clone();
+        let worker = std::thread::spawn(move || {
+            let is_cancelled = || worker_cancelled.load(std::sync::atomic::Ordering::SeqCst);
+            let result = execute_with_retry_cancellable(
+                "OpenAI vision",
+                "gpt-5.6-luna",
+                Some(&worker_recorder),
+                Some(0.5),
+                &is_cancelled,
+                || client.get(&base_url).send(),
+            );
+            worker_done_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            result.map(|response| {
+                if let Some(usage_event) = response.usage_event.as_ref() {
+                    usage_event.finish();
+                }
+            })
+        });
+
+        response_sent
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stub should signal after the first response");
+        let cancellation_observed_at = std::time::Instant::now();
+        let result = worker.join().expect("retry worker should finish");
+        assert!(cancellation_observed_at.elapsed() < Duration::from_millis(500));
+        server.join().expect("retry stub should finish");
+
+        assert!(matches!(
+            result,
+            Err(error) if error == AI_ANALYSIS_CANCELLED_MESSAGE
+        ));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!((recorder.reserved_budget_usd(Some(1.0)).unwrap() - 0.5).abs() < 0.000_001);
+        let event = recorder
+            .drain()
+            .pop()
+            .expect("sent request event should be available");
+        assert_eq!(event.outcome, "retryable_http_error");
+        assert_eq!(event.usage_status, "not_reported");
+    }
+
+    #[test]
+    fn gemini_embedding_loop_stops_before_the_next_request_after_cancellation() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (base_url, requests, server) = spawn_gemini_embedding_stop_stub(cancelled.clone());
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::Gemini),
+            api_key: Some("gemini-test-key".to_owned()),
+            base_url: Some(base_url),
+            ..Default::default()
+        }))
+        .expect("Gemini settings should be valid");
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("test client should build");
+        let texts = vec![
+            "first annotation".to_owned(),
+            "second annotation".to_owned(),
+        ];
+        let is_cancelled = || cancelled.load(std::sync::atomic::Ordering::SeqCst);
+        let result = create_embeddings(
+            &client,
+            &texts,
+            &settings,
+            EmbeddingKind::Document,
+            &is_cancelled,
+        );
+        server.join().expect("Gemini embedding stub should finish");
+
+        assert!(matches!(
+            result,
+            Err(error) if error == AI_ANALYSIS_CANCELLED_MESSAGE
+        ));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn detects_non_null_api_errors_and_failed_statuses() {
         assert!(response_body_reports_error(&json!({
             "error": {"message": "quota exceeded"}
@@ -2953,6 +3322,7 @@ mod tests {
                 duration_seconds: 60.0,
             },
             &settings,
+            &never_cancelled,
         )
         .expect("transcription should parse");
         let _ = fs::remove_file(&audio_path);
