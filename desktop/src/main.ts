@@ -1729,6 +1729,18 @@ async function analyzeLibraryWithAi(): Promise<void> {
           false,
           resumeCheckpoints,
         );
+      } else if (
+        plan.analyze_file_count === 0 &&
+        plan.already_analyzed_file_count === 0 &&
+        plan.partial_file_count === 0 &&
+        plan.coverage_unknown_file_count === 0
+      ) {
+        if (libraryStatus) libraryStatus.textContent = "Saved AI work kept";
+        if (libraryPath)
+          libraryPath.textContent = "No API requests were sent and saved checkpoints were not changed.";
+        if (aiSearchStatus)
+          aiSearchStatus.textContent = "Choose Continue next time to resume the saved vision work.";
+        return;
       }
     }
 
