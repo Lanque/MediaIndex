@@ -101,7 +101,7 @@
 
 - Baseline: `aab22e1` (`docs: record MI-03 coverage safeguards`).
 - Implementation commit: `df125c0` (`fix: separate active AI coverage from latest attempts`).
-- Documentation commit: pending after final verification.
+- Documentation commit: `f6f0ef0` (`docs: record MI-03R coverage safeguards`).
 - Scope: an annotation-to-coverage pointer and migration for durable active
   results, selection that trusts only the active matching settings fingerprint,
   separate latest-attempt diagnostics in library/search/inspector responses,
