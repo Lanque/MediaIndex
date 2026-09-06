@@ -33,9 +33,13 @@ export type SearchResult = {
   match_score?: number;
   ai_annotation_count?: number;
   ai_coverage_status?: "complete" | "partial" | "failed" | "legacy" | "coverage_unknown";
+  ai_coverage_fingerprint?: string | null;
   ai_coverage_warning?: string | null;
   ai_successful_frame_count?: number | null;
   ai_planned_frame_count?: number | null;
+  ai_latest_attempt_status?: "complete" | "partial" | "failed" | "legacy" | "coverage_unknown" | null;
+  ai_latest_attempt_fingerprint?: string | null;
+  ai_latest_attempt_warning?: string | null;
   metadata: {
     duration_ms: number | null;
     container: string | null;
@@ -151,9 +155,13 @@ export type AiSearchResult = {
   labels: string[];
   available: boolean;
   ai_coverage_status?: "complete" | "partial" | "failed" | "legacy" | "coverage_unknown";
+  ai_coverage_fingerprint?: string | null;
   ai_coverage_warning?: string | null;
   ai_successful_frame_count?: number | null;
   ai_planned_frame_count?: number | null;
+  ai_latest_attempt_status?: "complete" | "partial" | "failed" | "legacy" | "coverage_unknown" | null;
+  ai_latest_attempt_fingerprint?: string | null;
+  ai_latest_attempt_warning?: string | null;
 };
 
 export type SavedAiMoment = {
@@ -164,7 +172,11 @@ export type SavedAiMoment = {
   confidence: number | null;
   model: string;
   ai_coverage_status?: "complete" | "partial" | "failed" | "legacy" | "coverage_unknown";
+  ai_coverage_fingerprint?: string | null;
   ai_coverage_warning?: string | null;
+  ai_latest_attempt_status?: "complete" | "partial" | "failed" | "legacy" | "coverage_unknown" | null;
+  ai_latest_attempt_fingerprint?: string | null;
+  ai_latest_attempt_warning?: string | null;
 };
 
 export type ModelPreset = {

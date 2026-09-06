@@ -588,15 +588,13 @@ where
         let transcript_segments = match transcription {
             Ok(segments) => segments,
             Err(error) => {
-                return Ok(failed_file_analysis_result(
+                return transcription_failure_result(
+                    error,
+                    path,
                     frames.len(),
                     analyses.len(),
                     frame_errors,
-                    format!(
-                        "speech transcription failed for {}: {error}",
-                        path.display()
-                    ),
-                ));
+                );
             }
         };
         ensure_analysis_not_cancelled(&is_cancelled)?;
@@ -770,6 +768,27 @@ fn failed_file_analysis_result(
         status: AiFileAnalysisStatus::Failed,
         warning: Some(warning),
     }
+}
+
+fn transcription_failure_result(
+    error: String,
+    path: &Path,
+    planned_frame_count: usize,
+    successful_frame_count: usize,
+    failed_batches: Vec<AiFrameBatchFailure>,
+) -> Result<AiFileAnalysisResult, String> {
+    if error == AI_ANALYSIS_CANCELLED_MESSAGE {
+        return Err(error);
+    }
+    Ok(failed_file_analysis_result(
+        planned_frame_count,
+        successful_frame_count,
+        failed_batches,
+        format!(
+            "speech transcription failed for {}: {error}",
+            path.display()
+        ),
+    ))
 }
 
 fn partial_coverage_warning(
@@ -2679,6 +2698,64 @@ mod tests {
         )
     }
 
+    fn spawn_cancel_on_retry_multipart_stub(
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        worker_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::mpsc::Receiver<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        let address = listener.local_addr().expect("stub should have an address");
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let (response_sent, response_sent_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("stub should accept a request");
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = read_raw_stub_request(&mut stream);
+            write_stub_response_with_status(
+                &mut stream,
+                500,
+                "Internal Server Error",
+                br#"{"error":{"message":"temporary failure"}}"#,
+            );
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            response_sent
+                .send(())
+                .expect("test should receive cancellation signal");
+
+            listener
+                .set_nonblocking(true)
+                .expect("stub should support nonblocking accepts");
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_secs(3)
+                && !worker_done.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                match listener.accept() {
+                    Ok((mut retry_stream, _)) => {
+                        request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = read_raw_stub_request(&mut retry_stream);
+                        write_stub_response(&mut retry_stream, &json!({}));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("stub accept failed: {error}"),
+                }
+            }
+        });
+        (
+            format!("http://{address}"),
+            requests,
+            response_sent_rx,
+            handle,
+        )
+    }
+
     fn spawn_gemini_embedding_stop_stub(
         cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> (
@@ -3521,6 +3598,64 @@ mod tests {
             settings.model_namespace(),
             "openai:gpt-5.6-luna:text-embedding-3-small:speech-whisper-1"
         );
+    }
+
+    #[test]
+    fn speech_retry_cancellation_returns_cancelled_and_keeps_sent_usage() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (base_url, requests, response_sent, server) =
+            spawn_cancel_on_retry_multipart_stub(cancelled.clone(), worker_done.clone());
+        let audio_path = std::env::temp_dir().join(format!(
+            "mediaindex-cancel-transcription-{}.mp3",
+            std::process::id()
+        ));
+        fs::write(&audio_path, b"fake mp3 bytes").expect("fixture audio should write");
+        let recorder = AiUsageRecorder::new("run-cancel", "openai", "known", "2026-09-05");
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::OpenAI),
+            api_key: Some("openai-test-key".to_owned()),
+            base_url: Some(base_url),
+            transcribe_audio: Some(true),
+            ..Default::default()
+        }))
+        .expect("OpenAI settings should be valid")
+        .with_usage_recorder(recorder.clone());
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("test client should build");
+
+        let result = transcribe_openai_audio(
+            &client,
+            &ExtractedAudio {
+                path: audio_path.clone(),
+                duration_seconds: 12.0,
+            },
+            &settings,
+            &|| cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        response_sent
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stub should observe the first request before cancellation");
+        worker_done.store(true, std::sync::atomic::Ordering::SeqCst);
+        server.join().expect("stub should finish cleanly");
+        let _ = fs::remove_file(&audio_path);
+
+        let error = result.expect_err("cancellation should stop the speech retry");
+        assert_eq!(error, AI_ANALYSIS_CANCELLED_MESSAGE);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            transcription_failure_result(error, Path::new("cancelled-video.mp4"), 4, 4, Vec::new(),),
+            Err(AI_ANALYSIS_CANCELLED_MESSAGE.to_owned())
+        );
+        let event = recorder
+            .drain()
+            .pop()
+            .expect("sent speech request usage should be retained");
+        assert_eq!(event.operation, "OpenAI speech transcription");
+        assert_eq!(event.outcome, "retryable_http_error");
+        assert_eq!(event.status_code, Some(500));
     }
 
     #[test]
