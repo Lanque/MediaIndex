@@ -47,6 +47,7 @@ app.innerHTML = `
           <span class="topbar-logo-icon">M</span>
           <span class="topbar-product">MediaIndex</span>
           <span class="desktop-product-mark">Windows desktop</span>
+          <span class="build-marker" id="build-marker" title="Build marker">Build marker…</span>
         </div>
         <div class="topbar-breadcrumb" id="topbar-breadcrumb">
           <span class="topbar-breadcrumb-sep">/</span>
@@ -88,6 +89,39 @@ app.innerHTML = `
             >
               <span id="analysis-progress-fill"></span>
             </div>
+          </div>
+          <div class="ai-estimate-panel" id="ai-estimate-panel" hidden aria-live="polite">
+            <div class="ai-estimate-heading">
+              <strong>AI cost preview</strong>
+              <span id="ai-estimate-state">Waiting for scan</span>
+            </div>
+            <dl class="ai-estimate-grid">
+              <div>
+                <dt>Analyze</dt>
+                <dd id="ai-estimate-files">—</dd>
+              </div>
+              <div>
+                <dt>Vision</dt>
+                <dd id="ai-estimate-vision">—</dd>
+              </div>
+              <div>
+                <dt>Audio</dt>
+                <dd id="ai-estimate-audio">—</dd>
+              </div>
+              <div>
+                <dt>Price</dt>
+                <dd id="ai-estimate-price">—</dd>
+              </div>
+              <div>
+                <dt>Model</dt>
+                <dd id="ai-estimate-model">—</dd>
+              </div>
+              <div>
+                <dt>Budget</dt>
+                <dd id="ai-estimate-budget">—</dd>
+              </div>
+            </dl>
+            <p class="ai-estimate-note" id="ai-estimate-note">Scan only · no AI credits used.</p>
           </div>
         </div>
 
@@ -372,6 +406,16 @@ const analysisProgressLabel = document.querySelector<HTMLElement>("#analysis-pro
 const analysisProgressPercent = document.querySelector<HTMLElement>("#analysis-progress-percent");
 const analysisProgressTrack = document.querySelector<HTMLElement>("#analysis-progress-track");
 const analysisProgressFill = document.querySelector<HTMLElement>("#analysis-progress-fill");
+const buildMarker = document.querySelector<HTMLElement>("#build-marker");
+const aiEstimatePanel = document.querySelector<HTMLElement>("#ai-estimate-panel");
+const aiEstimateState = document.querySelector<HTMLElement>("#ai-estimate-state");
+const aiEstimateFiles = document.querySelector<HTMLElement>("#ai-estimate-files");
+const aiEstimateVision = document.querySelector<HTMLElement>("#ai-estimate-vision");
+const aiEstimateAudio = document.querySelector<HTMLElement>("#ai-estimate-audio");
+const aiEstimatePrice = document.querySelector<HTMLElement>("#ai-estimate-price");
+const aiEstimateModel = document.querySelector<HTMLElement>("#ai-estimate-model");
+const aiEstimateBudget = document.querySelector<HTMLElement>("#ai-estimate-budget");
+const aiEstimateNote = document.querySelector<HTMLElement>("#ai-estimate-note");
 const aiSearchStatus = document.querySelector<HTMLElement>("#ai-search-status");
 const clipCount = document.querySelector<HTMLElement>("#clip-count");
 const panelTitle = document.querySelector<HTMLElement>("#panel-title");
@@ -396,6 +440,8 @@ let selectedLibraryPath = "";
 let pendingPreviewTimestamp = 0;
 let previewGeneration = 0;
 let analysisGeneration = 0;
+let aiEstimateGeneration = 0;
+let aiEstimateTimer: number | null = null;
 let lastAiProgressPercent = 0;
 let thumbnailGeneration = 0;
 let aiAnalysisRunning = false;
@@ -528,6 +574,186 @@ function analysisBudgetBlockReason(plan: AiAnalysisPlan): string | null {
     return "The configured budget cannot be enforced because at least one selected model has unknown pricing. Choose a checked model or clear the budget limit.";
   }
   return null;
+}
+
+function formatEstimateAudio(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "none";
+  const minutes = seconds / 60;
+  return minutes < 1 ? `${Math.round(seconds)}s` : `${minutes.toFixed(minutes >= 10 ? 0 : 1)} min`;
+}
+
+function estimateUnknownReason(cost: AiAnalysisPlan["estimated_cost"]): string {
+  const reasons = cost.assumptions.filter((assumption) =>
+    assumption.toLowerCase().includes("no checked price"),
+  );
+  return reasons.length
+    ? reasons.join(" ")
+    : "A checked provider price is unavailable; the estimate cannot be reduced to a safe USD amount.";
+}
+
+function aiEstimateSignature(config: AiConfig): string {
+  const { apiKey: _apiKey, authMode: _authMode, ffmpegPath: _ffmpegPath, ...costInputs } = config;
+  return JSON.stringify(costInputs);
+}
+
+function isCurrentAiEstimate(path: string, config: AiConfig, generation: number): boolean {
+  return generation === aiEstimateGeneration &&
+    selectedLibraryPath === path &&
+    aiEstimateSignature(config) === aiEstimateSignature(readAiConfig());
+}
+
+function invalidateAiEstimate(): number {
+  aiEstimateGeneration += 1;
+  if (aiEstimateTimer !== null) {
+    window.clearTimeout(aiEstimateTimer);
+    aiEstimateTimer = null;
+  }
+  return aiEstimateGeneration;
+}
+
+function setAiEstimateField(element: HTMLElement | null, value: string): void {
+  if (element) element.textContent = value;
+}
+
+function renderAiEstimateLoading(message = "Updating locally…"): void {
+  if (aiEstimatePanel) {
+    aiEstimatePanel.hidden = false;
+    aiEstimatePanel.classList.remove("is-error");
+  }
+  setAiEstimateField(aiEstimateState, "Updating");
+  setAiEstimateField(aiEstimateFiles, "—");
+  setAiEstimateField(aiEstimateVision, "—");
+  setAiEstimateField(aiEstimateAudio, "—");
+  setAiEstimateField(aiEstimatePrice, "—");
+  setAiEstimateField(aiEstimateModel, "—");
+  setAiEstimateField(aiEstimateBudget, "—");
+  setAiEstimateField(aiEstimateNote, `Scan only · no AI credits used. ${message}`);
+}
+
+function renderAiEstimateError(error: unknown): void {
+  const message = conciseMessage(error);
+  const scanRequired = /fresh scan|unverified|legacy|unknown identity/i.test(message);
+  if (aiEstimatePanel) {
+    aiEstimatePanel.hidden = false;
+    aiEstimatePanel.classList.toggle("is-error", true);
+  }
+  setAiEstimateField(aiEstimateState, scanRequired ? "Scan required" : "Unavailable");
+  setAiEstimateField(aiEstimateFiles, "—");
+  setAiEstimateField(aiEstimateVision, "—");
+  setAiEstimateField(aiEstimateAudio, "—");
+  setAiEstimateField(aiEstimatePrice, "unknown");
+  setAiEstimateField(aiEstimateModel, "—");
+  setAiEstimateField(aiEstimateBudget, "—");
+  setAiEstimateField(
+    aiEstimateNote,
+    `Scan only · no AI credits used. ${scanRequired ? "Run a fresh folder scan before paid analysis. " : ""}${message}`,
+  );
+}
+
+function renderAiEstimate(
+  plan: AiAnalysisPlan,
+  config: AiConfig,
+  resumeCheckpoints: boolean,
+): void {
+  const cost = plan.estimated_cost;
+  const savedFrames = resumeCheckpoints
+    ? plan.reused_vision_frame_count
+    : plan.available_vision_frame_count;
+  const savedRequests = resumeCheckpoints
+    ? plan.reused_vision_request_count
+    : plan.available_vision_request_count;
+  const savedLabel = resumeCheckpoints ? "reused" : "saved";
+  const fileLabel = plan.skipped_file_count
+    ? `${plan.analyze_file_count} unique · ${plan.skipped_file_count} ready`
+    : `${plan.analyze_file_count} unique`;
+  const visionLabel = `${plan.remaining_vision_frame_count} new frames · ${plan.remaining_vision_request_count} requests · ` +
+    `${savedFrames} ${savedLabel} frames / ${savedRequests} ${savedLabel} requests`;
+  const modelLabel = `${aiProviderLabel(config.provider)} · ${config.visionModel} + ${config.embeddingModel}` +
+    (config.transcribeAudio ? ` · ${config.transcriptionModel}` : "");
+  const priceLabel = cost.pricing_status === "local"
+    ? "no provider fee"
+    : cost.pricing_status === "known" &&
+        cost.estimated_low_usd !== null &&
+        cost.estimated_likely_usd !== null &&
+        cost.estimated_high_usd !== null
+      ? `${formatEstimatedUsd(cost.estimated_low_usd)}–${formatEstimatedUsd(cost.estimated_high_usd)} · likely ${formatEstimatedUsd(cost.estimated_likely_usd)}`
+      : "unknown";
+  const budgetLabel = cost.budget_limit_usd === null
+    ? "no limit"
+    : cost.budget_status === "within_limit"
+      ? `${formatEstimatedUsd(cost.budget_limit_usd)} · within estimate`
+      : cost.budget_status === "exceeds_limit"
+        ? `${formatEstimatedUsd(cost.budget_limit_usd)} · estimate exceeds limit`
+        : `${formatEstimatedUsd(cost.budget_limit_usd)} · cannot enforce until pricing is known`;
+  let note = "Scan only · no AI credits used.";
+  if (cost.pricing_status === "unknown") {
+    note += ` ${estimateUnknownReason(cost)}`;
+  } else if (savedFrames > 0 && !resumeCheckpoints) {
+    note += " Saved vision work is available; choose Continue at analysis time to reuse it. The price above is the fresh/full scope.";
+  } else if (resumeCheckpoints && savedFrames > 0) {
+    note += " Continuation scope: saved vision work is excluded from the new vision estimate; embeddings and configured audio are still included.";
+  } else if (plan.analyze_file_count === 0 && plan.skipped_file_count > 0) {
+    note += " Every selected clip is already ready for this model/settings combination.";
+  }
+  if (plan.requires_explicit_coverage_confirmation) {
+    note += " Some partial or legacy coverage needs an explicit full reanalysis choice.";
+  }
+  if (aiEstimatePanel) {
+    aiEstimatePanel.hidden = false;
+    aiEstimatePanel.classList.toggle("is-error", false);
+  }
+  setAiEstimateField(aiEstimateState, cost.pricing_status === "unknown" ? "Price unknown" : "Ready");
+  setAiEstimateField(aiEstimateFiles, fileLabel);
+  setAiEstimateField(aiEstimateVision, visionLabel);
+  setAiEstimateField(aiEstimateAudio, formatEstimateAudio(plan.estimated_audio_seconds));
+  setAiEstimateField(aiEstimatePrice, priceLabel);
+  setAiEstimateField(aiEstimateModel, modelLabel);
+  setAiEstimateField(aiEstimateBudget, budgetLabel);
+  setAiEstimateField(aiEstimateNote, note);
+}
+
+async function loadAiEstimate(
+  path: string,
+  config: AiConfig,
+  resumeCheckpoints: boolean,
+  generation: number,
+): Promise<void> {
+  if (!("__TAURI_INTERNALS__" in window)) {
+    if (generation === aiEstimateGeneration && selectedLibraryPath === path) {
+      renderAiEstimateError("The local estimate is available in the desktop build.");
+    }
+    return;
+  }
+  try {
+    const plan = await tauriApi.planAiAnalysis(
+      path,
+      config,
+      config.reanalyzeExisting && !resumeCheckpoints,
+      resumeCheckpoints,
+    );
+    if (!isCurrentAiEstimate(path, config, generation)) return;
+    renderAiEstimate(plan, config, resumeCheckpoints);
+  } catch (error) {
+    if (!isCurrentAiEstimate(path, config, generation)) return;
+    renderAiEstimateError(error);
+  }
+}
+
+function scheduleAiEstimate(immediate = false, resumeCheckpoints = false): void {
+  const generation = invalidateAiEstimate();
+  const path = selectedLibraryPath.trim();
+  if (!path) {
+    if (aiEstimatePanel) aiEstimatePanel.hidden = true;
+    return;
+  }
+  const config = readAiConfig();
+  renderAiEstimateLoading();
+  const run = () => {
+    aiEstimateTimer = null;
+    void loadAiEstimate(path, config, resumeCheckpoints, generation);
+  };
+  if (immediate) run();
+  else aiEstimateTimer = window.setTimeout(run, 250);
 }
 
 function cleanApiKey(raw: string): string {
@@ -776,6 +1002,7 @@ function selectModelPreset(presetId: string): void {
   updateAiProviderFields();
   saveAiConfig();
   updateActiveModelCard();
+  scheduleAiEstimate();
   closeModelHub();
   if (aiConfigStatus) {
     aiConfigStatus.textContent = `Selected model: ${preset.name} (${aiProviderLabel(preset.provider)}). ${preset.pricing}`;
@@ -811,6 +1038,27 @@ function applyAiConfig(config: AiConfig): void {
   if (aiReanalyzeExisting) aiReanalyzeExisting.checked = config.reanalyzeExisting;
   updateAiProviderFields();
   updateActiveModelCard();
+}
+
+function formatBuildTime(unixSeconds: number): string {
+  if (!Number.isFinite(unixSeconds) || unixSeconds <= 0) return "time unknown";
+  return new Date(unixSeconds * 1_000).toLocaleString();
+}
+
+async function loadBuildInfo(): Promise<void> {
+  if (!("__TAURI_INTERNALS__" in window)) {
+    setAiEstimateField(buildMarker, "Development preview");
+    return;
+  }
+  try {
+    const info = await tauriApi.getBuildInfo();
+    const built = formatBuildTime(info.build_time_unix);
+    const label = `Build ${info.git_sha} · ${built}`;
+    setAiEstimateField(buildMarker, label);
+    if (buildMarker) buildMarker.title = `Git ${info.git_sha} · built ${built}`;
+  } catch {
+    setAiEstimateField(buildMarker, "Build marker unavailable");
+  }
 }
 
 function updateAiProviderFields(): void {
@@ -958,6 +1206,7 @@ function saveAiConfig(): AiConfig {
 }
 
 loadAiConfig();
+void loadBuildInfo();
 
 async function restoreGeminiOAuthStatus(): Promise<void> {
   if (!("__TAURI_INTERNALS__" in window)) return;
@@ -984,6 +1233,7 @@ async function restoreSelectedLibrary(): Promise<void> {
     if (analyzeAiButton) analyzeAiButton.disabled = false;
     if (libraryStatus) libraryStatus.textContent = "Restoring saved library…";
     if (libraryPath) libraryPath.textContent = savedPath;
+    scheduleAiEstimate(true);
     void searchLibrary();
   } catch (error) {
     if (libraryStatus) libraryStatus.textContent = "Could not restore saved library";
@@ -1702,6 +1952,8 @@ async function analyzeLibraryWithAi(): Promise<void> {
   analyzeAiButton.textContent = "Checking cost…";
   if (selectFolderButton) selectFolderButton.disabled = true;
   const config = saveAiConfig();
+  const estimateGeneration = aiEstimateGeneration;
+  const estimatePath = selectedLibraryPath;
   let analysisStarted = false;
   let forceReanalysis = config.reanalyzeExisting;
   let resumeCheckpoints = false;
@@ -1713,6 +1965,9 @@ async function analyzeLibraryWithAi(): Promise<void> {
       forceReanalysis,
       resumeCheckpoints,
     );
+    if (isCurrentAiEstimate(estimatePath, config, estimateGeneration)) {
+      renderAiEstimate(plan, config, resumeCheckpoints);
+    }
 
     if (!forceReanalysis && plan.resumable_checkpoint_file_count > 0) {
       const continueSavedWork = window.confirm(
@@ -1729,6 +1984,9 @@ async function analyzeLibraryWithAi(): Promise<void> {
           false,
           resumeCheckpoints,
         );
+        if (isCurrentAiEstimate(estimatePath, config, estimateGeneration)) {
+          renderAiEstimate(plan, config, resumeCheckpoints);
+        }
       } else if (
         plan.analyze_file_count === 0 &&
         plan.already_analyzed_file_count === 0 &&
@@ -1767,6 +2025,9 @@ async function analyzeLibraryWithAi(): Promise<void> {
         forceReanalysis = true;
         resumeCheckpoints = false;
         plan = await tauriApi.planAiAnalysis(selectedLibraryPath, config, true, false);
+        if (isCurrentAiEstimate(estimatePath, config, estimateGeneration)) {
+          renderAiEstimate(plan, config, false);
+        }
         coverageReviewCount = plan.partial_file_count + plan.coverage_unknown_file_count;
       }
     }
@@ -1912,6 +2173,7 @@ async function analyzeLibraryWithAi(): Promise<void> {
     analyzeAiButton.classList.remove("is-stop");
     analyzeAiButton.setAttribute("aria-pressed", "false");
     if (selectFolderButton) selectFolderButton.disabled = false;
+    if (selectedLibraryPath) scheduleAiEstimate(true);
   }
 }
 
@@ -2012,13 +2274,32 @@ aiProvider?.addEventListener("change", () => {
   if (aiBaseUrl) aiBaseUrl.value = defaults.baseUrl;
   updateAiProviderFields();
   saveAiConfig();
+  scheduleAiEstimate();
 });
 
-aiVisionModel?.addEventListener("input", updateActiveModelCard);
+aiVisionModel?.addEventListener("input", () => {
+  updateActiveModelCard();
+  scheduleAiEstimate();
+});
+
+for (const field of [
+  aiEmbeddingModel,
+  aiContextHint,
+  aiSampleSeconds,
+  aiMaxFrames,
+  aiTranscriptionModel,
+  aiBudgetUsd,
+]) {
+  field?.addEventListener("input", () => scheduleAiEstimate());
+}
+for (const field of [aiTranscribeAudio, aiReanalyzeExisting]) {
+  field?.addEventListener("change", () => scheduleAiEstimate());
+}
 
 aiSettingsForm?.addEventListener("submit", (event) => {
   event.preventDefault();
   saveAiConfig();
+  scheduleAiEstimate(true);
 });
 
 testAiConnectionButton?.addEventListener("click", () => {
@@ -2064,6 +2345,7 @@ loginGeminiOauthButton?.addEventListener("click", async () => {
     if (aiApiKey) aiApiKey.value = "";
     saveAiConfig();
     updateAiProviderFields();
+    scheduleAiEstimate();
     if (aiConfigStatus) {
       aiConfigStatus.textContent = `Signed in with Google for Cloud project ${geminiOAuthStatus.project_id ?? "unknown"}. Press Test Connection to verify model access.`;
     }
@@ -2082,6 +2364,7 @@ useGeminiApiKeyButton?.addEventListener("click", async () => {
   if (aiApiKey) aiApiKey.value = getSessionApiKey("gemini");
   saveAiConfig();
   updateAiProviderFields();
+  scheduleAiEstimate();
   if (aiConfigStatus) aiConfigStatus.textContent = "Gemini will use an AI Studio API key.";
 });
 
@@ -2090,6 +2373,7 @@ logoutGeminiOauthButton?.addEventListener("click", async () => {
   geminiAuthMode = "api_key";
   saveAiConfig();
   updateAiProviderFields();
+  scheduleAiEstimate();
   if (aiConfigStatus) aiConfigStatus.textContent = "Google disconnected. The in-memory access token was removed.";
 });
 
@@ -2113,6 +2397,9 @@ selectFolderButton?.addEventListener("click", async () => {
 
   libraryView = "current";
   updateLibraryViewUi();
+  selectedLibraryPath = "";
+  invalidateAiEstimate();
+  renderAiEstimateLoading("Waiting for the selected folder scan to finish…");
   selectFolderButton.disabled = true;
   if (analyzeAiButton) analyzeAiButton.disabled = true;
   if (libraryStatus) libraryStatus.textContent = "Scanning folder…";
@@ -2128,6 +2415,7 @@ selectFolderButton?.addEventListener("click", async () => {
         report.warnings.length === 0 ? "Folder indexed" : "Folder indexed with warnings";
     }
     if (clipCount) clipCount.textContent = `${report.active_file_count} clips`;
+    scheduleAiEstimate(true);
     try {
       localStorage.setItem(LIBRARY_PATH_STORAGE_KEY, selected);
     } catch (error) {
@@ -2137,6 +2425,8 @@ selectFolderButton?.addEventListener("click", async () => {
   } catch (error) {
     if (libraryStatus) libraryStatus.textContent = "Scan failed";
     if (libraryPath) libraryPath.textContent = conciseMessage(error);
+    invalidateAiEstimate();
+    if (aiEstimatePanel) aiEstimatePanel.hidden = true;
   } finally {
     selectFolderButton.disabled = false;
     if (analyzeAiButton) analyzeAiButton.disabled = aiAnalysisRunning || !selectedLibraryPath;

@@ -6,12 +6,17 @@ import type {
   AiIndexReport,
   AiSearchFocus,
   AiSearchResult,
+  BuildInfo,
   GeminiOAuthStatus,
   IndexReport,
   SearchFilters,
   SearchResult,
   SavedAiMoment,
 } from "../types";
+
+export async function getBuildInfo(): Promise<BuildInfo> {
+  return invoke<BuildInfo>("get_build_info");
+}
 
 export async function indexMediaFolder(path: string): Promise<IndexReport> {
   return invoke<IndexReport>("index_media_folder", { path });

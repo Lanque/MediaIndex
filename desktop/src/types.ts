@@ -4,6 +4,11 @@ export type IndexReport = {
   warnings: Array<{ path: string; message: string }>;
 };
 
+export type BuildInfo = {
+  git_sha: string;
+  build_time_unix: number;
+};
+
 export type SearchFilters = {
   keyword?: string;
   folder?: string;
