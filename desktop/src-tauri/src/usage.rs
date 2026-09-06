@@ -36,6 +36,7 @@ pub struct AiUsageEvent {
     pub reported_input_tokens: Option<u64>,
     pub reported_output_tokens: Option<u64>,
     pub reported_audio_seconds: Option<f64>,
+    pub estimated_audio_seconds: Option<f64>,
     pub calculated_cost_usd: Option<f64>,
     pub reserved_cost_usd: Option<f64>,
     pub budget_adjustment_usd: Option<f64>,
@@ -51,14 +52,6 @@ pub struct AiUsageRecorder {
     next_event_id: Arc<AtomicU64>,
     state: Arc<Mutex<RecorderState>>,
     budget_gate: Option<AiBudgetGate>,
-    request_budget_policy: Option<AiRequestBudgetPolicy>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AiRequestBudgetPolicy {
-    pub vision_usd: Option<f64>,
-    pub embedding_usd: Option<f64>,
-    pub transcription_usd: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -174,17 +167,11 @@ impl AiUsageRecorder {
             next_event_id: Arc::new(AtomicU64::new(1)),
             state: Arc::new(Mutex::new(RecorderState::default())),
             budget_gate: None,
-            request_budget_policy: None,
         }
     }
 
     pub fn with_budget_gate(mut self, budget_gate: AiBudgetGate) -> Self {
         self.budget_gate = Some(budget_gate);
-        self
-    }
-
-    pub fn with_request_budget_policy(mut self, policy: AiRequestBudgetPolicy) -> Self {
-        self.request_budget_policy = Some(policy);
         self
     }
 
@@ -210,6 +197,7 @@ impl AiUsageRecorder {
             reported_input_tokens: None,
             reported_output_tokens: None,
             reported_audio_seconds: None,
+            estimated_audio_seconds: None,
             calculated_cost_usd: None,
             reserved_cost_usd: None,
             budget_adjustment_usd: None,
@@ -263,11 +251,12 @@ impl AiUsageRecorder {
         operation: &str,
         model: &str,
         attempt: u32,
+        reserve_usd: Option<f64>,
     ) -> Option<AiUsageEventHandle> {
         let local_event_id = self.new_local_event_id();
         let (budget_gate, reserved_micros, reserved_cost_usd) =
             if let Some(budget_gate) = self.budget_gate.as_ref() {
-                let reserve_usd = self.request_reserve_usd(operation)?;
+                let reserve_usd = reserve_usd?;
                 let reserved_micros = budget_gate.try_reserve(&local_event_id, reserve_usd)?;
                 (
                     Some(budget_gate.clone()),
@@ -286,19 +275,6 @@ impl AiUsageRecorder {
             reserved_micros,
             reserved_cost_usd,
         ))
-    }
-
-    fn request_reserve_usd(&self, operation: &str) -> Option<f64> {
-        let policy = self.request_budget_policy?;
-        if operation.ends_with("vision") {
-            policy.vision_usd
-        } else if operation.ends_with("embedding") {
-            policy.embedding_usd
-        } else if operation.contains("speech transcription") {
-            policy.transcription_usd
-        } else {
-            None
-        }
     }
 
     fn begin_request_with_reservation(
@@ -327,6 +303,7 @@ impl AiUsageRecorder {
             reported_input_tokens: None,
             reported_output_tokens: None,
             reported_audio_seconds: None,
+            estimated_audio_seconds: None,
             calculated_cost_usd: None,
             reserved_cost_usd,
             budget_adjustment_usd: None,
@@ -370,6 +347,7 @@ impl AiUsageRecorder {
                 input_tokens,
                 output_tokens,
                 audio_seconds,
+                None,
             );
         }
     }
@@ -414,6 +392,7 @@ impl AiUsageEventHandle {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         audio_seconds: Option<f64>,
+        estimated_audio_seconds: Option<f64>,
     ) {
         if let Ok(mut state) = self.state.lock() {
             if let Some(event) = state.pending.get_mut(&self.local_event_id) {
@@ -423,6 +402,7 @@ impl AiUsageEventHandle {
                     input_tokens,
                     output_tokens,
                     audio_seconds,
+                    estimated_audio_seconds,
                 );
                 if let (Some(budget_gate), Some(_reserved_micros), Some(actual_cost_usd)) = (
                     self.budget_gate.as_ref(),
@@ -460,20 +440,26 @@ fn update_reported_usage(
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     audio_seconds: Option<f64>,
+    estimated_audio_seconds: Option<f64>,
 ) -> Option<f64> {
     event.reported_input_tokens = input_tokens;
     event.reported_output_tokens = output_tokens;
     event.reported_audio_seconds = audio_seconds;
+    event.estimated_audio_seconds = estimated_audio_seconds;
+    let effective_audio_seconds = audio_seconds.or(estimated_audio_seconds);
     let calculated_cost_usd = reported_cost(
         provider,
         &event.operation,
         &event.model,
         input_tokens,
         output_tokens,
+        effective_audio_seconds,
     );
     event.calculated_cost_usd = calculated_cost_usd;
     if input_tokens.is_some() || output_tokens.is_some() || audio_seconds.is_some() {
         event.usage_status = "reported".to_owned();
+    } else if estimated_audio_seconds.is_some() {
+        event.usage_status = "estimated".to_owned();
     }
     calculated_cost_usd
 }
@@ -495,6 +481,7 @@ fn reported_cost(
     model: &str,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    audio_seconds: Option<f64>,
 ) -> Option<f64> {
     let input_tokens = input_tokens.unwrap_or_default();
     let output_tokens = output_tokens.unwrap_or_default();
@@ -511,6 +498,10 @@ fn reported_cost(
         "OpenAI embedding" | "Gemini embedding" => {
             Some(input_tokens as f64 * pricing::embedding_pricing(provider, model)? / 1_000_000.0)
         }
+        "OpenAI speech transcription" => Some(
+            audio_seconds.unwrap_or_default() / 60.0
+                * pricing::transcription_pricing(provider, model)?,
+        ),
         _ => None,
     }
 }
@@ -571,21 +562,38 @@ mod tests {
     #[test]
     fn reported_usage_releases_the_unused_request_reserve() {
         let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
-            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"))
-            .with_request_budget_policy(AiRequestBudgetPolicy {
-                vision_usd: None,
-                embedding_usd: Some(0.6),
-                transcription_usd: None,
-            });
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
         let handle = recorder
-            .begin_reserved_request("OpenAI embedding", "text-embedding-3-small", 1)
+            .begin_reserved_request("OpenAI embedding", "text-embedding-3-small", 1, Some(0.6))
             .expect("request should reserve its type-specific amount");
 
-        handle.record_reported_usage(recorder.provider_name(), Some(1_000), None, None);
+        handle.record_reported_usage(recorder.provider_name(), Some(1_000), None, None, None);
 
         assert!(recorder.reserved_budget_usd(Some(1.0)).unwrap() < 0.6);
         assert!(handle.reserved_micros.is_some_and(|reserved| reserved > 0));
         handle.finish();
+    }
+
+    #[test]
+    fn local_audio_duration_is_kept_as_an_estimate_for_budgeting() {
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
+        let handle = recorder
+            .begin_reserved_request("OpenAI speech transcription", "whisper-1", 1, Some(0.006))
+            .expect("speech request should reserve its measured duration");
+
+        handle.record_reported_usage(recorder.provider_name(), None, None, None, Some(60.0));
+        handle.finish();
+
+        let event = recorder
+            .drain()
+            .pop()
+            .expect("speech event should be drainable");
+        assert_eq!(event.usage_status, "estimated");
+        assert_eq!(event.reported_audio_seconds, None);
+        assert_eq!(event.estimated_audio_seconds, Some(60.0));
+        assert!(event.calculated_cost_usd.is_some_and(|cost| cost > 0.0));
+        assert!((recorder.reserved_budget_usd(Some(1.0)).unwrap() - 0.006).abs() < 0.000_001);
     }
 
     #[test]
@@ -599,7 +607,7 @@ mod tests {
             Some("req_test".to_owned()),
         );
         assert!(recorder.drain().is_empty());
-        handle.record_reported_usage(recorder.provider_name(), Some(1_000), None, None);
+        handle.record_reported_usage(recorder.provider_name(), Some(1_000), None, None, None);
         handle.finish();
 
         let event = recorder
@@ -626,7 +634,7 @@ mod tests {
         let drained_before_body_parse = recorder.drain();
         assert!(drained_before_body_parse.is_empty());
 
-        handle.record_reported_usage(recorder.provider_name(), Some(1_000), None, None);
+        handle.record_reported_usage(recorder.provider_name(), Some(1_000), None, None, None);
         handle.finish();
 
         let event = recorder

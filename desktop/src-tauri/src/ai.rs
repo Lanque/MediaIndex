@@ -491,13 +491,13 @@ where
             phase: "Extracting speech audio",
         });
         ensure_analysis_not_cancelled(&is_cancelled)?;
-        let audio_path = extract_audio_track(path, settings)?;
+        let extracted_audio = extract_audio_track(path, settings)?;
         progress(AiFileProgress {
             percent: 78,
             phase: "Transcribing speech",
         });
-        let transcription = transcribe_openai_audio(&client, &audio_path, settings);
-        let _ = fs::remove_file(&audio_path);
+        let transcription = transcribe_openai_audio(&client, &extracted_audio, settings);
+        let _ = fs::remove_file(&extracted_audio.path);
         let transcript_segments = transcription?;
         ensure_analysis_not_cancelled(&is_cancelled)?;
         attach_transcript_segments(&mut analyses, &transcript_segments);
@@ -618,7 +618,12 @@ struct TimestampedTranscript {
     segments: Vec<TranscriptSegment>,
 }
 
-fn extract_audio_track(path: &Path, settings: &AiSettings) -> Result<PathBuf, String> {
+struct ExtractedAudio {
+    path: PathBuf,
+    duration_seconds: f64,
+}
+
+fn extract_audio_track(path: &Path, settings: &AiSettings) -> Result<ExtractedAudio, String> {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_nanos())
@@ -677,21 +682,98 @@ fn extract_audio_track(path: &Path, settings: &AiSettings) -> Result<PathBuf, St
             path.display()
         ));
     }
-    Ok(output_path)
+    let duration_seconds = match measure_audio_duration(&output_path, &settings.ffmpeg_executable) {
+        Ok(duration_seconds) => duration_seconds,
+        Err(error) => {
+            let _ = fs::remove_file(&output_path);
+            return Err(error);
+        }
+    };
+    Ok(ExtractedAudio {
+        path: output_path,
+        duration_seconds,
+    })
+}
+
+fn measure_audio_duration(path: &Path, ffmpeg_executable: &Path) -> Result<f64, String> {
+    let ffprobe_executable = resolve_ffprobe_executable(ffmpeg_executable);
+    let mut command = Command::new(&ffprobe_executable);
+    configure_hidden_process(&mut command);
+    let output = command
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| {
+            format!(
+                "FFprobe could not be started for extracted speech audio {}: {error}",
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!(
+                "FFprobe could not measure extracted speech audio {}",
+                path.display()
+            )
+        } else {
+            format!(
+                "FFprobe could not measure extracted speech audio {}: {stderr}",
+                path.display()
+            )
+        });
+    }
+    let raw_duration = String::from_utf8_lossy(&output.stdout);
+    parse_audio_duration(&raw_duration).ok_or_else(|| {
+        format!(
+            "FFprobe returned no valid duration for extracted speech audio {}",
+            path.display()
+        )
+    })
+}
+
+fn resolve_ffprobe_executable(ffmpeg_executable: &Path) -> PathBuf {
+    let Some(file_name) = ffmpeg_executable.file_name().and_then(|name| name.to_str()) else {
+        return PathBuf::from("ffprobe");
+    };
+    let ffprobe_name = if file_name.eq_ignore_ascii_case("ffmpeg.exe") {
+        "ffprobe.exe"
+    } else if file_name.eq_ignore_ascii_case("ffmpeg") {
+        "ffprobe"
+    } else {
+        return PathBuf::from("ffprobe");
+    };
+    ffmpeg_executable
+        .parent()
+        .map(|parent| parent.join(ffprobe_name))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from(ffprobe_name))
+}
+
+fn parse_audio_duration(raw_duration: &str) -> Option<f64> {
+    let duration_seconds = raw_duration.trim().parse::<f64>().ok()?;
+    (duration_seconds.is_finite() && duration_seconds > 0.0).then_some(duration_seconds)
 }
 
 fn transcribe_openai_audio(
     client: &Client,
-    audio_path: &Path,
+    audio: &ExtractedAudio,
     settings: &AiSettings,
 ) -> Result<Vec<TranscriptSegment>, String> {
     if settings.provider != AiProvider::OpenAI {
         return Ok(Vec::new());
     }
-    let audio = fs::read(audio_path).map_err(|error| {
+    let audio_bytes = fs::read(&audio.path).map_err(|error| {
         format!(
             "cannot read extracted speech audio {}: {error}",
-            audio_path.display()
+            audio.path.display()
         )
     })?;
     let response = execute_with_retry(
@@ -701,13 +783,10 @@ fn transcribe_openai_audio(
         cost::transcription_request_cost(
             settings.provider_name(),
             &settings.transcription_model,
-            settings
-                .sample_interval_ms
-                .saturating_mul(settings.max_frames_per_file as u64)
-                .div_ceil(1_000) as f64,
+            audio.duration_seconds,
         ),
         || {
-            let part = multipart::Part::bytes(audio.clone())
+            let part = multipart::Part::bytes(audio_bytes.clone())
                 .file_name("speech.mp3")
                 .mime_str("audio/mpeg")?;
             let form = multipart::Form::new()
@@ -727,6 +806,7 @@ fn transcribe_openai_audio(
         "OpenAI speech transcription",
         &settings.transcription_model,
         settings.usage_recorder.as_ref(),
+        Some(audio.duration_seconds),
     )?;
     let transcript: TimestampedTranscript = serde_json::from_value(body).map_err(|error| {
         format!("OpenAI speech transcription returned invalid timestamps: {error}")
@@ -850,6 +930,7 @@ fn validate_vision_model(client: &Client, settings: &AiSettings) -> Result<(), S
         },
         &settings.vision_model,
         settings.usage_recorder.as_ref(),
+        None,
     )?;
     Ok(())
 }
@@ -1422,6 +1503,7 @@ fn describe_openai(
         "OpenAI vision",
         &settings.vision_model,
         settings.usage_recorder.as_ref(),
+        None,
     )?;
     response_text(&body).ok_or_else(|| "OpenAI vision returned no output text".to_owned())
 }
@@ -1484,6 +1566,7 @@ fn describe_gemini(
         "Gemini vision",
         &settings.vision_model,
         settings.usage_recorder.as_ref(),
+        None,
     )?;
     response_text(&body).ok_or_else(|| "Gemini vision returned no candidate text".to_owned())
 }
@@ -1521,6 +1604,7 @@ fn describe_local(
         "Local AI vision",
         &settings.vision_model,
         settings.usage_recorder.as_ref(),
+        None,
     )?;
     response_text(&body).ok_or_else(|| "Local AI returned no message content".to_owned())
 }
@@ -1612,6 +1696,7 @@ fn create_embeddings(
                 "OpenAI embedding",
                 &settings.embedding_model,
                 settings.usage_recorder.as_ref(),
+                None,
             )?;
             body.get("data")
                 .and_then(Value::as_array)
@@ -1650,6 +1735,7 @@ fn create_embeddings(
                 "Local AI embedding",
                 &settings.embedding_model,
                 settings.usage_recorder.as_ref(),
+                None,
             )?;
             body.get("embeddings")
                 .and_then(Value::as_array)
@@ -1723,6 +1809,7 @@ fn request_single_gemini_embedding(
         "Gemini embedding",
         &settings.embedding_model,
         settings.usage_recorder.as_ref(),
+        None,
     )
     .map_err(|err| (is_not_found, err))?;
     let embedding = body
@@ -1770,6 +1857,7 @@ fn read_json_response(
     operation: &str,
     _model: &str,
     _recorder: Option<&AiUsageRecorder>,
+    estimated_audio_seconds: Option<f64>,
 ) -> Result<Value, String> {
     let TrackedResponse {
         response,
@@ -1801,13 +1889,15 @@ fn read_json_response(
     };
     if let Some(usage_event) = usage_event.as_ref() {
         let (input_tokens, output_tokens) = reported_token_usage(&body);
+        let reported_audio_seconds = reported_audio_seconds(&body, operation);
         usage_event.record_reported_usage(
             _recorder
                 .map(|recorder| recorder.provider_name())
                 .unwrap_or_default(),
             input_tokens,
             output_tokens,
-            None,
+            reported_audio_seconds,
+            estimated_audio_seconds,
         );
         usage_event.finish();
     }
@@ -1840,6 +1930,14 @@ fn reported_token_usage(body: &Value) -> (Option<u64>, Option<u64>) {
         .or_else(|| body.pointer("/usageMetadata/candidatesTokenCount"))
         .and_then(Value::as_u64);
     (input_tokens, output_tokens)
+}
+
+fn reported_audio_seconds(body: &Value, operation: &str) -> Option<f64> {
+    operation
+        .contains("speech transcription")
+        .then(|| body.pointer("/duration").and_then(Value::as_f64))
+        .flatten()
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
 }
 
 fn api_failure_message(operation: &str, status: reqwest::StatusCode, detail: &str) -> String {
@@ -2472,6 +2570,27 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_valid_audio_duration_and_rejects_zero_or_invalid_values() {
+        assert_eq!(parse_audio_duration("60.25\n"), Some(60.25));
+        assert_eq!(parse_audio_duration("0\n"), None);
+        assert_eq!(parse_audio_duration("N/A\n"), None);
+    }
+
+    #[test]
+    fn prefers_service_reported_audio_duration_over_local_estimate() {
+        let body = json!({"duration": 42.5});
+
+        assert_eq!(
+            reported_audio_seconds(&body, "OpenAI speech transcription"),
+            Some(42.5)
+        );
+        assert_eq!(
+            reported_audio_seconds(&json!({}), "OpenAI speech transcription"),
+            None
+        );
+    }
+
+    #[test]
     fn sends_timestamped_openai_transcription_as_multipart_audio() {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
@@ -2515,8 +2634,15 @@ mod tests {
         .expect("OpenAI settings should be valid");
         let client = build_http_client().expect("HTTP client should build");
 
-        let transcript = transcribe_openai_audio(&client, &audio_path, &settings)
-            .expect("transcription should parse");
+        let transcript = transcribe_openai_audio(
+            &client,
+            &ExtractedAudio {
+                path: audio_path.clone(),
+                duration_seconds: 60.0,
+            },
+            &settings,
+        )
+        .expect("transcription should parse");
         let _ = fs::remove_file(&audio_path);
         server.join().expect("stub should finish cleanly");
 
