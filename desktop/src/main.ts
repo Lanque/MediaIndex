@@ -1839,12 +1839,15 @@ async function analyzeLibraryWithAi(): Promise<void> {
     if (!report.cancelled && report.analyzed_file_count > 0) {
       recordAnalysisTiming(config, plan, elapsedMs);
     }
+    const diagnosticsNote = report.diagnostics_path
+      ? ` Diagnostics JSON: ${report.diagnostics_path}`
+      : "";
     if (report.cancelled) {
       showAiProgress(lastAiProgressPercent, "Analysis stopped");
       if (libraryStatus)
         libraryStatus.textContent = `AI analysis stopped · ${report.analyzed_file_count} clips saved`;
       if (libraryPath)
-        libraryPath.textContent = `${report.annotation_count} new visual moments kept · unstarted clips were not charged`;
+        libraryPath.textContent = `${report.annotation_count} new visual moments kept · unstarted clips were not charged.${diagnosticsNote}`;
       if (aiSearchStatus)
         aiSearchStatus.textContent =
           "Completed clips remain searchable. Start analysis again later to continue with missing clips.";
@@ -1872,12 +1875,13 @@ async function analyzeLibraryWithAi(): Promise<void> {
       if (libraryStatus)
         libraryStatus.textContent = `AI indexed ${report.analyzed_file_count} clips${partialSuffix}${failedSuffix}${skippedSuffix}${warningSuffix}`;
       if (libraryPath) {
-        libraryPath.textContent =
+        const summary =
           report.analyzed_file_count === 0 && report.skipped_file_count > 0
             ? "Existing AI index kept · no API credits used"
             : warningDetails
               ? `${report.annotation_count} new visual moments stored locally · ${warningDetails}`
               : `${report.annotation_count} new visual moments stored locally`;
+        libraryPath.textContent = `${summary}${diagnosticsNote}`;
       }
       if (aiSearchStatus) {
         aiSearchStatus.textContent = warningDetails

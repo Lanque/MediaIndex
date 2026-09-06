@@ -3,6 +3,7 @@ use reqwest::blocking::{multipart, Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::error::Error as StdError;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -136,6 +137,8 @@ pub struct AiIndexReport {
     pub failed_file_count: u64,
     pub cancelled: bool,
     pub warnings: Vec<AiWarning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -177,6 +180,7 @@ pub struct AiSettings {
     transcription_model: String,
     budget_usd: Option<f64>,
     usage_recorder: Option<AiUsageRecorder>,
+    diagnostics: Option<crate::diagnostics::AiFileDiagnosticsHandle>,
     gemini_uses_oauth: bool,
     google_project_id: Option<String>,
 }
@@ -341,6 +345,7 @@ impl AiSettings {
             transcription_model,
             budget_usd,
             usage_recorder: None,
+            diagnostics: None,
             gemini_uses_oauth,
             google_project_id,
         })
@@ -429,6 +434,14 @@ impl AiSettings {
         self.usage_recorder = Some(recorder);
         self
     }
+
+    pub(crate) fn with_diagnostics(
+        mut self,
+        diagnostics: crate::diagnostics::AiFileDiagnosticsHandle,
+    ) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
 }
 
 fn authorize_gemini(request: RequestBuilder, settings: &AiSettings) -> RequestBuilder {
@@ -448,6 +461,68 @@ pub fn resolve_ffmpeg_executable(configured_path: Option<String>) -> PathBuf {
         .or_else(|| std::env::var_os("MEDIAINDEX_FFMPEG_PATH").map(PathBuf::from))
         .filter(|path| path.is_file())
         .unwrap_or_else(|| PathBuf::from("ffmpeg"))
+}
+
+thread_local! {
+    static CURRENT_FILE_DIAGNOSTICS: RefCell<Option<crate::diagnostics::AiFileDiagnosticsHandle>> = const {
+        RefCell::new(None)
+    };
+}
+
+struct FileDiagnosticsScope {
+    previous: Option<crate::diagnostics::AiFileDiagnosticsHandle>,
+}
+
+impl FileDiagnosticsScope {
+    fn enter(diagnostics: Option<crate::diagnostics::AiFileDiagnosticsHandle>) -> Self {
+        let previous = CURRENT_FILE_DIAGNOSTICS.with(|current| current.replace(diagnostics));
+        Self { previous }
+    }
+}
+
+impl Drop for FileDiagnosticsScope {
+    fn drop(&mut self) {
+        CURRENT_FILE_DIAGNOSTICS.with(|current| {
+            let _ = current.replace(self.previous.take());
+        });
+    }
+}
+
+fn record_current_stage(stage: &str, elapsed: Duration, outcome: crate::diagnostics::StageOutcome) {
+    CURRENT_FILE_DIAGNOSTICS.with(|current| {
+        if let Some(diagnostics) = current.borrow().as_ref() {
+            diagnostics.record_stage(stage, elapsed, outcome);
+        }
+    });
+}
+
+fn record_current_http_attempt(operation: &str, elapsed: Duration, succeeded: bool) {
+    let stage = if operation.contains("vision") {
+        "vision_http"
+    } else if operation.contains("embedding") {
+        "embedding_http"
+    } else if operation.contains("speech transcription") {
+        "transcription_http"
+    } else {
+        "other_http"
+    };
+    record_current_stage(
+        stage,
+        elapsed,
+        if succeeded {
+            crate::diagnostics::StageOutcome::Succeeded
+        } else {
+            crate::diagnostics::StageOutcome::Failed
+        },
+    );
+}
+
+fn record_current_vision_batch(reused: bool, frame_count: usize) {
+    CURRENT_FILE_DIAGNOSTICS.with(|current| {
+        if let Some(diagnostics) = current.borrow().as_ref() {
+            diagnostics.record_vision_batch(reused, frame_count);
+        }
+    });
 }
 
 pub fn analyze_file(
@@ -508,13 +583,26 @@ where
     L: FnOnce(&[u64], usize) -> Result<Vec<AiVisionCheckpointBatch>, String>,
     S: FnMut(AiVisionCheckpointBatch) -> Result<(), String>,
 {
+    let _diagnostics_scope = FileDiagnosticsScope::enter(settings.diagnostics.clone());
     ensure_analysis_not_cancelled(&is_cancelled)?;
     let client = build_http_client()?;
     progress(AiFileProgress {
         percent: 1,
         phase: "Extracting frames",
     });
-    let frames = match extract_frames(path, settings) {
+    let extraction_started = std::time::Instant::now();
+    let extraction = extract_frames(path, settings);
+    let extraction_outcome = if extraction.is_ok() {
+        crate::diagnostics::StageOutcome::Succeeded
+    } else {
+        crate::diagnostics::StageOutcome::Failed
+    };
+    record_current_stage(
+        "frame_extraction",
+        extraction_started.elapsed(),
+        extraction_outcome,
+    );
+    let frames = match extraction {
         Ok(frames) => frames,
         Err(error) => {
             return Ok(failed_file_analysis_result(
@@ -568,7 +656,18 @@ where
             phase: "Extracting speech audio",
         });
         ensure_analysis_not_cancelled(&is_cancelled)?;
-        let extracted_audio = match extract_audio_track(path, settings) {
+        let audio_started = std::time::Instant::now();
+        let extracted_audio_result = extract_audio_track(path, settings);
+        record_current_stage(
+            "audio_extraction",
+            audio_started.elapsed(),
+            if extracted_audio_result.is_ok() {
+                crate::diagnostics::StageOutcome::Succeeded
+            } else {
+                crate::diagnostics::StageOutcome::Failed
+            },
+        );
+        let extracted_audio = match extracted_audio_result {
             Ok(audio) => audio,
             Err(error) => {
                 return Ok(failed_file_analysis_result(
@@ -583,8 +682,23 @@ where
             percent: 78,
             phase: "Transcribing speech",
         });
+        let transcription_started = std::time::Instant::now();
         let transcription =
             transcribe_openai_audio(&client, &extracted_audio, settings, &is_cancelled);
+        record_current_stage(
+            "transcription",
+            transcription_started.elapsed(),
+            if transcription.is_ok() {
+                crate::diagnostics::StageOutcome::Succeeded
+            } else if transcription
+                .as_ref()
+                .is_err_and(|error| error == AI_ANALYSIS_CANCELLED_MESSAGE)
+            {
+                crate::diagnostics::StageOutcome::Cancelled
+            } else {
+                crate::diagnostics::StageOutcome::Failed
+            },
+        );
         let _ = fs::remove_file(&extracted_audio.path);
         let transcript_segments = match transcription {
             Ok(segments) => segments,
@@ -627,13 +741,29 @@ where
         phase: "Creating search index",
     });
     ensure_analysis_not_cancelled(&is_cancelled)?;
-    let embeddings = match create_embeddings(
+    let embeddings_started = std::time::Instant::now();
+    let embeddings_result = create_embeddings(
         &client,
         &embedding_texts,
         settings,
         EmbeddingKind::Document,
         &is_cancelled,
-    ) {
+    );
+    record_current_stage(
+        "embeddings",
+        embeddings_started.elapsed(),
+        if embeddings_result.is_ok() {
+            crate::diagnostics::StageOutcome::Succeeded
+        } else if embeddings_result
+            .as_ref()
+            .is_err_and(|error| error == AI_ANALYSIS_CANCELLED_MESSAGE)
+        {
+            crate::diagnostics::StageOutcome::Cancelled
+        } else {
+            crate::diagnostics::StageOutcome::Failed
+        },
+    );
+    let embeddings = match embeddings_result {
         Ok(embeddings) => embeddings,
         Err(error) if error == AI_ANALYSIS_CANCELLED_MESSAGE => return Err(error),
         Err(error) => {
@@ -895,7 +1025,18 @@ fn extract_audio_track(path: &Path, settings: &AiSettings) -> Result<ExtractedAu
             path.display()
         ));
     }
-    let duration_seconds = match measure_audio_duration(&output_path, &settings.ffmpeg_executable) {
+    let duration_probe_started = std::time::Instant::now();
+    let duration_probe = measure_audio_duration(&output_path, &settings.ffmpeg_executable);
+    record_current_stage(
+        "audio_duration_probe",
+        duration_probe_started.elapsed(),
+        if duration_probe.is_ok() {
+            crate::diagnostics::StageOutcome::Succeeded
+        } else {
+            crate::diagnostics::StageOutcome::Failed
+        },
+    );
+    let duration_seconds = match duration_probe {
         Ok(duration_seconds) => duration_seconds,
         Err(error) => {
             let _ = fs::remove_file(&output_path);
@@ -1091,7 +1232,24 @@ where
         .iter()
         .map(|(timestamp_ms, _)| *timestamp_ms)
         .collect::<Vec<_>>();
-    let checkpoint_batches = load_checkpoints(&frame_timestamps, settings.vision_batch_size())?;
+    let checkpoint_lookup_started = std::time::Instant::now();
+    let checkpoint_batches_result =
+        load_checkpoints(&frame_timestamps, settings.vision_batch_size());
+    record_current_stage(
+        "checkpoint_lookup",
+        checkpoint_lookup_started.elapsed(),
+        if checkpoint_batches_result.is_ok() {
+            crate::diagnostics::StageOutcome::Succeeded
+        } else if checkpoint_batches_result
+            .as_ref()
+            .is_err_and(|error| error == AI_ANALYSIS_CANCELLED_MESSAGE)
+        {
+            crate::diagnostics::StageOutcome::Cancelled
+        } else {
+            crate::diagnostics::StageOutcome::Failed
+        },
+    );
+    let checkpoint_batches = checkpoint_batches_result?;
     let mut analyses = Vec::with_capacity(frames.len());
     let mut frame_errors = Vec::new();
     let mut processed_frames = 0usize;
@@ -1108,6 +1266,7 @@ where
                 && checkpoint.analyses.len() == frame_batch.len()
         });
         let reused_checkpoint = checkpoint.is_some();
+        record_current_vision_batch(reused_checkpoint, frame_batch.len());
         if let Some(checkpoint) = checkpoint {
             analyses.extend(
                 frame_batch
@@ -1118,13 +1277,28 @@ where
         } else {
             match describe_frames(client, frame_batch, settings, is_cancelled) {
                 Ok(batch) if batch.len() == frame_batch.len() => {
-                    save_checkpoint(AiVisionCheckpointBatch {
+                    let checkpoint_save_started = std::time::Instant::now();
+                    let checkpoint_save_result = save_checkpoint(AiVisionCheckpointBatch {
                         batch_index,
                         frame_timestamps: frame_timestamps.clone(),
                         batch_timestamps,
                         analyses: batch.clone(),
-                    })
-                    .map_err(|error| {
+                    });
+                    record_current_stage(
+                        "checkpoint_save_ack",
+                        checkpoint_save_started.elapsed(),
+                        if checkpoint_save_result.is_ok() {
+                            crate::diagnostics::StageOutcome::Succeeded
+                        } else if checkpoint_save_result
+                            .as_ref()
+                            .is_err_and(|error| error == AI_ANALYSIS_CANCELLED_MESSAGE)
+                        {
+                            crate::diagnostics::StageOutcome::Cancelled
+                        } else {
+                            crate::diagnostics::StageOutcome::Failed
+                        },
+                    );
+                    checkpoint_save_result.map_err(|error| {
                         format!(
                             "cannot persist vision checkpoint for {} batch {}: {error}",
                             path.display(),
@@ -1405,6 +1579,7 @@ where
         match make_request() {
             Ok(response) => {
                 let status = response.status();
+                record_current_http_attempt(operation_name, started.elapsed(), status.is_success());
                 let retryable = is_transient_status(status) && attempt < MAX_ATTEMPTS;
                 if let Some(usage_event) = usage_event.as_ref() {
                     usage_event.record_response(
@@ -1429,7 +1604,18 @@ where
                         2 => 3_500,
                         _ => 6_000,
                     };
-                    if wait_for_retry_or_cancel(delay_ms, is_cancelled) {
+                    let retry_wait_started = std::time::Instant::now();
+                    let retry_cancelled = wait_for_retry_or_cancel(delay_ms, is_cancelled);
+                    record_current_stage(
+                        "retry_wait",
+                        retry_wait_started.elapsed(),
+                        if retry_cancelled {
+                            crate::diagnostics::StageOutcome::Cancelled
+                        } else {
+                            crate::diagnostics::StageOutcome::Succeeded
+                        },
+                    );
+                    if retry_cancelled {
                         return Err(AI_ANALYSIS_CANCELLED_MESSAGE.to_owned());
                     }
                     continue;
@@ -1440,6 +1626,7 @@ where
                 });
             }
             Err(error) => {
+                record_current_http_attempt(operation_name, started.elapsed(), false);
                 let retryable =
                     (error.is_timeout() || error.is_connect()) && attempt < MAX_ATTEMPTS;
                 if let Some(usage_event) = usage_event.as_ref() {
@@ -1456,7 +1643,19 @@ where
                     usage_event.finish();
                 }
                 if retryable {
-                    if wait_for_retry_or_cancel(1_500 * attempt as u64, is_cancelled) {
+                    let retry_wait_started = std::time::Instant::now();
+                    let retry_cancelled =
+                        wait_for_retry_or_cancel(1_500 * attempt as u64, is_cancelled);
+                    record_current_stage(
+                        "retry_wait",
+                        retry_wait_started.elapsed(),
+                        if retry_cancelled {
+                            crate::diagnostics::StageOutcome::Cancelled
+                        } else {
+                            crate::diagnostics::StageOutcome::Succeeded
+                        },
+                    );
+                    if retry_cancelled {
                         return Err(AI_ANALYSIS_CANCELLED_MESSAGE.to_owned());
                     }
                     continue;
@@ -1735,6 +1934,7 @@ fn describe_frames<C: Fn() -> bool>(
     settings: &AiSettings,
     is_cancelled: &C,
 ) -> Result<Vec<FrameAnalysis>, String> {
+    let frame_encoding_started = std::time::Instant::now();
     let encoded_frames = frames
         .iter()
         .map(|(timestamp_ms, frame)| {
@@ -1753,6 +1953,11 @@ fn describe_frames<C: Fn() -> bool>(
             })
         })
         .collect::<Vec<_>>();
+    record_current_stage(
+        "frame_encoding",
+        frame_encoding_started.elapsed(),
+        crate::diagnostics::StageOutcome::Succeeded,
+    );
     let timestamps = encoded_frames
         .iter()
         .map(|(timestamp_ms, _)| format!("{timestamp_ms} ms"))
@@ -2291,6 +2496,47 @@ fn values_to_embedding(values: &Vec<Value>) -> Vec<f32> {
 fn read_json_response(
     tracked_response: TrackedResponse,
     operation: &str,
+    model: &str,
+    recorder: Option<&AiUsageRecorder>,
+    estimated_audio_seconds: Option<f64>,
+) -> Result<Value, String> {
+    let started = std::time::Instant::now();
+    let result = read_json_response_inner(
+        tracked_response,
+        operation,
+        model,
+        recorder,
+        estimated_audio_seconds,
+    );
+    let stage = if operation.contains("vision") {
+        "vision_response_parse"
+    } else if operation.contains("embedding") {
+        "embedding_response_parse"
+    } else if operation.contains("speech transcription") {
+        "transcription_response_parse"
+    } else {
+        "other_response_parse"
+    };
+    record_current_stage(
+        stage,
+        started.elapsed(),
+        if result.is_ok() {
+            crate::diagnostics::StageOutcome::Succeeded
+        } else if result
+            .as_ref()
+            .is_err_and(|error| error == AI_ANALYSIS_CANCELLED_MESSAGE)
+        {
+            crate::diagnostics::StageOutcome::Cancelled
+        } else {
+            crate::diagnostics::StageOutcome::Failed
+        },
+    );
+    result
+}
+
+fn read_json_response_inner(
+    tracked_response: TrackedResponse,
+    operation: &str,
     _model: &str,
     _recorder: Option<&AiUsageRecorder>,
     estimated_audio_seconds: Option<f64>,
@@ -2712,6 +2958,154 @@ mod tests {
         (format!("http://{address}"), requests, stopped, handle)
     }
 
+    fn spawn_benchmark_pipeline_stub(
+        delay: Duration,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("benchmark stub should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("benchmark stub should support nonblocking accepts");
+        let address = listener
+            .local_addr()
+            .expect("benchmark stub should have an address");
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let request_count = requests.clone();
+        let stop_signal = stopped.clone();
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while !stop_signal.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("benchmark stub stream should support blocking reads");
+                        request_count.fetch_add(1, Ordering::SeqCst);
+                        let (request_line, _headers, raw_body) = read_raw_stub_request(&mut stream);
+                        let body = if request_line.contains("/audio/transcriptions") {
+                            Value::Null
+                        } else {
+                            serde_json::from_slice(&raw_body)
+                                .expect("benchmark JSON request body should parse")
+                        };
+                        std::thread::sleep(delay);
+                        if request_line.contains("/responses") {
+                            let frame_count = body
+                                .pointer("/input/0/content")
+                                .and_then(Value::as_array)
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter(|item| {
+                                            item.get("type").and_then(Value::as_str)
+                                                == Some("input_image")
+                                        })
+                                        .count()
+                                })
+                                .unwrap_or(1);
+                            write_stub_response(
+                                &mut stream,
+                                &vision_stub_response(frame_count.max(1)),
+                            );
+                        } else if request_line.contains("/embeddings") {
+                            let count = body
+                                .get("input")
+                                .and_then(Value::as_array)
+                                .map(Vec::len)
+                                .unwrap_or(1);
+                            let data = (0..count)
+                                .map(|index| {
+                                    json!({
+                                        "index": index,
+                                        "embedding": [0.5, 0.25, 0.125]
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            write_stub_response(&mut stream, &json!({"data": data}));
+                        } else if request_line.contains("/audio/transcriptions") {
+                            write_stub_response(
+                                &mut stream,
+                                &json!({"duration": 1.0, "segments": []}),
+                            );
+                        } else {
+                            write_stub_response(&mut stream, &json!({}));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("benchmark stub accept failed: {error}"),
+                }
+            }
+        });
+        (format!("http://{address}"), requests, stopped, handle)
+    }
+
+    fn create_benchmark_video(
+        path: &Path,
+        ffmpeg: &Path,
+        duration_seconds: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        let video_source = format!("color=c=black:s={width}x{height}:r=1");
+        let audio_source = "sine=frequency=880:sample_rate=16000";
+        let duration = duration_seconds.to_string();
+        let output = Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &video_source,
+                "-f",
+                "lavfi",
+                "-i",
+                audio_source,
+                "-t",
+                &duration,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "mpeg4",
+                "-q:v",
+                "5",
+                "-c:a",
+                "aac",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-shortest",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(path)
+            .output()
+            .map_err(|error| format!("benchmark FFmpeg could not start: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "benchmark FFmpeg failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
     fn vision_stub_response(frame_count: usize) -> Value {
         let frames = (0..frame_count)
             .map(|index| {
@@ -2735,6 +3129,157 @@ mod tests {
                 "content": [{"type": "output_text", "text": text}]
             }]
         })
+    }
+
+    #[derive(Clone, Copy)]
+    enum BenchmarkCheckpointMode {
+        All,
+        FirstBatchOnly,
+    }
+
+    #[derive(Clone, Copy)]
+    enum BenchmarkPersistMode {
+        PreserveCheckpoints,
+        Complete,
+    }
+
+    fn run_benchmark_case(
+        path: &Path,
+        metadata: &MediaMetadata,
+        content_id: &str,
+        storage_content_id: &str,
+        storage: &std::rc::Rc<std::cell::RefCell<crate::local_index::SqliteIndex>>,
+        settings: &AiSettings,
+        recorder: &crate::diagnostics::AiDiagnosticsRecorder,
+        checkpoint_mode: BenchmarkCheckpointMode,
+        persist_mode: BenchmarkPersistMode,
+    ) -> Result<AiFileAnalysisStatus, String> {
+        let file_diagnostics = recorder.start_file(content_id.to_owned());
+        let started = std::time::Instant::now();
+        let task_settings = settings.clone().with_diagnostics(file_diagnostics.clone());
+        let fingerprint = task_settings.analysis_settings_fingerprint();
+        let model_namespace = task_settings.model_namespace();
+
+        let load_storage = storage.clone();
+        let load_content_id = storage_content_id.to_owned();
+        let load_fingerprint = fingerprint.clone();
+        let save_storage = storage.clone();
+        let save_content_id = storage_content_id.to_owned();
+        let save_fingerprint = fingerprint.clone();
+        let analysis = match analyze_file_with_progress_and_cancel_with_checkpoints(
+            path,
+            Some(metadata),
+            &task_settings,
+            |_| {},
+            || false,
+            move |frame_timestamps, batch_size| {
+                let checkpoints = load_storage
+                    .borrow()
+                    .load_ai_vision_checkpoints(
+                        &load_content_id,
+                        &load_fingerprint,
+                        AI_VISION_CHECKPOINT_VERSION,
+                        frame_timestamps,
+                        batch_size,
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(match checkpoint_mode {
+                    BenchmarkCheckpointMode::All => checkpoints,
+                    BenchmarkCheckpointMode::FirstBatchOnly => checkpoints
+                        .into_iter()
+                        .filter(|checkpoint| checkpoint.batch_index == 0)
+                        .collect(),
+                })
+            },
+            move |checkpoint| {
+                save_storage
+                    .borrow_mut()
+                    .store_ai_vision_checkpoint(
+                        &save_content_id,
+                        &save_fingerprint,
+                        AI_VISION_CHECKPOINT_VERSION,
+                        &checkpoint,
+                    )
+                    .map_err(|error| error.to_string())
+            },
+        ) {
+            Ok(analysis) => analysis,
+            Err(error) => {
+                let status = if error == AI_ANALYSIS_CANCELLED_MESSAGE {
+                    "cancelled"
+                } else {
+                    "failed"
+                };
+                file_diagnostics.finish(status, started.elapsed());
+                return Err(error);
+            }
+        };
+
+        let commit_started = std::time::Instant::now();
+        let commit_result = match persist_mode {
+            BenchmarkPersistMode::PreserveCheckpoints => {
+                let mut failed_result = analysis.clone();
+                failed_result.annotations.clear();
+                failed_result.status = AiFileAnalysisStatus::Failed;
+                failed_result.warning =
+                    Some("MI-05 benchmark simulated downstream failure".to_owned());
+                storage
+                    .borrow_mut()
+                    .record_ai_analysis_result(
+                        storage_content_id,
+                        &model_namespace,
+                        &fingerprint,
+                        None,
+                        &failed_result,
+                    )
+                    .map(|_| ())
+            }
+            BenchmarkPersistMode::Complete => storage
+                .borrow_mut()
+                .record_ai_analysis_result(
+                    storage_content_id,
+                    &model_namespace,
+                    &fingerprint,
+                    None,
+                    &analysis,
+                )
+                .map(|_| ()),
+        };
+        file_diagnostics.record_stage(
+            "final_sqlite_commit",
+            commit_started.elapsed(),
+            if commit_result.is_ok() {
+                crate::diagnostics::StageOutcome::Succeeded
+            } else {
+                crate::diagnostics::StageOutcome::Failed
+            },
+        );
+        if let Err(error) = commit_result {
+            file_diagnostics.finish("failed", started.elapsed());
+            return Err(error.to_string());
+        }
+
+        let status = match persist_mode {
+            BenchmarkPersistMode::PreserveCheckpoints => "failed",
+            BenchmarkPersistMode::Complete => analysis.status.as_str(),
+        };
+        file_diagnostics.finish(status, started.elapsed());
+        Ok(analysis.status)
+    }
+
+    fn benchmark_metadata(duration_ms: u64, width: u32, height: u32) -> MediaMetadata {
+        MediaMetadata {
+            duration_ms: Some(duration_ms),
+            size_bytes: None,
+            container: Some("mp4".to_owned()),
+            video_codec: Some("mpeg4".to_owned()),
+            audio_codec: Some("aac".to_owned()),
+            width: Some(width),
+            height: Some(height),
+            frame_rate: Some("1/1".to_owned()),
+            start_time: None,
+            creation_time: None,
+        }
     }
 
     fn checkpoint_test_settings(base_url: String, max_frames: u64) -> AiSettings {
@@ -4495,6 +5040,236 @@ mod tests {
             1,
             "the second paid vision batch must wait for the failed write ACK"
         );
+    }
+
+    #[test]
+    #[ignore = "benchmark: requires FFmpeg and is intentionally manual"]
+    fn mi05_benchmark_real_ffmpeg_with_delayed_local_stub() {
+        let ffmpeg = resolve_ffmpeg_executable(None);
+        let ffmpeg_check = Command::new(&ffmpeg).arg("-version").output();
+        let Ok(ffmpeg_check) = ffmpeg_check else {
+            println!("MI05 benchmark skipped: FFmpeg is unavailable");
+            return;
+        };
+        if !ffmpeg_check.status.success() {
+            println!("MI05 benchmark skipped: FFmpeg returned a failed version check");
+            return;
+        }
+        let ffmpeg_version = String::from_utf8_lossy(&ffmpeg_check.stdout)
+            .lines()
+            .next()
+            .unwrap_or("unknown")
+            .to_owned();
+        println!("MI05_BENCHMARK_ENV version={ffmpeg_version}");
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("benchmark clock should be after epoch")
+            .as_nanos();
+        let benchmark_root = std::env::temp_dir().join(format!(
+            "mediaindex-mi05-benchmark-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&benchmark_root).expect("benchmark directory should be creatable");
+        let short_video = benchmark_root.join("short.mp4");
+        let long_video = benchmark_root.join("long.mp4");
+        create_benchmark_video(&short_video, &ffmpeg, 3, 320, 180)
+            .expect("short benchmark video should be created");
+        create_benchmark_video(&long_video, &ffmpeg, 12, 640, 360)
+            .expect("long benchmark video should be created");
+
+        let short_metadata = benchmark_metadata(3_000, 320, 180);
+        let long_metadata = benchmark_metadata(12_000, 640, 360);
+        let mut index = crate::local_index::SqliteIndex::open_in_memory()
+            .expect("benchmark SQLite index should open");
+        index
+            .reconcile(
+                &crate::scanner::ScanReport {
+                    files: vec![
+                        crate::scanner::DiscoveredFile {
+                            path: short_video.to_string_lossy().into_owned(),
+                            size_bytes: fs::metadata(&short_video)
+                                .expect("short benchmark metadata should be readable")
+                                .len(),
+                            modified_unix_ms: None,
+                            content_hash: "benchmark-short".to_owned(),
+                        },
+                        crate::scanner::DiscoveredFile {
+                            path: long_video.to_string_lossy().into_owned(),
+                            size_bytes: fs::metadata(&long_video)
+                                .expect("long benchmark metadata should be readable")
+                                .len(),
+                            modified_unix_ms: None,
+                            content_hash: "benchmark-long".to_owned(),
+                        },
+                    ],
+                    warnings: Vec::new(),
+                },
+                &std::collections::HashMap::new(),
+            )
+            .expect("benchmark videos should be indexed");
+        let storage = std::rc::Rc::new(std::cell::RefCell::new(index));
+
+        let (base_url, requests, stop_stub, stub_server) =
+            spawn_benchmark_pipeline_stub(Duration::from_millis(15));
+        let settings = AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::OpenAI),
+            api_key: Some("mi05-benchmark-stub-key".to_owned()),
+            vision_model: Some("vision-benchmark".to_owned()),
+            embedding_model: Some("embedding-benchmark".to_owned()),
+            base_url: Some(base_url),
+            ffmpeg_path: Some(ffmpeg.to_string_lossy().into_owned()),
+            sample_interval_seconds: Some(1),
+            max_frames: Some(12),
+            transcribe_audio: Some(true),
+            transcription_model: Some("whisper-1".to_owned()),
+            ..Default::default()
+        }))
+        .expect("benchmark settings should be valid");
+        let recorder = crate::diagnostics::AiDiagnosticsRecorder::new(
+            format!("run-mi05-benchmark-{stamp}"),
+            "mi05_benchmark",
+            settings.provider_name(),
+            settings.vision_model(),
+            settings.embedding_model(),
+            Some(settings.transcription_model().to_owned()),
+            std::time::Instant::now(),
+            crate::diagnostics::unix_time_ms(),
+            8,
+            1,
+        );
+
+        for (path, label, metadata) in [
+            (short_video.as_path(), "short", &short_metadata),
+            (long_video.as_path(), "long", &long_metadata),
+        ] {
+            let content_id = format!("{label}:fresh");
+            let result = run_benchmark_case(
+                path,
+                metadata,
+                &content_id,
+                &format!("benchmark-{label}"),
+                &storage,
+                &settings,
+                &recorder,
+                BenchmarkCheckpointMode::All,
+                BenchmarkPersistMode::PreserveCheckpoints,
+            )
+            .expect("fresh benchmark analysis should complete");
+            assert_eq!(result, AiFileAnalysisStatus::Complete);
+
+            let ready_diagnostics = recorder.start_file(format!("{label}:ready_repeat"));
+            ready_diagnostics.finish("skipped", Duration::ZERO);
+
+            let content_id = format!("{label}:partial_resume");
+            let result = run_benchmark_case(
+                path,
+                metadata,
+                &content_id,
+                &format!("benchmark-{label}"),
+                &storage,
+                &settings,
+                &recorder,
+                BenchmarkCheckpointMode::FirstBatchOnly,
+                BenchmarkPersistMode::PreserveCheckpoints,
+            )
+            .expect("partial benchmark analysis should complete");
+            assert_eq!(result, AiFileAnalysisStatus::Complete);
+
+            let content_id = format!("{label}:downstream_retry");
+            let result = run_benchmark_case(
+                path,
+                metadata,
+                &content_id,
+                &format!("benchmark-{label}"),
+                &storage,
+                &settings,
+                &recorder,
+                BenchmarkCheckpointMode::All,
+                BenchmarkPersistMode::Complete,
+            )
+            .expect("downstream retry benchmark analysis should complete");
+            assert_eq!(result, AiFileAnalysisStatus::Complete);
+        }
+
+        let snapshot = recorder.snapshot("completed");
+        assert_eq!(snapshot.files.len(), 8);
+        let find_file = |content_id: &str| {
+            snapshot
+                .files
+                .iter()
+                .find(|file| file.content_id == content_id)
+                .unwrap_or_else(|| panic!("benchmark file {content_id} should be present"))
+        };
+        let long_fresh = find_file("long:fresh");
+        let long_partial = find_file("long:partial_resume");
+        let long_retry = find_file("long:downstream_retry");
+        assert!(long_fresh.vision_new_frames > 0);
+        assert!(long_partial.vision_new_frames > 0);
+        assert!(long_partial.vision_reused_frames > 0);
+        assert_eq!(long_retry.vision_new_frames, 0);
+        assert!(long_retry.vision_reused_frames > 0);
+        assert_eq!(
+            long_retry
+                .stages
+                .get("vision_http")
+                .map(|stage| stage.calls)
+                .unwrap_or_default(),
+            0,
+            "a downstream retry should reuse all saved vision batches"
+        );
+
+        let stage_elapsed = |file: &crate::diagnostics::AiFileDiagnostics, name: &str| {
+            file.stages
+                .get(name)
+                .map(|stage| stage.elapsed_ms)
+                .unwrap_or_default()
+        };
+        let stage_calls = |file: &crate::diagnostics::AiFileDiagnostics, name: &str| {
+            file.stages
+                .get(name)
+                .map(|stage| stage.calls)
+                .unwrap_or_default()
+        };
+        for file in &snapshot.files {
+            println!(
+                "MI05_BENCHMARK_FILE {}",
+                json!({
+                    "content_id": &file.content_id,
+                    "status": &file.status,
+                    "wall_ms": file.wall_time_ms,
+                    "vision_new_frames": file.vision_new_frames,
+                    "vision_new_batches": file.vision_new_batches,
+                    "vision_reused_frames": file.vision_reused_frames,
+                    "vision_reused_batches": file.vision_reused_batches,
+                    "frame_extraction_ms": stage_elapsed(file, "frame_extraction"),
+                    "checkpoint_lookup_ms": stage_elapsed(file, "checkpoint_lookup"),
+                    "vision_http_ms": stage_elapsed(file, "vision_http"),
+                    "vision_http_calls": stage_calls(file, "vision_http"),
+                    "audio_extraction_ms": stage_elapsed(file, "audio_extraction"),
+                    "transcription_http_ms": stage_elapsed(file, "transcription_http"),
+                    "transcription_http_calls": stage_calls(file, "transcription_http"),
+                    "embedding_http_ms": stage_elapsed(file, "embedding_http"),
+                    "embedding_http_calls": stage_calls(file, "embedding_http"),
+                    "final_sqlite_commit_ms": stage_elapsed(file, "final_sqlite_commit")
+                })
+            );
+        }
+        let diagnostics_path = recorder
+            .write_json(&benchmark_root, "completed")
+            .expect("benchmark diagnostics should be written");
+        println!("MI05_BENCHMARK_DIAGNOSTICS {}", diagnostics_path.display());
+        println!(
+            "MI05_BENCHMARK_REQUESTS {}",
+            requests.load(std::sync::atomic::Ordering::SeqCst)
+        );
+
+        stop_stub.store(true, std::sync::atomic::Ordering::SeqCst);
+        stub_server
+            .join()
+            .expect("benchmark stub should stop cleanly");
+        let _ = fs::remove_file(short_video);
+        let _ = fs::remove_file(long_video);
     }
 
     #[test]

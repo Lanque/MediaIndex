@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod cost;
+pub(crate) mod diagnostics;
 pub mod gemini_oauth;
 pub mod local_index;
 pub mod metadata;
@@ -13,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
@@ -415,6 +416,8 @@ fn analyze_media_folder_blocking(
     resume_checkpoints: bool,
     control: &AiAnalysisControl,
 ) -> Result<ai::AiIndexReport, String> {
+    let run_started = Instant::now();
+    let run_started_unix_ms = diagnostics::unix_time_ms();
     let settings = ai_settings(&app, config.clone())?;
     let mut index = open_local_index(&app)?;
     let plan = plan_ai_analysis(
@@ -455,7 +458,23 @@ fn analyze_media_folder_blocking(
     )?;
     let files = selection.files;
     let skipped_file_count = selection.skipped_file_count;
+    let total_files = files.len() as u64;
+    let worker_count = settings.parallel_file_limit().min(files.len());
     let run_id = new_ai_run_id();
+    let diagnostics = diagnostics::AiDiagnosticsRecorder::new(
+        run_id.clone(),
+        "analyze_media_folder",
+        settings.provider_name(),
+        settings.vision_model(),
+        settings.embedding_model(),
+        settings
+            .transcribes_audio()
+            .then(|| settings.transcription_model().to_owned()),
+        run_started,
+        run_started_unix_ms,
+        total_files,
+        worker_count as u64,
+    );
     let recorder = usage::AiUsageRecorder::new(
         run_id.clone(),
         settings.provider_name(),
@@ -471,23 +490,35 @@ fn analyze_media_folder_blocking(
             .unwrap_or(recorder),
         _ => recorder,
     };
-    index
-        .start_ai_analysis_run(&usage::AiRunSpec {
-            run_id: run_id.clone(),
-            operation: "analyze_media_folder".to_owned(),
-            provider: settings.provider_name().to_owned(),
-            vision_model: settings.vision_model().to_owned(),
-            embedding_model: settings.embedding_model().to_owned(),
-            transcription_model: settings
-                .transcribes_audio()
-                .then(|| settings.transcription_model().to_owned()),
-            model_namespace: provider.clone(),
-            pricing_status: plan.estimated_cost.pricing_status.to_owned(),
-            pricing_checked_at: plan.estimated_cost.pricing_checked_at.to_owned(),
-            estimated_cost_usd: plan.estimated_cost.estimated_likely_usd,
-            budget_limit_usd: plan.estimated_cost.budget_limit_usd,
-        })
-        .map_err(|error| error.to_string())?;
+    let start_run_started = Instant::now();
+    let start_run_result = index.start_ai_analysis_run(&usage::AiRunSpec {
+        run_id: run_id.clone(),
+        operation: "analyze_media_folder".to_owned(),
+        provider: settings.provider_name().to_owned(),
+        vision_model: settings.vision_model().to_owned(),
+        embedding_model: settings.embedding_model().to_owned(),
+        transcription_model: settings
+            .transcribes_audio()
+            .then(|| settings.transcription_model().to_owned()),
+        model_namespace: provider.clone(),
+        pricing_status: plan.estimated_cost.pricing_status.to_owned(),
+        pricing_checked_at: plan.estimated_cost.pricing_checked_at.to_owned(),
+        estimated_cost_usd: plan.estimated_cost.estimated_likely_usd,
+        budget_limit_usd: plan.estimated_cost.budget_limit_usd,
+    });
+    diagnostics.record_stage(
+        "run_start_sqlite_commit",
+        start_run_started.elapsed(),
+        if start_run_result.is_ok() {
+            diagnostics::StageOutcome::Succeeded
+        } else {
+            diagnostics::StageOutcome::Failed
+        },
+    );
+    if let Err(error) = start_run_result {
+        let _ = write_ai_diagnostics(&app, &diagnostics, "failed");
+        return Err(error.to_string());
+    }
 
     let mut report = ai::AiIndexReport {
         analyzed_file_count: 0,
@@ -497,8 +528,8 @@ fn analyze_media_folder_blocking(
         failed_file_count: 0,
         cancelled: false,
         warnings: Vec::new(),
+        diagnostics_path: None,
     };
-    let total_files = files.len() as u64;
     emit_ai_progress(
         &app,
         0,
@@ -514,10 +545,10 @@ fn analyze_media_folder_blocking(
         let metadata = index
             .get_asset_metadata(&file.content_hash)
             .map_err(|error| error.to_string())?;
-        tasks.push_back((file_index, file, metadata));
+        let file_diagnostics = diagnostics.start_file(file.content_hash.clone());
+        tasks.push_back((file_index, file, metadata, file_diagnostics));
     }
 
-    let worker_count = settings.parallel_file_limit().min(tasks.len());
     let tasks = Arc::new(Mutex::new(tasks));
     let file_progress = Arc::new(Mutex::new(vec![0u8; total_files as usize]));
     let persisted_files = Arc::new(AtomicU64::new(0));
@@ -544,9 +575,10 @@ fn analyze_media_folder_blocking(
                     break;
                 }
                 let task = lock_unpoisoned(&worker_tasks).pop_front();
-                let Some((file_index, file, metadata)) = task else {
+                let Some((file_index, file, metadata, file_diagnostics)) = task else {
                     break;
                 };
+                let file_started = Instant::now();
                 let current_file = file.path.clone();
                 let checkpoint_load_content_hash = file.content_hash.clone();
                 let checkpoint_load_settings_fingerprint = worker_settings_fingerprint.clone();
@@ -556,10 +588,13 @@ fn analyze_media_folder_blocking(
                 let task_checkpoint_store_sender = checkpoint_store_sender.clone();
                 let require_checkpoint_match = allow_checkpoint_resume
                     && worker_resumable_content_hashes.contains(&file.content_hash);
+                let task_settings = worker_settings
+                    .clone()
+                    .with_diagnostics(file_diagnostics.clone());
                 let result = ai::analyze_file_with_progress_and_cancel_with_checkpoints(
                     Path::new(&current_file),
                     metadata.as_ref(),
-                    &worker_settings,
+                    &task_settings,
                     |progress| {
                         let percent =
                             update_overall_progress(&worker_progress, file_index, progress.percent);
@@ -620,6 +655,8 @@ fn analyze_media_folder_blocking(
                         file_index,
                         file,
                         result,
+                        diagnostics: file_diagnostics,
+                        started: file_started,
                     });
                     break;
                 }
@@ -628,6 +665,8 @@ fn analyze_media_folder_blocking(
                         file_index,
                         file,
                         result,
+                        diagnostics: file_diagnostics,
+                        started: file_started,
                     })
                     .is_err()
                 {
@@ -648,19 +687,34 @@ fn analyze_media_folder_blocking(
                 file_index,
                 file,
                 result,
+                diagnostics: file_diagnostics,
+                started: file_started,
             } = message
             else {
                 unreachable!("checkpoint handler must consume checkpoint messages");
             };
             if fatal_error.is_some() {
+                file_diagnostics.finish("failed", file_started.elapsed());
                 continue;
             }
-            if let Err(error) = persist_ai_usage_events(&mut index, &usage_recorder) {
+            let usage_flush_started = Instant::now();
+            let usage_flush = persist_ai_usage_events(&mut index, &usage_recorder);
+            diagnostics.record_stage(
+                "usage_sqlite_commit",
+                usage_flush_started.elapsed(),
+                if usage_flush.is_ok() {
+                    diagnostics::StageOutcome::Succeeded
+                } else {
+                    diagnostics::StageOutcome::Failed
+                },
+            );
+            if let Err(error) = usage_flush {
                 fatal_error.get_or_insert(error);
                 control.request_cancel();
                 continue;
             }
-            let outcome = match persist_ai_result(
+            let final_commit_started = Instant::now();
+            let persisted_result = persist_ai_result(
                 &mut index,
                 &mut report,
                 &file,
@@ -669,14 +723,33 @@ fn analyze_media_folder_blocking(
                 &settings_fingerprint,
                 result,
                 &persisted_files,
-            ) {
+            );
+            let final_commit_outcome = match &persisted_result {
+                Ok(AiResultOutcome::Cancelled) => diagnostics::StageOutcome::Cancelled,
+                Ok(_) => diagnostics::StageOutcome::Succeeded,
+                Err(_) => diagnostics::StageOutcome::Failed,
+            };
+            file_diagnostics.record_stage(
+                "final_sqlite_commit",
+                final_commit_started.elapsed(),
+                final_commit_outcome,
+            );
+            let outcome = match persisted_result {
                 Ok(outcome) => outcome,
                 Err(error) => {
+                    file_diagnostics.finish("failed", file_started.elapsed());
                     fatal_error.get_or_insert(error);
                     control.request_cancel();
                     continue;
                 }
             };
+            let diagnostics_status = match &outcome {
+                AiResultOutcome::Committed => "complete",
+                AiResultOutcome::Partial => "partial",
+                AiResultOutcome::Warning => "failed",
+                AiResultOutcome::Cancelled => "cancelled",
+            };
+            file_diagnostics.finish(diagnostics_status, file_started.elapsed());
             let percent = update_overall_progress(&file_progress, file_index, 100);
             match outcome {
                 AiResultOutcome::Committed => emit_ai_progress(
@@ -716,7 +789,21 @@ fn analyze_media_folder_blocking(
         }
     });
 
-    persist_ai_usage_events(&mut index, &usage_recorder)?;
+    let usage_flush_started = Instant::now();
+    let usage_flush = persist_ai_usage_events(&mut index, &usage_recorder);
+    diagnostics.record_stage(
+        "usage_sqlite_commit",
+        usage_flush_started.elapsed(),
+        if usage_flush.is_ok() {
+            diagnostics::StageOutcome::Succeeded
+        } else {
+            diagnostics::StageOutcome::Failed
+        },
+    );
+    if let Err(error) = usage_flush {
+        report.diagnostics_path = write_ai_diagnostics(&app, &diagnostics, "failed");
+        return Err(error);
+    }
 
     report.cancelled |= control.is_cancelled();
     let run_status = match &worker_result {
@@ -725,16 +812,37 @@ fn analyze_media_folder_blocking(
         Ok(()) => "partial",
         Err(_) => "failed",
     };
-    index
-        .finish_ai_analysis_run(
-            &run_id,
-            run_status,
-            report.analyzed_file_count,
-            report.annotation_count,
-            usage_recorder.reserved_budget_usd(plan.estimated_cost.budget_limit_usd),
-        )
-        .map_err(|error| error.to_string())?;
-    worker_result?;
+    let finish_run_started = Instant::now();
+    let finish_run_result = index.finish_ai_analysis_run(
+        &run_id,
+        run_status,
+        report.analyzed_file_count,
+        report.annotation_count,
+        usage_recorder.reserved_budget_usd(plan.estimated_cost.budget_limit_usd),
+    );
+    diagnostics.record_stage(
+        "run_finish_sqlite_commit",
+        finish_run_started.elapsed(),
+        if finish_run_result.is_ok() {
+            diagnostics::StageOutcome::Succeeded
+        } else {
+            diagnostics::StageOutcome::Failed
+        },
+    );
+    let finish_run_error = finish_run_result.err().map(|error| error.to_string());
+    let worker_error = worker_result.err();
+    let diagnostics_status = if finish_run_error.is_some() || worker_error.is_some() {
+        "failed"
+    } else {
+        run_status
+    };
+    report.diagnostics_path = write_ai_diagnostics(&app, &diagnostics, diagnostics_status);
+    if let Some(error) = finish_run_error {
+        return Err(error);
+    }
+    if let Some(error) = worker_error {
+        return Err(error);
+    }
 
     if !report.cancelled {
         emit_ai_progress(
@@ -769,6 +877,8 @@ enum AiWorkerMessage {
         file_index: usize,
         file: local_index::IndexedFile,
         result: Result<ai::AiFileAnalysisResult, String>,
+        diagnostics: diagnostics::AiFileDiagnosticsHandle,
+        started: Instant,
     },
 }
 
@@ -824,6 +934,22 @@ fn handle_ai_checkpoint_message(
             None
         }
         message @ AiWorkerMessage::Result { .. } => Some(message),
+    }
+}
+
+fn write_ai_diagnostics(
+    app: &tauri::AppHandle,
+    diagnostics: &diagnostics::AiDiagnosticsRecorder,
+    status: &str,
+) -> Option<String> {
+    match app_local_data_directory(app)
+        .and_then(|directory| diagnostics.write_json(&directory, status))
+    {
+        Ok(path) => Some(path.to_string_lossy().into_owned()),
+        Err(error) => {
+            eprintln!("AI diagnostics export failed: {error}");
+            None
+        }
     }
 }
 
@@ -1484,14 +1610,18 @@ fn active_indexed_media_path(app: &tauri::AppHandle, path: &str) -> Result<PathB
     Ok(indexed_path)
 }
 
-fn open_local_index(app: &tauri::AppHandle) -> Result<local_index::SqliteIndex, String> {
+fn app_local_data_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let database_directory = app
         .path()
         .app_local_data_dir()
         .map_err(|error| format!("cannot determine local index directory: {error}"))?;
     fs::create_dir_all(&database_directory)
         .map_err(|error| format!("cannot create local index directory: {error}"))?;
-    let database_path: PathBuf = database_directory.join("mediaindex.sqlite3");
+    Ok(database_directory)
+}
+
+fn open_local_index(app: &tauri::AppHandle) -> Result<local_index::SqliteIndex, String> {
+    let database_path = app_local_data_directory(app)?.join("mediaindex.sqlite3");
     local_index::SqliteIndex::open(database_path).map_err(|error| error.to_string())
 }
 
@@ -1577,6 +1707,7 @@ mod tests {
             failed_file_count: 0,
             cancelled: false,
             warnings: Vec::new(),
+            diagnostics_path: None,
         };
         let persisted_files = AtomicU64::new(0);
         let annotation = ai::AiAnnotation {
@@ -1874,6 +2005,7 @@ mod tests {
             failed_file_count: 0,
             cancelled: false,
             warnings: Vec::new(),
+            diagnostics_path: None,
         };
         let persisted_files = AtomicU64::new(0);
         assert_eq!(
