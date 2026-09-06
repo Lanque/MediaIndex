@@ -86,6 +86,12 @@ struct AiAnalysisPlan {
     model: String,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct BuildInfo {
+    git_sha: String,
+    build_time_unix: u64,
+}
+
 impl Drop for AiAnalysisRunGuard {
     fn drop(&mut self) {
         let mut flags = lock_unpoisoned(&self.control.flags);
@@ -248,7 +254,7 @@ fn plan_ai_analysis(
     force: Option<bool>,
     resume_checkpoints: Option<bool>,
 ) -> Result<AiAnalysisPlan, String> {
-    let settings = ai_settings(&app, config)?;
+    let settings = ai_estimate_settings(config)?;
     let index = open_local_index(&app)?;
     let indexed_files = unique_indexed_files_under_root(
         index.known_files().map_err(|error| error.to_string())?,
@@ -406,6 +412,18 @@ fn plan_ai_analysis(
 #[tauri::command]
 fn cancel_ai_analysis(control: tauri::State<'_, AiAnalysisControl>) -> bool {
     control.request_cancel()
+}
+
+#[tauri::command]
+fn get_build_info() -> BuildInfo {
+    BuildInfo {
+        git_sha: option_env!("MEDIAINDEX_BUILD_GIT_SHA")
+            .unwrap_or("unknown")
+            .to_owned(),
+        build_time_unix: option_env!("MEDIAINDEX_BUILD_TIME_UNIX")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
+    }
 }
 
 fn analyze_media_folder_blocking(
@@ -1547,6 +1565,10 @@ fn ai_settings(
     ai::AiSettings::from_request(config)
 }
 
+fn ai_estimate_settings(config: Option<ai::AiRequestConfig>) -> Result<ai::AiSettings, String> {
+    ai::AiSettings::for_estimate(config)
+}
+
 #[tauri::command]
 async fn login_gemini_oauth(
     app: tauri::AppHandle,
@@ -1636,6 +1658,7 @@ pub fn run() {
             scan_media_folder,
             extract_media_metadata,
             index_media_folder,
+            get_build_info,
             search_media,
             get_indexed_library_path,
             plan_ai_analysis,

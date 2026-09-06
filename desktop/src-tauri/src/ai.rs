@@ -206,6 +206,17 @@ fn sanitize_api_key(raw: &str) -> String {
 
 impl AiSettings {
     pub fn from_request(request: Option<AiRequestConfig>) -> Result<Self, String> {
+        Self::from_request_with_auth(request, true)
+    }
+
+    pub(crate) fn for_estimate(request: Option<AiRequestConfig>) -> Result<Self, String> {
+        Self::from_request_with_auth(request, false)
+    }
+
+    fn from_request_with_auth(
+        request: Option<AiRequestConfig>,
+        require_runtime_auth: bool,
+    ) -> Result<Self, String> {
         let request = request.unwrap_or_default();
         let provider = request
             .provider
@@ -232,7 +243,7 @@ impl AiSettings {
             AiProvider::Local => None,
         });
         let api_key = sanitize_api_key(&api_key.unwrap_or_default());
-        if provider.is_remote() && api_key.is_empty() {
+        if require_runtime_auth && provider.is_remote() && api_key.is_empty() {
             return Err(match provider {
                 AiProvider::OpenAI => {
                     "OpenAI needs an API key. Add it under AI connection or set MEDIAINDEX_OPENAI_API_KEY."
@@ -250,7 +261,7 @@ impl AiSettings {
                 AiProvider::Local => unreachable!(),
             });
         }
-        if gemini_uses_oauth && google_project_id.is_none() {
+        if require_runtime_auth && gemini_uses_oauth && google_project_id.is_none() {
             return Err("Google login did not provide a Cloud project ID. Log in again with a Desktop OAuth client JSON that contains project_id.".to_owned());
         }
 
@@ -4452,6 +4463,21 @@ mod tests {
             settings.model_namespace(),
             "local:gemma4:e2b:embeddinggemma"
         );
+    }
+
+    #[test]
+    fn estimate_settings_normalize_remote_models_without_runtime_auth() {
+        let settings = AiSettings::for_estimate(Some(AiRequestConfig {
+            provider: Some(AiProvider::OpenAI),
+            vision_model: Some("04-mini".to_owned()),
+            ..Default::default()
+        }))
+        .expect("an estimate should not need a provider key");
+
+        assert_eq!(settings.provider, AiProvider::OpenAI);
+        assert_eq!(settings.vision_model, "o4-mini");
+        assert_eq!(settings.embedding_model, DEFAULT_OPENAI_EMBEDDING_MODEL);
+        assert_eq!(settings.parallel_file_limit(), 2);
     }
 
     #[test]
