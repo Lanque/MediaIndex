@@ -37,7 +37,7 @@
 
 - Baseline: `65eb10f` (`docs: record MI-01 verification`).
 - Implementation commit: `a67079b` (`fix: stop analysis retries after cancellation`).
-- Documentation commit: pending after the final documentation commit.
+- Documentation commit: `b4192ac` (`docs: document analysis cancellation semantics`).
 - Scope: shared analysis cancellation checks before reservations and sends,
   cancellable retry backoff, cancellation-safe reservation cleanup, and a
   cancellation check between Gemini document embeddings. Search and Test
