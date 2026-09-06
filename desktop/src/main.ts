@@ -439,11 +439,11 @@ function readTimingHistory(): AiTimingHistory {
 }
 
 function recordAnalysisTiming(config: AiConfig, plan: AiAnalysisPlan, elapsedMs: number): void {
-  if (plan.estimated_vision_requests <= 0 || elapsedMs <= 0) return;
+  if (plan.remaining_vision_request_count <= 0 || elapsedMs <= 0) return;
   const history = readTimingHistory();
   const key = timingKey(config);
   const previous = history[key];
-  const measured = elapsedMs / plan.estimated_vision_requests;
+  const measured = elapsedMs / plan.remaining_vision_request_count;
   const samples = Math.min((previous?.samples ?? 0) + 1, 10);
   history[key] = {
     millisecondsPerRequest: previous
@@ -470,7 +470,7 @@ function formatApproximateTime(milliseconds: number): string {
 
 function analysisTimeEstimate(plan: AiAnalysisPlan, config: AiConfig): string {
   const timing = readTimingHistory()[timingKey(config)];
-  if (!timing || plan.estimated_vision_requests <= 0) {
+  if (!timing || plan.remaining_vision_request_count <= 0) {
     const model = config.visionModel.toLowerCase();
     const millisecondsPerRequest = config.provider === "local"
       ? 12_000
@@ -485,11 +485,11 @@ function analysisTimeEstimate(plan: AiAnalysisPlan, config: AiConfig): string {
     const speechMs = plan.estimated_audio_seconds * 180;
     const estimate = Math.max(
       1_000,
-      plan.estimated_vision_requests * millisecondsPerRequest + preparationMs + speechMs,
+      plan.remaining_vision_request_count * millisecondsPerRequest + preparationMs + speechMs,
     );
     return `Rough first-run estimate: ${formatApproximateTime(estimate)}. The completed run will calibrate future estimates on this computer.`;
   }
-  return `Estimated time: ${formatApproximateTime(timing.millisecondsPerRequest * plan.estimated_vision_requests)} based on ${timing.samples} completed local run${timing.samples === 1 ? "" : "s"}.`;
+  return `Estimated time: ${formatApproximateTime(timing.millisecondsPerRequest * plan.remaining_vision_request_count)} based on ${timing.samples} completed local run${timing.samples === 1 ? "" : "s"}.`;
 }
 
 function formatEstimatedUsd(value: number): string {
@@ -1704,15 +1704,35 @@ async function analyzeLibraryWithAi(): Promise<void> {
   const config = saveAiConfig();
   let analysisStarted = false;
   let forceReanalysis = config.reanalyzeExisting;
+  let resumeCheckpoints = false;
   let plan: AiAnalysisPlan | null = null;
   try {
     plan = await tauriApi.planAiAnalysis(
       selectedLibraryPath,
       config,
       forceReanalysis,
+      resumeCheckpoints,
     );
 
-    const coverageReviewCount = plan.partial_file_count + plan.coverage_unknown_file_count;
+    if (!forceReanalysis && plan.resumable_checkpoint_file_count > 0) {
+      const continueSavedWork = window.confirm(
+        `Saved vision work exists for ${plan.resumable_checkpoint_file_count} clips. ` +
+          `Continuing can reuse ${plan.available_vision_frame_count} saved frames in ${plan.available_vision_request_count} vision requests; ` +
+          "document embeddings and configured speech transcription are still estimated again.\n\n" +
+          "Continue the saved work? Choose Cancel to leave those checkpoints untouched and review a full reanalysis separately.",
+      );
+      if (continueSavedWork) {
+        resumeCheckpoints = true;
+        plan = await tauriApi.planAiAnalysis(
+          selectedLibraryPath,
+          config,
+          false,
+          resumeCheckpoints,
+        );
+      }
+    }
+
+    let coverageReviewCount = plan.partial_file_count + plan.coverage_unknown_file_count;
     if (!forceReanalysis && (plan.requires_explicit_coverage_confirmation || (plan.analyze_file_count === 0 && plan.already_analyzed_file_count > 0))) {
       const existingSummary = plan.already_analyzed_file_count > 0
         ? `There are ${plan.already_analyzed_file_count} saved ${plan.model} analyses in this folder.`
@@ -1733,7 +1753,9 @@ async function analyzeLibraryWithAi(): Promise<void> {
         }
       } else {
         forceReanalysis = true;
-        plan = await tauriApi.planAiAnalysis(selectedLibraryPath, config, true);
+        resumeCheckpoints = false;
+        plan = await tauriApi.planAiAnalysis(selectedLibraryPath, config, true, false);
+        coverageReviewCount = plan.partial_file_count + plan.coverage_unknown_file_count;
       }
     }
 
@@ -1752,9 +1774,15 @@ async function analyzeLibraryWithAi(): Promise<void> {
       const speechSummary = plan.estimated_audio_seconds > 0
         ? ` Spoken audio: about ${formatApproximateTime(plan.estimated_audio_seconds * 1_000).replace("about ", "")} sent to ${config.transcriptionModel} for timestamped transcription.`
         : "";
+      const checkpointSummary = resumeCheckpoints && plan.reused_vision_frame_count > 0
+        ? ` Continue saved work: ${plan.reused_vision_frame_count} saved vision frames in ${plan.reused_vision_request_count} requests will be reused; ` +
+          `${plan.remaining_vision_frame_count} new vision frames in ${plan.remaining_vision_request_count} requests remain. Document embeddings and configured speech transcription are estimated again.`
+        : forceReanalysis
+          ? " Full reanalysis selected; saved vision checkpoints will be bypassed."
+          : "";
       const requestSummary = config.provider === "local"
-        ? `${plan.estimated_sampled_frames} estimated sampled frames processed locally.`
-        : `${plan.estimated_sampled_frames} estimated sampled frame images in about ${plan.estimated_vision_requests} vision requests. ` +
+        ? `${plan.remaining_vision_frame_count} estimated sampled frames processed locally.${checkpointSummary}`
+        : `${plan.remaining_vision_frame_count} estimated sampled frame images in about ${plan.remaining_vision_request_count} vision requests.${checkpointSummary} ` +
           `Configured maximum: ${plan.max_sampled_frames} frames in ${plan.max_vision_requests} requests.${speechSummary}`;
       const budgetBlockReason = analysisBudgetBlockReason(plan);
       if (budgetBlockReason) {
@@ -1790,6 +1818,7 @@ async function analyzeLibraryWithAi(): Promise<void> {
       selectedLibraryPath,
       config,
       forceReanalysis,
+      resumeCheckpoints,
     );
     if (report.annotation_count > 0 || report.partial_file_count > 0 || report.failed_file_count > 0) {
       savedAnalysisCache.clear();
