@@ -66,6 +66,13 @@ export type AiAnalysisPlan = {
   analyze_file_count: number;
   skipped_file_count: number;
   already_analyzed_file_count: number;
+  resumable_checkpoint_file_count: number;
+  available_vision_frame_count: number;
+  available_vision_request_count: number;
+  reused_vision_frame_count: number;
+  reused_vision_request_count: number;
+  remaining_vision_frame_count: number;
+  remaining_vision_request_count: number;
   partial_file_count: number;
   coverage_unknown_file_count: number;
   requires_explicit_coverage_confirmation: boolean;

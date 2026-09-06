@@ -25,16 +25,28 @@ export async function planAiAnalysis(
   path: string,
   config: AiConfig,
   force = false,
+  resumeCheckpoints = false,
 ): Promise<AiAnalysisPlan> {
-  return invoke<AiAnalysisPlan>("plan_ai_analysis", { path, config, force });
+  return invoke<AiAnalysisPlan>("plan_ai_analysis", {
+    path,
+    config,
+    force,
+    resumeCheckpoints,
+  });
 }
 
 export async function analyzeMediaFolder(
   path: string,
   config: AiConfig,
   force = false,
+  resumeCheckpoints = false,
 ): Promise<AiIndexReport> {
-  return invoke<AiIndexReport>("analyze_media_folder", { path, config, force });
+  return invoke<AiIndexReport>("analyze_media_folder", {
+    path,
+    config,
+    force,
+    resumeCheckpoints,
+  });
 }
 
 export async function cancelAiAnalysis(): Promise<boolean> {
