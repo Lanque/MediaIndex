@@ -82,6 +82,13 @@ struct BudgetState {
     reservations: HashMap<String, u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UsageAssessment {
+    calculated_cost_usd: Option<f64>,
+    lower_bound_usd: Option<f64>,
+    usage_status: &'static str,
+}
+
 impl AiBudgetGate {
     pub fn new(limit_usd: f64) -> Option<Self> {
         let limit_micros = usd_to_micros(limit_usd)?;
@@ -336,7 +343,7 @@ impl AiUsageRecorder {
         let event = state.pending.values_mut().find(|event| {
             event.operation == operation
                 && event.model == model
-                && event.usage_status == "not_reported"
+                && matches!(event.usage_status.as_str(), "not_reported" | "partial" | "estimated")
                 && request_id
                     .is_none_or(|request_id| event.request_id.as_deref() == Some(request_id))
         });
@@ -396,7 +403,7 @@ impl AiUsageEventHandle {
     ) {
         if let Ok(mut state) = self.state.lock() {
             if let Some(event) = state.pending.get_mut(&self.local_event_id) {
-                let calculated_cost_usd = update_reported_usage(
+                let assessment = update_reported_usage(
                     event,
                     provider,
                     input_tokens,
@@ -404,11 +411,15 @@ impl AiUsageEventHandle {
                     audio_seconds,
                     estimated_audio_seconds,
                 );
-                if let (Some(budget_gate), Some(_reserved_micros), Some(actual_cost_usd)) = (
-                    self.budget_gate.as_ref(),
-                    self.reserved_micros,
-                    calculated_cost_usd,
-                ) {
+                let settlement_cost_usd = assessment.calculated_cost_usd.or_else(|| {
+                    let lower_bound_usd = assessment.lower_bound_usd?;
+                    let lower_bound_micros = usd_to_nonnegative_micros(lower_bound_usd)?;
+                    (lower_bound_micros > self.reserved_micros?)
+                        .then(|| lower_bound_micros as f64 / 1_000_000.0)
+                });
+                if let (Some(budget_gate), Some(actual_cost_usd)) =
+                    (self.budget_gate.as_ref(), settlement_cost_usd)
+                {
                     if !self.reservation_adjusted.swap(true, Ordering::AcqRel) {
                         budget_gate.settle(&self.local_event_id, Some(actual_cost_usd));
                         event.budget_adjustment_usd = event
@@ -441,27 +452,28 @@ fn update_reported_usage(
     output_tokens: Option<u64>,
     audio_seconds: Option<f64>,
     estimated_audio_seconds: Option<f64>,
-) -> Option<f64> {
+) -> UsageAssessment {
+    let input_tokens = input_tokens.or(event.reported_input_tokens);
+    let output_tokens = output_tokens.or(event.reported_output_tokens);
+    let audio_seconds = valid_audio_seconds(audio_seconds).or(event.reported_audio_seconds);
+    let estimated_audio_seconds =
+        valid_audio_seconds(estimated_audio_seconds).or(event.estimated_audio_seconds);
     event.reported_input_tokens = input_tokens;
     event.reported_output_tokens = output_tokens;
     event.reported_audio_seconds = audio_seconds;
     event.estimated_audio_seconds = estimated_audio_seconds;
-    let effective_audio_seconds = audio_seconds.or(estimated_audio_seconds);
-    let calculated_cost_usd = reported_cost(
+    let assessment = reported_cost(
         provider,
         &event.operation,
         &event.model,
         input_tokens,
         output_tokens,
-        effective_audio_seconds,
+        audio_seconds,
+        estimated_audio_seconds,
     );
-    event.calculated_cost_usd = calculated_cost_usd;
-    if input_tokens.is_some() || output_tokens.is_some() || audio_seconds.is_some() {
-        event.usage_status = "reported".to_owned();
-    } else if estimated_audio_seconds.is_some() {
-        event.usage_status = "estimated".to_owned();
-    }
-    calculated_cost_usd
+    event.calculated_cost_usd = assessment.calculated_cost_usd;
+    event.usage_status = assessment.usage_status.to_owned();
+    assessment
 }
 
 fn usd_to_micros(value: f64) -> Option<u64> {
@@ -481,28 +493,90 @@ fn reported_cost(
     model: &str,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
-    audio_seconds: Option<f64>,
-) -> Option<f64> {
-    let input_tokens = input_tokens.unwrap_or_default();
-    let output_tokens = output_tokens.unwrap_or_default();
+    reported_audio_seconds: Option<f64>,
+    estimated_audio_seconds: Option<f64>,
+) -> UsageAssessment {
     match operation {
         "OpenAI vision" | "Gemini vision" => {
-            let pricing = pricing::vision_pricing(provider, model)?;
-            Some(
-                input_tokens as f64 * pricing.input_usd_per_million.unwrap_or_default()
-                    / 1_000_000.0
-                    + output_tokens as f64 * pricing.output_usd_per_million.unwrap_or_default()
-                        / 1_000_000.0,
-            )
+            let pricing = pricing::vision_pricing(provider, model);
+            let input_cost = input_tokens
+                .zip(pricing.and_then(|pricing| pricing.input_usd_per_million))
+                .map(|(tokens, rate)| tokens as f64 * rate / 1_000_000.0);
+            let output_cost = output_tokens
+                .zip(pricing.and_then(|pricing| pricing.output_usd_per_million))
+                .map(|(tokens, rate)| tokens as f64 * rate / 1_000_000.0);
+            UsageAssessment {
+                calculated_cost_usd: input_tokens.zip(output_tokens).and_then(|_| {
+                    input_cost
+                        .zip(output_cost)
+                        .map(|(input, output)| input + output)
+                }),
+                lower_bound_usd: add_known_costs(input_cost, output_cost),
+                usage_status: usage_status_for_tokens(
+                    input_tokens.is_some() && output_tokens.is_some(),
+                    input_tokens.is_some() || output_tokens.is_some(),
+                ),
+            }
         }
         "OpenAI embedding" | "Gemini embedding" => {
-            Some(input_tokens as f64 * pricing::embedding_pricing(provider, model)? / 1_000_000.0)
+            let input_cost = input_tokens
+                .zip(pricing::embedding_pricing(provider, model))
+                .map(|(tokens, rate)| tokens as f64 * rate / 1_000_000.0);
+            UsageAssessment {
+                calculated_cost_usd: input_cost,
+                lower_bound_usd: input_cost,
+                usage_status: usage_status_for_tokens(
+                    input_tokens.is_some(),
+                    input_tokens.is_some() || output_tokens.is_some(),
+                ),
+            }
         }
-        "OpenAI speech transcription" => Some(
-            audio_seconds.unwrap_or_default() / 60.0
-                * pricing::transcription_pricing(provider, model)?,
-        ),
-        _ => None,
+        "OpenAI speech transcription" => {
+            let audio_seconds = reported_audio_seconds.or(estimated_audio_seconds);
+            let audio_cost = audio_seconds
+                .zip(pricing::transcription_pricing(provider, model))
+                .map(|(seconds, rate)| seconds / 60.0 * rate);
+            UsageAssessment {
+                calculated_cost_usd: audio_cost,
+                lower_bound_usd: audio_cost,
+                usage_status: if reported_audio_seconds.is_some() {
+                    "reported"
+                } else if estimated_audio_seconds.is_some() {
+                    "estimated"
+                } else if input_tokens.is_some() || output_tokens.is_some() {
+                    "partial"
+                } else {
+                    "not_reported"
+                },
+            }
+        }
+        _ => UsageAssessment {
+            calculated_cost_usd: None,
+            lower_bound_usd: None,
+            usage_status: "not_reported",
+        },
+    }
+}
+
+fn valid_audio_seconds(value: Option<f64>) -> Option<f64> {
+    value.filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+}
+
+fn add_known_costs(first: Option<f64>, second: Option<f64>) -> Option<f64> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first + second),
+        (Some(cost), None) | (None, Some(cost)) => Some(cost),
+        (None, None) => None,
+    }
+}
+
+fn usage_status_for_tokens(complete: bool, any: bool) -> &'static str {
+    if complete {
+        "reported"
+    } else if any {
+        "partial"
+    } else {
+        "not_reported"
     }
 }
 
@@ -575,6 +649,119 @@ mod tests {
     }
 
     #[test]
+    fn missing_vision_usage_keeps_the_entire_request_reserve() {
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
+        let handle = recorder
+            .begin_reserved_request("OpenAI vision", "gpt-5.6-luna", 1, Some(0.6))
+            .expect("vision request should reserve its cost");
+
+        handle.record_reported_usage(recorder.provider_name(), None, None, None, None);
+        handle.finish();
+
+        assert!((recorder.reserved_budget_usd(Some(1.0)).unwrap() - 0.6).abs() < 0.000_001);
+        let event = recorder
+            .drain()
+            .pop()
+            .expect("usage event should be available");
+        assert_eq!(event.usage_status, "not_reported");
+        assert_eq!(event.calculated_cost_usd, None);
+    }
+
+    #[test]
+    fn partial_vision_usage_keeps_the_entire_request_reserve() {
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
+        let handle = recorder
+            .begin_reserved_request("OpenAI vision", "gpt-5.6-luna", 1, Some(0.6))
+            .expect("vision request should reserve its cost");
+
+        handle.record_reported_usage(recorder.provider_name(), Some(1_000), None, None, None);
+        handle.finish();
+
+        assert!((recorder.reserved_budget_usd(Some(1.0)).unwrap() - 0.6).abs() < 0.000_001);
+        let event = recorder
+            .drain()
+            .pop()
+            .expect("usage event should be available");
+        assert_eq!(event.usage_status, "partial");
+        assert_eq!(event.calculated_cost_usd, None);
+    }
+
+    #[test]
+    fn missing_embedding_input_keeps_the_entire_request_reserve() {
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
+        let handle = recorder
+            .begin_reserved_request(
+                "OpenAI embedding",
+                "text-embedding-3-small",
+                1,
+                Some(0.6),
+            )
+            .expect("embedding request should reserve its cost");
+
+        handle.record_reported_usage(recorder.provider_name(), None, Some(1_000), None, None);
+        handle.finish();
+
+        assert!((recorder.reserved_budget_usd(Some(1.0)).unwrap() - 0.6).abs() < 0.000_001);
+        let event = recorder.drain().pop().expect("usage event should be available");
+        assert_eq!(event.usage_status, "partial");
+        assert_eq!(event.calculated_cost_usd, None);
+    }
+
+    #[test]
+    fn complete_zero_vision_usage_releases_the_request_reserve() {
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
+        let handle = recorder
+            .begin_reserved_request("OpenAI vision", "gpt-5.6-luna", 1, Some(0.6))
+            .expect("vision request should reserve its cost");
+
+        handle.record_reported_usage(recorder.provider_name(), Some(0), Some(0), None, None);
+        handle.finish();
+
+        assert_eq!(recorder.reserved_budget_usd(Some(1.0)), Some(0.0));
+        let event = recorder
+            .drain()
+            .pop()
+            .expect("usage event should be available");
+        assert_eq!(event.usage_status, "reported");
+        assert_eq!(event.calculated_cost_usd, Some(0.0));
+    }
+
+    #[test]
+    fn partial_usage_charges_a_known_lower_bound_when_it_exceeds_the_reserve() {
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(10.0).expect("valid budget should create a gate"));
+        let handle = recorder
+            .begin_reserved_request("OpenAI vision", "gpt-5.6-luna", 1, Some(0.01))
+            .expect("vision request should reserve its cost");
+
+        handle.record_reported_usage(
+            recorder.provider_name(),
+            Some(100_000_000),
+            None,
+            None,
+            None,
+        );
+        handle.finish();
+
+        assert!(recorder.reserved_budget_usd(Some(10.0)).unwrap() > 10.0);
+        assert!(recorder
+            .begin_reserved_request("OpenAI embedding", "text-embedding-3-small", 1, Some(0.01))
+            .is_none());
+        let event = recorder
+            .drain()
+            .pop()
+            .expect("usage event should be available");
+        assert_eq!(event.usage_status, "partial");
+        assert!(event
+            .budget_adjustment_usd
+            .is_some_and(|adjustment| adjustment > 0.0));
+    }
+
+    #[test]
     fn local_audio_duration_is_kept_as_an_estimate_for_budgeting() {
         let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
             .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
@@ -594,6 +781,23 @@ mod tests {
         assert_eq!(event.estimated_audio_seconds, Some(60.0));
         assert!(event.calculated_cost_usd.is_some_and(|cost| cost > 0.0));
         assert!((recorder.reserved_budget_usd(Some(1.0)).unwrap() - 0.006).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn missing_audio_duration_keeps_the_entire_request_reserve() {
+        let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
+            .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
+        let handle = recorder
+            .begin_reserved_request("OpenAI speech transcription", "whisper-1", 1, Some(0.006))
+            .expect("speech request should reserve its cost");
+
+        handle.record_reported_usage(recorder.provider_name(), None, None, None, None);
+        handle.finish();
+
+        assert!((recorder.reserved_budget_usd(Some(1.0)).unwrap() - 0.006).abs() < 0.000_001);
+        let event = recorder.drain().pop().expect("usage event should be available");
+        assert_eq!(event.usage_status, "not_reported");
+        assert_eq!(event.calculated_cost_usd, None);
     }
 
     #[test]
