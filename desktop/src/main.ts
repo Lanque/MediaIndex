@@ -1046,7 +1046,11 @@ function summarizeAiWarnings(warnings: AiIndexReport["warnings"]): string {
   const fileName = first.path.split(/[\\/]/).pop() ?? first.path;
   let reason = "temporary API error";
   const msg = first.message.toLowerCase();
-  if (msg.includes("503") || msg.includes("high demand") || msg.includes("service unavailable")) {
+  if (msg.includes("partial ai analysis") || msg.includes("partial coverage")) {
+    reason = "partial frame coverage";
+  } else if (msg.includes("unknown frame coverage") || msg.includes("coverage_unknown")) {
+    reason = "unknown frame coverage";
+  } else if (msg.includes("503") || msg.includes("high demand") || msg.includes("service unavailable")) {
     reason = "Google service demand spike (503)";
   } else if (msg.includes("429") || msg.includes("quota") || msg.includes("rate limit")) {
     reason = "Rate limit reached (429)";
@@ -1209,7 +1213,12 @@ async function openSavedAnalysis(
       : `${moments.length} contextual ${moments.length === 1 ? "range" : "ranges"}. `;
     analysisStatus.textContent = `${sampleSummary}${groups.size} model ${groups.size === 1 ? "analysis" : "analyses"} stored locally.`;
     analysisContent.innerHTML = Array.from(groups.entries())
-      .map(([model, modelMoments]) => `<section class="analysis-model-group">
+      .map(([model, modelMoments]) => {
+        const coverageStatus = modelMoments[0]?.ai_coverage_status;
+        const coverageWarning = coverageStatus && coverageStatus !== "complete"
+          ? modelMoments[0]?.ai_coverage_warning ?? "This analysis has incomplete or unverified frame coverage."
+          : "";
+        return `<section class="analysis-model-group">
         <header>
           <div>
             <span>Analysis model</span>
@@ -1217,6 +1226,7 @@ async function openSavedAnalysis(
           </div>
           <strong>${modelMoments.length} ${modelMoments.length === 1 ? "moment" : "moments"}</strong>
         </header>
+        ${coverageWarning ? `<p class="analysis-coverage-warning">${escapeHtml(coverageWarning)}</p>` : ""}
         <div class="analysis-moment-list">
           ${modelMoments
             .map((moment, index) => `<article class="analysis-moment-card">
@@ -1233,7 +1243,8 @@ async function openSavedAnalysis(
             </article>`)
             .join("")}
         </div>
-      </section>`)
+      </section>`;
+      })
       .join("");
     analysisContent.querySelectorAll<HTMLButtonElement>(".analysis-moment-preview").forEach((button) => {
       button.addEventListener("click", () => {
@@ -1262,10 +1273,29 @@ function renderResultCard(result: SearchResult, index: number): string {
   const codec = metadata?.video_codec ? metadata.video_codec.toUpperCase() : "";
   const size = formatBytes(result.size_bytes);
   const aiCount = result.ai_annotation_count ?? 0;
+  const coverageStatus = result.ai_coverage_status;
+  const incompleteCoverage = coverageStatus != null && coverageStatus !== "complete";
+  const coverageFrameSummary = incompleteCoverage && result.ai_planned_frame_count != null
+    ? `${result.ai_successful_frame_count ?? 0}/${result.ai_planned_frame_count} frames`
+    : "";
+  const coverageLabel = coverageStatus === "partial"
+    ? `AI · partial${coverageFrameSummary ? ` · ${coverageFrameSummary}` : ""}`
+    : coverageStatus === "failed"
+      ? "AI · failed"
+      : coverageStatus === "legacy" || coverageStatus === "coverage_unknown"
+        ? "AI · coverage unknown"
+        : `AI · ${aiCount} samples`;
 
-  const aiBadge = aiCount > 0
-    ? `<span class="relevance-badge badge-ai-indexed">AI · ${aiCount} samples</span>`
+  const aiBadge = aiCount > 0 && !incompleteCoverage
+    ? `<span class="relevance-badge badge-ai-indexed">${coverageLabel}</span>`
+    : incompleteCoverage
+      ? `<span class="relevance-badge badge-ai-partial">${coverageLabel}</span>`
     : `<span class="relevance-badge badge-ai-unindexed">Scan only</span>`;
+  const coverageWarning = incompleteCoverage
+    ? result.ai_coverage_warning ?? (coverageStatus === "partial"
+      ? "Some sampled frame batches failed. Run an explicit full analysis to complete coverage."
+      : "This AI result is not confirmed as complete. Run an explicit full analysis before treating it as exhaustive.")
+    : "";
 
   const metaPills = [
     resolution,
@@ -1291,6 +1321,7 @@ function renderResultCard(result: SearchResult, index: number): string {
       </div>
       <p class="video-card-folder" title="${escapeHtml(result.path)}">${escapeHtml(parentFolder)}</p>
       <div class="video-card-meta">${escapeHtml(metaPills || "Metadata unavailable")}</div>
+      ${coverageWarning ? `<p class="video-card-coverage-warning" title="${escapeHtml(coverageWarning)}">${escapeHtml(coverageWarning)}</p>` : ""}
       ${aiCount > 0 ? `<button class="analysis-disclosure-button view-ai-analysis" type="button" data-path="${escapeHtml(result.path)}" data-name="${escapeHtml(fileName)}" data-sample-count="${aiCount}" data-available="${result.available}"><span>View AI analysis</span><small>${aiCount} saved ${aiCount === 1 ? "sample" : "samples"}</small></button>` : ""}
     </div>
   </article>`;
@@ -1395,9 +1426,12 @@ function renderGroupedAiResults(results: SearchResult[]): string {
             <h3 title="${escapeHtml(fileName)}">${escapeHtml(fileName)}</h3>
           </div>
           <button class="icon-button open-result" type="button" data-path="${escapeHtml(bestMatch.path)}" ${bestMatch.available ? "" : "disabled"} title="Open original file" aria-label="Open original ${escapeHtml(fileName)}"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8 5h7v7M15 5 7 13"/><path d="M12 10v5H5V8h5"/></svg></button>
-        </div>
-        <p class="video-card-folder">${escapeHtml(parentFolder)}</p>
-        <p class="video-best-description">${escapeHtml(bestMatch.ai_description ?? "Matching scene")}</p>
+      </div>
+      <p class="video-card-folder">${escapeHtml(parentFolder)}</p>
+      <p class="video-best-description">${escapeHtml(bestMatch.ai_description ?? "Matching scene")}</p>
+        ${bestMatch.ai_coverage_status && bestMatch.ai_coverage_status !== "complete"
+          ? `<p class="video-card-coverage-warning">${escapeHtml(bestMatch.ai_coverage_warning ?? "Search result comes from incomplete or unverified frame coverage.")}</p>`
+          : ""}
         <button class="analysis-disclosure-button view-ai-analysis" type="button" data-path="${escapeHtml(bestMatch.path)}" data-name="${escapeHtml(fileName)}" data-sample-count="${bestMatch.ai_annotation_count ?? 0}" data-available="${bestMatch.available}"><span>Full description &amp; analysis</span><small>All saved context</small></button>
         ${extraMoments}
       </div>
@@ -1608,6 +1642,10 @@ async function searchAiLibrary(): Promise<void> {
       end_timestamp_ms: match.end_timestamp_ms,
       ai_description: match.description,
       match_score: match.score,
+      ai_coverage_status: match.ai_coverage_status,
+      ai_coverage_warning: match.ai_coverage_warning,
+      ai_successful_frame_count: match.ai_successful_frame_count,
+      ai_planned_frame_count: match.ai_planned_frame_count,
       metadata: null,
     }));
     renderResults(displayResults, true);
@@ -1652,19 +1690,29 @@ async function analyzeLibraryWithAi(): Promise<void> {
       forceReanalysis,
     );
 
-    if (!forceReanalysis && plan.analyze_file_count === 0 && plan.already_analyzed_file_count > 0) {
+    const coverageReviewCount = plan.partial_file_count + plan.coverage_unknown_file_count;
+    if (!forceReanalysis && (plan.requires_explicit_coverage_confirmation || (plan.analyze_file_count === 0 && plan.already_analyzed_file_count > 0))) {
+      const existingSummary = plan.already_analyzed_file_count > 0
+        ? `There are ${plan.already_analyzed_file_count} saved ${plan.model} analyses in this folder.`
+        : "There are no complete analyses ready for this configuration yet.";
+      const coverageSummary = coverageReviewCount > 0
+        ? `\n${plan.partial_file_count} clips have partial coverage and ${plan.coverage_unknown_file_count} have unknown or legacy coverage. They are excluded from paid work until you explicitly choose a full reanalysis.`
+        : "";
       const reanalyze = window.confirm(
-        `All ${plan.already_analyzed_file_count} clips in this folder are already analyzed with ${plan.model}.\n\n` +
-          "Reanalyze them anyway? Existing moments for this model will be replaced, and cloud providers may charge for the new requests.",
+        `${existingSummary}${coverageSummary}\n\n` +
+          "Run a new full analysis for these clips now? This shows the full estimated cost next and may charge cloud providers. Choose Cancel to keep the saved results and continue only with new clips.",
       );
       if (!reanalyze) {
-        if (libraryStatus) libraryStatus.textContent = "Existing AI analysis kept";
-        if (libraryPath) libraryPath.textContent = "No API requests were sent and saved moments were not changed.";
-        if (aiSearchStatus) aiSearchStatus.textContent = "Open Analyzed archive to search the saved analysis.";
-        return;
+        if (plan.analyze_file_count === 0) {
+          if (libraryStatus) libraryStatus.textContent = "Existing AI analysis kept";
+          if (libraryPath) libraryPath.textContent = "No API requests were sent and saved moments were not changed.";
+          if (aiSearchStatus) aiSearchStatus.textContent = "Open Analyzed archive to search the saved analysis.";
+          return;
+        }
+      } else {
+        forceReanalysis = true;
+        plan = await tauriApi.planAiAnalysis(selectedLibraryPath, config, true);
       }
-      forceReanalysis = true;
-      plan = await tauriApi.planAiAnalysis(selectedLibraryPath, config, true);
     }
 
     const replacesExisting = forceReanalysis && plan.already_analyzed_file_count > 0;
@@ -1672,6 +1720,9 @@ async function analyzeLibraryWithAi(): Promise<void> {
       const action = replacesExisting ? "reanalyze" : "analyze";
       const skipped = plan.skipped_file_count
         ? `\n${plan.skipped_file_count} already indexed clips will be skipped.`
+        : "";
+      const excludedCoverage = !forceReanalysis && coverageReviewCount > 0
+        ? `\n${coverageReviewCount} clips with partial or unknown coverage remain excluded; choose Reanalyze to include them in a new full paid attempt.`
         : "";
       const replacementWarning = replacesExisting
         ? `\n\nWarning: saved ${plan.model} moments for ${plan.already_analyzed_file_count} clips will be replaced.`
@@ -1692,7 +1743,7 @@ async function analyzeLibraryWithAi(): Promise<void> {
       }
       const confirmed = window.confirm(
         `${aiProviderLabel(config.provider)} will ${action} ${plan.analyze_file_count} unique videos.\n\n` +
-          `${requestSummary}\n${analysisCostSummary(plan)}${skipped}${replacementWarning}\n\n${analysisTimeEstimate(plan, config)}\n\nContinue?`,
+          `${requestSummary}\n${analysisCostSummary(plan)}${skipped}${excludedCoverage}${replacementWarning}\n\n${analysisTimeEstimate(plan, config)}\n\nContinue?`,
       );
       if (!confirmed) {
         if (libraryStatus) libraryStatus.textContent = "AI analysis not started";
@@ -1718,7 +1769,9 @@ async function analyzeLibraryWithAi(): Promise<void> {
       config,
       forceReanalysis,
     );
-    if (report.analyzed_file_count > 0) savedAnalysisCache.clear();
+    if (report.annotation_count > 0 || report.partial_file_count > 0 || report.failed_file_count > 0) {
+      savedAnalysisCache.clear();
+    }
     const elapsedMs = Date.now() - analysisStartedAt;
     if (!report.cancelled && report.analyzed_file_count > 0) {
       recordAnalysisTiming(config, plan, elapsedMs);
@@ -1735,15 +1788,26 @@ async function analyzeLibraryWithAi(): Promise<void> {
     } else {
       const warningSuffix = report.warnings.length ? ` · ${report.warnings.length} warnings` : "";
       const warningDetails = summarizeAiWarnings(report.warnings);
+      const partialSuffix = report.partial_file_count
+        ? ` · ${report.partial_file_count} partial`
+        : "";
+      const failedSuffix = report.failed_file_count
+        ? ` · ${report.failed_file_count} failed`
+        : "";
+      const progressLabel = report.partial_file_count > 0
+        ? "Analysis complete with partial coverage"
+        : report.warnings.length
+          ? "Analysis complete with warnings"
+          : "Analysis complete";
       showAiProgress(
         100,
-        report.warnings.length ? "Analysis complete with warnings" : "Analysis complete",
+        progressLabel,
       );
       const skippedSuffix = report.skipped_file_count
         ? ` · ${report.skipped_file_count} already ready`
         : "";
       if (libraryStatus)
-        libraryStatus.textContent = `AI indexed ${report.analyzed_file_count} clips${skippedSuffix}${warningSuffix}`;
+        libraryStatus.textContent = `AI indexed ${report.analyzed_file_count} clips${partialSuffix}${failedSuffix}${skippedSuffix}${warningSuffix}`;
       if (libraryPath) {
         libraryPath.textContent =
           report.analyzed_file_count === 0 && report.skipped_file_count > 0

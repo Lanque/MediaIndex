@@ -65,6 +65,9 @@ struct AiAnalysisPlan {
     analyze_file_count: u64,
     skipped_file_count: u64,
     already_analyzed_file_count: u64,
+    partial_file_count: u64,
+    coverage_unknown_file_count: u64,
+    requires_explicit_coverage_confirmation: bool,
     max_frames_per_file: u64,
     max_sampled_frames: u64,
     max_vision_requests: u64,
@@ -239,10 +242,18 @@ fn plan_ai_analysis(
     }
     ensure_ai_identity_verified(&indexed_files)?;
     let model = settings.model_namespace();
+    let settings_fingerprint = settings.analysis_settings_fingerprint();
     let total_file_count = indexed_files.len() as u64;
     let already_analyzed_file_count = count_already_analyzed(&index, &indexed_files, &model)?;
-    let (files, skipped_file_count) =
-        select_ai_files(&index, indexed_files, &model, force.unwrap_or(false))?;
+    let selection = select_ai_files(
+        &index,
+        indexed_files,
+        &model,
+        &settings_fingerprint,
+        force.unwrap_or(false),
+    )?;
+    let files = selection.files;
+    let skipped_file_count = selection.skipped_file_count;
     let analyze_file_count = files.len() as u64;
     let max_frames_per_file = settings.max_frames_per_file() as u64;
     let vision_batch_size = settings.vision_batch_size() as u64;
@@ -307,6 +318,13 @@ fn plan_ai_analysis(
         analyze_file_count,
         skipped_file_count,
         already_analyzed_file_count,
+        partial_file_count: selection.partial_file_count,
+        coverage_unknown_file_count: selection.coverage_unknown_file_count,
+        requires_explicit_coverage_confirmation: requires_explicit_coverage_confirmation(
+            force.unwrap_or(false),
+            selection.partial_file_count,
+            selection.coverage_unknown_file_count,
+        ),
         max_frames_per_file,
         max_sampled_frames: analyze_file_count.saturating_mul(max_frames_per_file),
         max_vision_requests: analyze_file_count.saturating_mul(requests_per_file),
@@ -345,7 +363,16 @@ fn analyze_media_folder_blocking(
     ensure_ai_identity_verified(&indexed_files)?;
 
     let provider = settings.model_namespace();
-    let (files, skipped_file_count) = select_ai_files(&index, indexed_files, &provider, force)?;
+    let settings_fingerprint = settings.analysis_settings_fingerprint();
+    let selection = select_ai_files(
+        &index,
+        indexed_files,
+        &provider,
+        &settings_fingerprint,
+        force,
+    )?;
+    let files = selection.files;
+    let skipped_file_count = selection.skipped_file_count;
     let run_id = new_ai_run_id();
     let recorder = usage::AiUsageRecorder::new(
         run_id.clone(),
@@ -384,6 +411,8 @@ fn analyze_media_folder_blocking(
         analyzed_file_count: 0,
         skipped_file_count,
         annotation_count: 0,
+        partial_file_count: 0,
+        failed_file_count: 0,
         cancelled: false,
         warnings: Vec::new(),
     };
@@ -464,8 +493,16 @@ fn analyze_media_folder_blocking(
 
         while let Ok((file_index, file, result)) = receiver.recv() {
             persist_ai_usage_events(&mut index, &usage_recorder)?;
-            let outcome =
-                persist_ai_result(&mut index, &mut report, &file, result, &persisted_files)?;
+            let outcome = persist_ai_result(
+                &mut index,
+                &mut report,
+                &file,
+                &provider,
+                &run_id,
+                &settings_fingerprint,
+                result,
+                &persisted_files,
+            )?;
             let percent = update_overall_progress(&file_progress, file_index, 100);
             match outcome {
                 AiResultOutcome::Committed => emit_ai_progress(
@@ -486,6 +523,15 @@ fn analyze_media_folder_blocking(
                     percent,
                     "Clip finished with a warning",
                 ),
+                AiResultOutcome::Partial => emit_ai_progress(
+                    &app,
+                    persisted_files.load(Ordering::Relaxed),
+                    total_files,
+                    file.path,
+                    provider.clone(),
+                    percent,
+                    "Clip saved with partial coverage",
+                ),
                 AiResultOutcome::Cancelled => {}
             }
         }
@@ -497,7 +543,7 @@ fn analyze_media_folder_blocking(
     report.cancelled |= control.is_cancelled();
     let run_status = match &worker_result {
         Ok(()) if report.cancelled => "cancelled",
-        Ok(()) if report.warnings.is_empty() => "completed",
+        Ok(()) if report.warnings.is_empty() && report.partial_file_count == 0 => "completed",
         Ok(()) => "partial",
         Err(_) => "failed",
     };
@@ -568,6 +614,7 @@ fn validate_ai_budget(plan: &AiAnalysisPlan) -> Result<(), String> {
 #[derive(Debug, PartialEq, Eq)]
 enum AiResultOutcome {
     Committed,
+    Partial,
     Warning,
     Cancelled,
 }
@@ -576,24 +623,64 @@ fn persist_ai_result(
     index: &mut local_index::SqliteIndex,
     report: &mut ai::AiIndexReport,
     file: &local_index::IndexedFile,
-    result: Result<Vec<ai::AiAnnotation>, String>,
+    model: &str,
+    run_id: &str,
+    settings_fingerprint: &str,
+    result: Result<ai::AiFileAnalysisResult, String>,
     persisted_files: &AtomicU64,
 ) -> Result<AiResultOutcome, String> {
     match result {
-        Ok(annotations) => {
-            index
-                .replace_ai_annotations(&file.content_hash, &annotations)
+        Ok(analysis) => {
+            let stored_annotation_count = index
+                .record_ai_analysis_result(
+                    &file.content_hash,
+                    model,
+                    settings_fingerprint,
+                    Some(run_id),
+                    &analysis,
+                )
                 .map_err(|error| error.to_string())?;
-            report.analyzed_file_count += 1;
-            report.annotation_count += annotations.len() as u64;
+            report.annotation_count += stored_annotation_count;
             persisted_files.fetch_add(1, Ordering::Relaxed);
-            Ok(AiResultOutcome::Committed)
+            match analysis.status {
+                ai::AiFileAnalysisStatus::Complete => {
+                    report.analyzed_file_count += 1;
+                    Ok(AiResultOutcome::Committed)
+                }
+                ai::AiFileAnalysisStatus::Partial => {
+                    report.partial_file_count += 1;
+                    report.warnings.push(ai::AiWarning {
+                        path: file.path.clone(),
+                        message: analysis.warning.unwrap_or_else(|| {
+                            format!(
+                                "Partial AI analysis for {}: {}/{} frames succeeded. Rerun explicitly to complete coverage.",
+                                file.path,
+                                analysis.successful_frame_count,
+                                analysis.planned_frame_count
+                            )
+                        }),
+                    });
+                    Ok(AiResultOutcome::Partial)
+                }
+                ai::AiFileAnalysisStatus::Failed => {
+                    report.failed_file_count += 1;
+                    report.warnings.push(ai::AiWarning {
+                        path: file.path.clone(),
+                        message: analysis.warning.unwrap_or_else(|| {
+                            "AI analysis failed before a complete coverage result was produced."
+                                .to_owned()
+                        }),
+                    });
+                    Ok(AiResultOutcome::Warning)
+                }
+            }
         }
         Err(error) if error == ai::AI_ANALYSIS_CANCELLED_MESSAGE => {
             report.cancelled = true;
             Ok(AiResultOutcome::Cancelled)
         }
         Err(error) => {
+            report.failed_file_count += 1;
             report.warnings.push(ai::AiWarning {
                 path: file.path.clone(),
                 message: error,
@@ -632,10 +719,13 @@ fn select_ai_files(
     index: &local_index::SqliteIndex,
     indexed_files: Vec<local_index::IndexedFile>,
     model: &str,
+    settings_fingerprint: &str,
     force: bool,
-) -> Result<(Vec<local_index::IndexedFile>, u64), String> {
+) -> Result<AiFileSelection, String> {
     let mut files = Vec::with_capacity(indexed_files.len());
     let mut skipped_file_count = 0u64;
+    let mut partial_file_count = 0u64;
+    let mut coverage_unknown_file_count = 0u64;
     for file in indexed_files {
         if !file.identity_verified {
             return Err(format!(
@@ -643,18 +733,75 @@ fn select_ai_files(
                 file.path
             ));
         }
-        let already_analyzed = file.identity_verified
-            && !force
-            && index
-                .has_ai_annotations_for_content_model(&file.content_hash, model)
-                .map_err(|error| error.to_string())?;
-        if already_analyzed {
+        let coverage_state =
+            ai_coverage_state(index, &file.content_hash, model, settings_fingerprint)?;
+        if !force && coverage_state != AiCoverageState::New {
             skipped_file_count += 1;
+            match coverage_state {
+                AiCoverageState::Partial => partial_file_count += 1,
+                AiCoverageState::CoverageUnknown => coverage_unknown_file_count += 1,
+                AiCoverageState::Complete | AiCoverageState::New => {}
+            }
         } else {
             files.push(file);
         }
     }
-    Ok((files, skipped_file_count))
+    Ok(AiFileSelection {
+        files,
+        skipped_file_count,
+        partial_file_count,
+        coverage_unknown_file_count,
+    })
+}
+
+struct AiFileSelection {
+    files: Vec<local_index::IndexedFile>,
+    skipped_file_count: u64,
+    partial_file_count: u64,
+    coverage_unknown_file_count: u64,
+}
+
+fn requires_explicit_coverage_confirmation(
+    force: bool,
+    partial_file_count: u64,
+    coverage_unknown_file_count: u64,
+) -> bool {
+    !force && partial_file_count.saturating_add(coverage_unknown_file_count) > 0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AiCoverageState {
+    New,
+    Complete,
+    Partial,
+    CoverageUnknown,
+}
+
+fn ai_coverage_state(
+    index: &local_index::SqliteIndex,
+    content_hash: &str,
+    model: &str,
+    settings_fingerprint: &str,
+) -> Result<AiCoverageState, String> {
+    if let Some(coverage) = index
+        .latest_ai_analysis_coverage(content_hash, model, settings_fingerprint)
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(match coverage.status.as_str() {
+            "complete" => AiCoverageState::Complete,
+            "partial" | "failed" => AiCoverageState::Partial,
+            _ => AiCoverageState::CoverageUnknown,
+        });
+    }
+    if index
+        .latest_ai_analysis_coverage_or_unknown(content_hash, model)
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        Ok(AiCoverageState::CoverageUnknown)
+    } else {
+        Ok(AiCoverageState::New)
+    }
 }
 
 fn count_already_analyzed(
@@ -1091,6 +1238,8 @@ mod tests {
             analyzed_file_count: 0,
             skipped_file_count: 0,
             annotation_count: 0,
+            partial_file_count: 0,
+            failed_file_count: 0,
             cancelled: false,
             warnings: Vec::new(),
         };
@@ -1109,7 +1258,17 @@ mod tests {
                 &mut index,
                 &mut report,
                 &file,
-                Ok(vec![annotation.clone()]),
+                "openai:test",
+                "test-run",
+                "test-fingerprint",
+                Ok(ai::AiFileAnalysisResult {
+                    annotations: vec![annotation.clone()],
+                    planned_frame_count: 1,
+                    successful_frame_count: 1,
+                    failed_batches: Vec::new(),
+                    status: ai::AiFileAnalysisStatus::Complete,
+                    warning: None,
+                }),
                 &persisted_files,
             )
             .expect("result should be committed"),
@@ -1126,7 +1285,17 @@ mod tests {
             &mut index,
             &mut report,
             &missing_file,
-            Ok(vec![annotation]),
+            "openai:test",
+            "test-run",
+            "test-fingerprint",
+            Ok(ai::AiFileAnalysisResult {
+                annotations: vec![annotation],
+                planned_frame_count: 1,
+                successful_frame_count: 1,
+                failed_batches: Vec::new(),
+                status: ai::AiFileAnalysisStatus::Complete,
+                warning: None,
+            }),
             &persisted_files,
         )
         .is_err());
@@ -1177,7 +1346,14 @@ mod tests {
             ready_tx
                 .send(())
                 .expect("test should observe completed work");
-            Ok::<Vec<ai::AiAnnotation>, String>(vec![completed_annotation])
+            Ok::<ai::AiFileAnalysisResult, String>(ai::AiFileAnalysisResult {
+                annotations: vec![completed_annotation],
+                planned_frame_count: 1,
+                successful_frame_count: 1,
+                failed_batches: Vec::new(),
+                status: ai::AiFileAnalysisStatus::Complete,
+                warning: None,
+            })
         });
         let next_worker_control = control.clone();
         let next_worker = std::thread::spawn(move || {
@@ -1185,7 +1361,14 @@ mod tests {
             if next_worker_control.is_cancelled() {
                 Err(ai::AI_ANALYSIS_CANCELLED_MESSAGE.to_owned())
             } else {
-                Ok(Vec::new())
+                Ok(ai::AiFileAnalysisResult {
+                    annotations: Vec::new(),
+                    planned_frame_count: 0,
+                    successful_frame_count: 0,
+                    failed_batches: Vec::new(),
+                    status: ai::AiFileAnalysisStatus::Complete,
+                    warning: None,
+                })
             }
         });
 
@@ -1203,6 +1386,8 @@ mod tests {
             analyzed_file_count: 0,
             skipped_file_count: 0,
             annotation_count: 0,
+            partial_file_count: 0,
+            failed_file_count: 0,
             cancelled: false,
             warnings: Vec::new(),
         };
@@ -1212,6 +1397,9 @@ mod tests {
                 &mut index,
                 &mut report,
                 &file,
+                "openai:test",
+                "test-run",
+                "test-fingerprint",
                 completed_result,
                 &persisted_files,
             )
@@ -1223,6 +1411,9 @@ mod tests {
                 &mut index,
                 &mut report,
                 &file,
+                "openai:test",
+                "test-run",
+                "test-fingerprint",
                 cancelled_result,
                 &persisted_files,
             )
@@ -1310,6 +1501,146 @@ mod tests {
 
         assert!(error.contains("fresh scan"));
         assert!(error.contains("unverified"));
+    }
+
+    #[test]
+    fn partial_retry_is_skipped_until_explicitly_confirmed() {
+        let mut index = local_index::SqliteIndex::open_in_memory().expect("index should open");
+        let file = local_index::IndexedFile {
+            path: "/library/partial-retry.mp4".to_owned(),
+            content_hash: "hash-partial-retry".to_owned(),
+            size_bytes: 10,
+            modified_unix_ms: None,
+            status: local_index::LocalFileStatus::Active,
+            identity_verified: true,
+        };
+        index
+            .reconcile(
+                &scanner::ScanReport {
+                    files: vec![scanner::DiscoveredFile {
+                        path: file.path.clone(),
+                        size_bytes: file.size_bytes,
+                        modified_unix_ms: file.modified_unix_ms,
+                        content_hash: file.content_hash.clone(),
+                    }],
+                    warnings: Vec::new(),
+                },
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        index
+            .record_ai_analysis_result(
+                &file.content_hash,
+                "model-a",
+                "fingerprint-a",
+                None,
+                &ai::AiFileAnalysisResult {
+                    annotations: vec![ai::AiAnnotation {
+                        timestamp_ms: 1_000,
+                        description: "Partial result".to_owned(),
+                        labels: Vec::new(),
+                        embedding: vec![1.0, 0.0],
+                        confidence: None,
+                        model: "model-a".to_owned(),
+                    }],
+                    planned_frame_count: 2,
+                    successful_frame_count: 1,
+                    failed_batches: Vec::new(),
+                    status: ai::AiFileAnalysisStatus::Partial,
+                    warning: Some("Partial coverage".to_owned()),
+                },
+            )
+            .expect("partial fixture should persist");
+
+        let selection = select_ai_files(
+            &index,
+            vec![file.clone()],
+            "model-a",
+            "fingerprint-a",
+            false,
+        )
+        .expect("selection should work");
+        assert!(selection.files.is_empty());
+        assert_eq!(selection.partial_file_count, 1);
+        assert!(requires_explicit_coverage_confirmation(
+            false,
+            selection.partial_file_count,
+            selection.coverage_unknown_file_count,
+        ));
+
+        let forced = select_ai_files(&index, vec![file], "model-a", "fingerprint-a", true)
+            .expect("forced selection should work");
+        assert_eq!(forced.files.len(), 1);
+        assert!(!requires_explicit_coverage_confirmation(true, 1, 0));
+    }
+
+    #[test]
+    fn legacy_annotations_are_not_auto_queued_for_paid_analysis() {
+        let mut index = local_index::SqliteIndex::open_in_memory().expect("index should open");
+        let file = local_index::IndexedFile {
+            path: "/library/legacy-paid.mp4".to_owned(),
+            content_hash: "hash-legacy-paid".to_owned(),
+            size_bytes: 10,
+            modified_unix_ms: None,
+            status: local_index::LocalFileStatus::Active,
+            identity_verified: true,
+        };
+        index
+            .reconcile(
+                &scanner::ScanReport {
+                    files: vec![scanner::DiscoveredFile {
+                        path: file.path.clone(),
+                        size_bytes: file.size_bytes,
+                        modified_unix_ms: file.modified_unix_ms,
+                        content_hash: file.content_hash.clone(),
+                    }],
+                    warnings: Vec::new(),
+                },
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        index
+            .replace_ai_annotations(
+                &file.content_hash,
+                &[ai::AiAnnotation {
+                    timestamp_ms: 1_000,
+                    description: "Legacy result".to_owned(),
+                    labels: Vec::new(),
+                    embedding: vec![1.0, 0.0],
+                    confidence: None,
+                    model: "model-a".to_owned(),
+                }],
+            )
+            .expect("legacy annotation should persist");
+
+        let selection = select_ai_files(
+            &index,
+            vec![file.clone()],
+            "model-a",
+            "new-settings-fingerprint",
+            false,
+        )
+        .expect("selection should work");
+        assert!(selection.files.is_empty());
+        assert_eq!(selection.coverage_unknown_file_count, 1);
+        assert!(requires_explicit_coverage_confirmation(
+            false,
+            selection.partial_file_count,
+            selection.coverage_unknown_file_count,
+        ));
+        assert_eq!(
+            select_ai_files(
+                &index,
+                vec![file],
+                "model-a",
+                "new-settings-fingerprint",
+                true,
+            )
+            .expect("forced selection should work")
+            .files
+            .len(),
+            1
+        );
     }
 
     #[test]
