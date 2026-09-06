@@ -168,6 +168,64 @@
 - Stage-wise performance instrumentation, batch-level continuation across
   audio/embedding, and precise ETA calibration remain future work.
 
+## 2026-09-06 — MI-06 local AI cost preview and release verification
+
+- Baseline: `05ae60c` (`docs: record MI-05 performance baseline`).
+- Implementation commit: `8a48a9a` (`feat: show local AI cost preview`).
+- Scope: the selected library now shows a persistent local-only AI cost
+  preview after indexing. It reports unique files, new/reused vision frames
+  and requests, configured audio duration, low/likely/high USD pricing, model
+  inputs, and budget status. The preview is refreshed after folder scans and
+  cost-affecting settings changes with a debounce and generation/path/config
+  guard, so an older planner response cannot replace a newer selection.
+- Remote provider normalization is available to the planner without runtime
+  credentials; authentication is still required by the actual paid analysis
+  path. The preview explicitly says that scanning uses no AI credits and turns
+  unknown provider pricing or legacy coverage into an actionable state.
+- `get_build_info` exposes the embedded short git SHA and build timestamp; the
+  top bar displays both in the desktop build. No provider requests or database
+  deletion were used during implementation or verification.
+
+### Checks
+
+- `cargo test --manifest-path desktop/src-tauri/Cargo.toml --offline`:
+  120 passed, 0 failed, 2 ignored (the real-media smoke test and the manual
+  MI-05 benchmark).
+- `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check`:
+  passed.
+- `npm.cmd run build`: passed (`tsc` and Vite production build).
+- `git diff --check`: passed apart from the repository's existing LF/CRLF
+  normalization warnings.
+- `npm.cmd run tauri -- build` with an isolated `CARGO_TARGET_DIR`: passed;
+  the NSIS bundle was produced successfully.
+
+### Release evidence
+
+- Fresh application:
+  `C:\Users\grego\Documents\Playground\MediaIndex\desktop\src-tauri\target\mi06-release\release\mediaindex.exe`
+  — built `2026-09-06 19:50:13 +03:00`, SHA-256
+  `2A83F35AF1CB394E417733824E16EEB40E079A665CF121F374C51D082BF8F90E`.
+- Installer:
+  `C:\Users\grego\Documents\Playground\MediaIndex\desktop\src-tauri\target\mi06-release\release\bundle\nsis\MediaIndex_0.1.0_x64-setup.exe`
+  — SHA-256
+  `187910E550D790C6BAD5F77A77A97317C48E5D32F42F26FCFC607EFCAF6A0304`.
+- The embedded marker `8a48a9a5f043` was found in the fresh EXE. The prior
+  `C:\Users\grego\Documents\Playground\MediaIndex\desktop\src-tauri\target\release\mediaindex.exe`
+  remained at `2026-09-03 15:38:48 +03:00` with SHA-256
+  `A49A187BBBA8CE4264D26305FA8934F247DD524EBC898D6497CF92A53AF5E465`.
+
+### Remaining risks
+
+- The preview is a planner-based conservative estimate, not a provider quote;
+  actual usage and retries remain subject to the existing budget gate and
+  usage reconciliation.
+- MI-06 does not yet implement stage-based performance targets, batch-level
+  continuation for audio/embeddings, whole-video coverage, or a calibrated
+  ETA. Gameplay event retrieval still needs saved annotation evidence first,
+  then HUD/killfeed/death-context coverage and budgeted dense short-clip
+  analysis; fixed five-second/start-only sampling cannot guarantee those
+  events.
+
 ## 2026-09-06 — MI-05 stage diagnostics and repeatable local benchmark
 
 - Baseline: `ecf7950` (`docs: record MI-04R plan reconciliation safeguards`).
