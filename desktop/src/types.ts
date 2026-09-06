@@ -82,9 +82,6 @@ export type AiCostEstimate = {
   vision_output_tokens: AiTokenEstimate;
   embedding_input_tokens: AiTokenEstimate;
   audio_seconds: number;
-  vision_request_reserve_usd: number | null;
-  embedding_request_reserve_usd: number | null;
-  transcription_request_reserve_usd: number | null;
   pricing_checked_at: string;
   pricing_source: string;
   budget_limit_usd: number | null;

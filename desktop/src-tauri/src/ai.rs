@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::cost;
 use crate::metadata::MediaMetadata;
 use crate::usage::{AiUsageEventHandle, AiUsageRecorder};
 
@@ -697,6 +698,14 @@ fn transcribe_openai_audio(
         "OpenAI speech transcription",
         &settings.transcription_model,
         settings.usage_recorder.as_ref(),
+        cost::transcription_request_cost(
+            settings.provider_name(),
+            &settings.transcription_model,
+            settings
+                .sample_interval_ms
+                .saturating_mul(settings.max_frames_per_file as u64)
+                .div_ceil(1_000) as f64,
+        ),
         || {
             let part = multipart::Part::bytes(audio.clone())
                 .file_name("speech.mp3")
@@ -798,6 +807,7 @@ fn validate_vision_model(client: &Client, settings: &AiSettings) -> Result<(), S
             "OpenAI vision model check",
             &settings.vision_model,
             settings.usage_recorder.as_ref(),
+            Some(0.0),
             || {
                 client
                     .get(format!("{}/models/{clean_model}", settings.base_url))
@@ -809,6 +819,7 @@ fn validate_vision_model(client: &Client, settings: &AiSettings) -> Result<(), S
             "Gemini vision model check",
             &settings.vision_model,
             settings.usage_recorder.as_ref(),
+            Some(0.0),
             || {
                 authorize_gemini(
                     client.get(format!("{}/models/{clean_model}", settings.base_url)),
@@ -821,6 +832,7 @@ fn validate_vision_model(client: &Client, settings: &AiSettings) -> Result<(), S
             "Local AI vision model check",
             &settings.vision_model,
             settings.usage_recorder.as_ref(),
+            Some(0.0),
             || {
                 client
                     .post(format!("{}/api/show", settings.base_url))
@@ -927,6 +939,7 @@ fn execute_with_retry<F>(
     operation_name: &str,
     model: &str,
     recorder: Option<&AiUsageRecorder>,
+    request_reserve_usd: Option<f64>,
     mut make_request: F,
 ) -> Result<TrackedResponse, String>
 where
@@ -937,7 +950,12 @@ where
     loop {
         attempt += 1;
         let usage_event = if let Some(recorder) = recorder {
-            match recorder.begin_reserved_request(operation_name, model, attempt as u32) {
+            match recorder.begin_reserved_request(
+                operation_name,
+                model,
+                attempt as u32,
+                request_reserve_usd,
+            ) {
                 Some(handle) => Some(handle),
                 None => {
                     recorder.record_budget_blocked(operation_name, model, attempt as u32);
@@ -1103,6 +1121,44 @@ fn extract_frames(path: &Path, settings: &AiSettings) -> Result<Vec<(u64, Vec<u8
     Ok(frames)
 }
 
+fn jpeg_dimensions(data: &[u8]) -> Option<cost::ImageDimensions> {
+    if data.get(..2) != Some(&[0xff, 0xd8]) {
+        return None;
+    }
+    let mut index = 2;
+    while index + 1 < data.len() {
+        if data[index] != 0xff {
+            index += 1;
+            continue;
+        }
+        while data.get(index) == Some(&0xff) {
+            index += 1;
+        }
+        let marker = *data.get(index)?;
+        index += 1;
+        if matches!(marker, 0xd8 | 0xd9 | 0x01 | 0xd0..=0xd7) {
+            continue;
+        }
+        let segment_length = u16::from_be_bytes([*data.get(index)?, *data.get(index + 1)?]);
+        if segment_length < 2 || index + usize::from(segment_length) > data.len() {
+            return None;
+        }
+        if matches!(
+            marker,
+            0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf
+        ) {
+            let height = u16::from_be_bytes([*data.get(index + 3)?, *data.get(index + 4)?]);
+            let width = u16::from_be_bytes([*data.get(index + 5)?, *data.get(index + 6)?]);
+            return (width > 0 && height > 0).then_some(cost::ImageDimensions {
+                width: u32::from(width),
+                height: u32::from(height),
+            });
+        }
+        index += usize::from(segment_length);
+    }
+    None
+}
+
 pub fn extract_thumbnail(
     path: &Path,
     timestamp_ms: u64,
@@ -1212,6 +1268,15 @@ fn describe_frames(
             )
         })
         .collect::<Vec<_>>();
+    let dimensions = frames
+        .iter()
+        .map(|(_, frame)| {
+            jpeg_dimensions(frame).unwrap_or(cost::ImageDimensions {
+                width: MAX_EXTRACTED_FRAME_WIDTH,
+                height: MAX_EXTRACTED_FRAME_WIDTH * 9 / 16,
+            })
+        })
+        .collect::<Vec<_>>();
     let timestamps = encoded_frames
         .iter()
         .map(|(timestamp_ms, _)| format!("{timestamp_ms} ms"))
@@ -1229,8 +1294,12 @@ fn describe_frames(
         "Analyze these ordered video frames for a general-purpose searchable media library. The frame timestamps, in order, are: {timestamps}. {library_context} Use adjacent frames as temporal context so recurring subjects stay consistent and an ongoing action or situation is understood as a sequence. Return only a JSON object with a frames array containing exactly one object per input frame, in the same order. Each frame object must contain: description (one concise factual sentence covering who or what is visible, what is happening, and the important context); entities (lowercase array of confidently recognizable fictional characters, game characters, creatures, teams, franchises, products, vehicles, landmarks, or named objects); actions (lowercase array of concrete actions and interactions); setting (short lowercase location or environment, or an empty string); situation (short lowercase event or circumstance such as conversation, ceremony, chase, battle, tutorial, performance, sports play, accident, travel, gameplay event, or an empty string); dialogue (array of exact dialogue that is visibly shown in subtitles, captions, or speech bubbles; never infer unheard audio); labels (lowercase array covering useful subjects, objects, genre, visual style, mood, shot type, and concepts); visible_text (array of exact readable words or short phrases from subtitles, signs, titles, HUD, menus, score overlays, or logos); and confidence (number from 0 to 1). Name a well-known fictional character or franchise only when distinctive visual evidence supports it; otherwise describe appearance and role precisely. Never identify a real person from their face alone—use a real person's name only when readable on-screen text establishes it. Inspect the full frame, including background details and small UI text. Add useful search synonyms only when supported by the image. Do not invent identities, actions, relationships, locations, events, audio, or text. Use empty arrays or strings when evidence is insufficient."
     );
     let text = match settings.provider {
-        AiProvider::OpenAI => describe_openai(client, &encoded_frames, &prompt, settings)?,
-        AiProvider::Gemini => describe_gemini(client, &encoded_frames, &prompt, settings)?,
+        AiProvider::OpenAI => {
+            describe_openai(client, &encoded_frames, &dimensions, &prompt, settings)?
+        }
+        AiProvider::Gemini => {
+            describe_gemini(client, &encoded_frames, &dimensions, &prompt, settings)?
+        }
         AiProvider::Local => describe_local(client, &encoded_frames, &prompt, settings)?,
     };
     parse_frame_analyses(&text)
@@ -1239,6 +1308,7 @@ fn describe_frames(
 fn describe_openai(
     client: &Client,
     encoded_frames: &[(u64, String)],
+    dimensions: &[cost::ImageDimensions],
     prompt: &str,
     settings: &AiSettings,
 ) -> Result<String, String> {
@@ -1332,6 +1402,13 @@ fn describe_openai(
         "OpenAI vision",
         &settings.vision_model,
         settings.usage_recorder.as_ref(),
+        cost::vision_request_cost(
+            settings.provider_name(),
+            &settings.vision_model,
+            dimensions,
+            cost::text_tokens_upper(prompt).saturating_add(8_192),
+            output_token_limit as u64,
+        ),
         || {
             client
                 .post(format!("{}/responses", settings.base_url))
@@ -1363,6 +1440,7 @@ fn openai_reasoning_effort(model: &str) -> Option<&'static str> {
 fn describe_gemini(
     client: &Client,
     encoded_frames: &[(u64, String)],
+    dimensions: &[cost::ImageDimensions],
     prompt: &str,
     settings: &AiSettings,
 ) -> Result<String, String> {
@@ -1388,6 +1466,13 @@ fn describe_gemini(
         "Gemini vision",
         &settings.vision_model,
         settings.usage_recorder.as_ref(),
+        cost::vision_request_cost(
+            settings.provider_name(),
+            &settings.vision_model,
+            dimensions,
+            cost::text_tokens_upper(prompt),
+            encoded_frames.len() as u64 * 640,
+        ),
         || {
             authorize_gemini(client.post(&url), settings)
                 .json(&payload)
@@ -1423,6 +1508,7 @@ fn describe_local(
         "Local AI vision",
         &settings.vision_model,
         settings.usage_recorder.as_ref(),
+        Some(0.0),
         || {
             client
                 .post(format!("{}/api/chat", settings.base_url))
@@ -1508,6 +1594,11 @@ fn create_embeddings(
                 "OpenAI embedding",
                 &settings.embedding_model,
                 settings.usage_recorder.as_ref(),
+                cost::embedding_request_cost(
+                    settings.provider_name(),
+                    &settings.embedding_model,
+                    texts.iter().map(|text| cost::text_tokens_upper(text)).sum(),
+                ),
                 || {
                     client
                         .post(format!("{}/embeddings", settings.base_url))
@@ -1546,6 +1637,7 @@ fn create_embeddings(
                 "Local AI embedding",
                 &settings.embedding_model,
                 settings.usage_recorder.as_ref(),
+                Some(0.0),
                 || {
                     client
                         .post(format!("{}/api/embed", settings.base_url))
@@ -1613,6 +1705,11 @@ fn request_single_gemini_embedding(
         "Gemini embedding",
         &settings.embedding_model,
         settings.usage_recorder.as_ref(),
+        cost::embedding_request_cost(
+            settings.provider_name(),
+            &settings.embedding_model,
+            cost::text_tokens_upper(&prepared_text),
+        ),
         || {
             authorize_gemini(client.post(&url), settings)
                 .json(&payload)
