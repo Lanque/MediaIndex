@@ -4264,6 +4264,23 @@ mod tests {
         assert_eq!(second_result.0.len(), 16);
         assert!(second_result.1.is_empty());
         assert_eq!(second_requests.load(Ordering::SeqCst), 1);
+        second_storage
+            .borrow_mut()
+            .record_ai_analysis_result(
+                "hash-checkpoint",
+                &second_settings.model_namespace(),
+                &second_fingerprint,
+                None,
+                &AiFileAnalysisResult {
+                    annotations: Vec::new(),
+                    planned_frame_count: 16,
+                    successful_frame_count: 16,
+                    failed_batches: Vec::new(),
+                    status: AiFileAnalysisStatus::Failed,
+                    warning: Some("simulated embedding failure".to_owned()),
+                },
+            )
+            .expect("downstream failure should preserve the checkpoints");
         drop(second_storage);
 
         let (third_base_url, third_requests, third_stop, third_server) =
