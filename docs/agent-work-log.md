@@ -126,3 +126,42 @@
   instrumentation, and batch continuation remain intentionally outside MI-03R.
 - The real-media OpenAI smoke test still requires a configured local video and
   FFmpeg, so it remains ignored in this environment.
+
+## 2026-09-06 — MI-04 persistent vision checkpoints and continuation
+
+- Baseline: `f2cf355` (`docs: finalize MI-03R work log reference`); ADR commit:
+  `ff89ed1` (`docs: add MI-04 vision checkpoint ADR`).
+- Implementation commits: `84eac50` (`feat: persist resumable vision
+  checkpoints`) and `24dbec9` (`feat: expose vision checkpoint continuation`).
+- Scope: migration 11 for local vision-batch checkpoints, exact content/settings/
+  version/timestamp identity, validated metadata-only reuse, SQLite-owner
+  request/acknowledgement writes, failure-before-next-batch behavior, bounded
+  retention, transactional cleanup after complete results, continuation-only
+  vision cost estimation, and explicit desktop continuation/full-reanalysis
+  choices. Audio and document embedding caching, new sampling, and parallelism
+  remain outside MI-04.
+- Checkpoint tests use a local HTTP stub and a file-backed SQLite database. The
+  tests cover restart continuation without repeating committed vision requests,
+  all-vision reuse after downstream failure, incompatible/corrupt rows,
+  failed-write ACK boundaries, checkpoint cleanup, and explicit queue selection.
+- No paid provider requests were made.
+
+### Checks
+
+- `cargo test --manifest-path desktop/src-tauri/Cargo.toml --offline`:
+  115 passed, 0 failed, 1 ignored; the ignored test requires a real video and
+  FFmpeg.
+- `npm.cmd run build`: passed.
+- `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check`: passed.
+- `git diff --check`: passed apart from the repository's existing LF/CRLF
+  normalization warnings.
+
+### Remaining risks
+
+- FFmpeg extraction still runs before checkpoint lookup, so MI-04 avoids paid
+  vision repetition but does not yet avoid frame extraction or JPEG memory cost.
+- The full production worker path still has existing per-file remote
+  parallelism; a checkpoint write failure cancels other work, while an already
+  in-flight provider request may finish and remain recorded.
+- Stage-wise performance instrumentation, batch-level continuation across
+  audio/embedding, and precise ETA calibration remain future work.
