@@ -1,4 +1,6 @@
-use crate::ai::{AiAnnotation, AiFileAnalysisResult, AiFrameBatchFailure};
+use crate::ai::{
+    AiAnnotation, AiFileAnalysisResult, AiFrameBatchFailure, AiVisionCheckpointBatch, FrameAnalysis,
+};
 use crate::metadata::MediaMetadata;
 use crate::scanner::{DiscoveredFile, ScanReport, ScanWarning};
 use crate::usage::{AiRunSpec, AiUsageEvent};
@@ -17,6 +19,7 @@ const AI_FOCUSED_SCORE_WINDOW: f32 = 0.08;
 const AI_BALANCED_SCORE_WINDOW: f32 = 0.14;
 const AI_FOCUSED_SCORE_FLOOR: f32 = 0.46;
 const AI_BALANCED_SCORE_FLOOR: f32 = 0.36;
+const MAX_AI_VISION_CHECKPOINTS: i64 = 4_096;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE media_assets (
@@ -193,10 +196,38 @@ SET coverage_id = (
 WHERE coverage_id IS NULL;
 "#;
 
+const MIGRATION_11: &str = r#"
+CREATE TABLE ai_vision_checkpoints (
+    checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_hash TEXT NOT NULL REFERENCES media_assets(content_hash),
+    settings_fingerprint TEXT NOT NULL,
+    checkpoint_version TEXT NOT NULL,
+    frame_timestamps_json TEXT NOT NULL,
+    batch_index INTEGER NOT NULL CHECK (batch_index >= 0),
+    batch_timestamps_json TEXT NOT NULL,
+    analyses_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(
+        content_hash,
+        settings_fingerprint,
+        checkpoint_version,
+        frame_timestamps_json,
+        batch_index,
+        batch_timestamps_json
+    )
+);
+
+CREATE INDEX ai_vision_checkpoints_lookup_idx
+    ON ai_vision_checkpoints(
+        content_hash, settings_fingerprint, checkpoint_version, batch_index
+    );
+"#;
+
 #[derive(Debug)]
 pub enum IndexError {
     Database(rusqlite::Error),
     Json(serde_json::Error),
+    InvalidCheckpoint(String),
 }
 
 impl Display for IndexError {
@@ -205,6 +236,9 @@ impl Display for IndexError {
             Self::Database(error) => write!(formatter, "local index database error: {error}"),
             Self::Json(error) => {
                 write!(formatter, "cannot encode or decode media metadata: {error}")
+            }
+            Self::InvalidCheckpoint(error) => {
+                write!(formatter, "invalid AI vision checkpoint: {error}")
             }
         }
     }
@@ -370,6 +404,12 @@ pub struct AiAnalysisCoverage {
     pub successful_frame_count: u64,
     pub failed_batches: Vec<AiFrameBatchFailure>,
     pub warning: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AiVisionCheckpointSummary {
+    pub reusable_frame_count: u64,
+    pub reusable_batch_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -606,9 +646,10 @@ impl SqliteIndex {
             .query_row(
                 "SELECT metadata_json FROM media_assets WHERE content_hash = ?1",
                 params![content_hash],
-                |row| row.get(0),
+                |row| row.get::<_, Option<String>>(0),
             )
-            .optional()?;
+            .optional()?
+            .flatten();
         json.map(|value| serde_json::from_str(&value))
             .transpose()
             .map_err(Into::into)
@@ -785,8 +826,179 @@ impl SqliteIndex {
         } else {
             0
         };
+        if result.status.as_str() == "complete" {
+            transaction.execute(
+                "DELETE FROM ai_vision_checkpoints
+                 WHERE content_hash = ?1 AND settings_fingerprint = ?2",
+                params![content_hash, settings_fingerprint],
+            )?;
+        }
         transaction.commit()?;
         Ok(stored_annotation_count)
+    }
+
+    pub(crate) fn load_ai_vision_checkpoints(
+        &self,
+        content_hash: &str,
+        settings_fingerprint: &str,
+        checkpoint_version: &str,
+        frame_timestamps: &[u64],
+        batch_size: usize,
+    ) -> Result<Vec<AiVisionCheckpointBatch>, IndexError> {
+        if frame_timestamps.is_empty() || batch_size == 0 {
+            return Ok(Vec::new());
+        }
+        let frame_timestamps_json = serde_json::to_string(frame_timestamps)?;
+        let mut statement = self.connection.prepare(
+            "SELECT batch_index, batch_timestamps_json, analyses_json
+             FROM ai_vision_checkpoints
+             WHERE content_hash = ?1
+               AND settings_fingerprint = ?2
+               AND checkpoint_version = ?3
+               AND frame_timestamps_json = ?4
+             ORDER BY batch_index",
+        )?;
+        let rows = statement.query_map(
+            params![
+                content_hash,
+                settings_fingerprint,
+                checkpoint_version,
+                frame_timestamps_json,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        let expected_batches = frame_timestamps
+            .chunks(batch_size)
+            .map(|batch| batch.to_vec())
+            .collect::<Vec<_>>();
+        let mut checkpoints = Vec::new();
+        for row in rows {
+            let (batch_index, batch_timestamps_json, analyses_json) = row?;
+            let Ok(batch_index) = usize::try_from(batch_index) else {
+                continue;
+            };
+            let Some(expected_timestamps) = expected_batches.get(batch_index) else {
+                continue;
+            };
+            let Ok(batch_timestamps) = serde_json::from_str::<Vec<u64>>(&batch_timestamps_json)
+            else {
+                continue;
+            };
+            if batch_timestamps != *expected_timestamps {
+                continue;
+            }
+            let Ok(analyses) = serde_json::from_str::<Vec<FrameAnalysis>>(&analyses_json) else {
+                continue;
+            };
+            let Some(analyses) =
+                crate::ai::validate_checkpoint_analyses(analyses, expected_timestamps.len())
+            else {
+                continue;
+            };
+            if checkpoints
+                .iter()
+                .any(|checkpoint: &AiVisionCheckpointBatch| checkpoint.batch_index == batch_index)
+            {
+                continue;
+            }
+            checkpoints.push(AiVisionCheckpointBatch {
+                batch_index,
+                frame_timestamps: frame_timestamps.to_vec(),
+                batch_timestamps,
+                analyses,
+            });
+        }
+        Ok(checkpoints)
+    }
+
+    pub(crate) fn ai_vision_checkpoint_summary(
+        &self,
+        content_hash: &str,
+        settings_fingerprint: &str,
+        checkpoint_version: &str,
+        frame_timestamps: &[u64],
+        batch_size: usize,
+    ) -> Result<AiVisionCheckpointSummary, IndexError> {
+        let checkpoints = self.load_ai_vision_checkpoints(
+            content_hash,
+            settings_fingerprint,
+            checkpoint_version,
+            frame_timestamps,
+            batch_size,
+        )?;
+        Ok(AiVisionCheckpointSummary {
+            reusable_frame_count: checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.analyses.len() as u64)
+                .sum(),
+            reusable_batch_count: checkpoints.len() as u64,
+        })
+    }
+
+    pub(crate) fn store_ai_vision_checkpoint(
+        &mut self,
+        content_hash: &str,
+        settings_fingerprint: &str,
+        checkpoint_version: &str,
+        checkpoint: &AiVisionCheckpointBatch,
+    ) -> Result<(), IndexError> {
+        if checkpoint.frame_timestamps.is_empty() || checkpoint.batch_timestamps.is_empty() {
+            return Err(IndexError::InvalidCheckpoint(
+                "a checkpoint batch must contain at least one timestamp".to_owned(),
+            ));
+        }
+        if checkpoint.batch_timestamps.len() != checkpoint.analyses.len() {
+            return Err(IndexError::InvalidCheckpoint(format!(
+                "checkpoint batch {} contains {} analyses for {} timestamps",
+                checkpoint.batch_index,
+                checkpoint.analyses.len(),
+                checkpoint.batch_timestamps.len()
+            )));
+        }
+        let frame_timestamps_json = serde_json::to_string(&checkpoint.frame_timestamps)?;
+        let batch_timestamps_json = serde_json::to_string(&checkpoint.batch_timestamps)?;
+        let analyses_json = serde_json::to_string(&checkpoint.analyses)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO ai_vision_checkpoints(
+                content_hash, settings_fingerprint, checkpoint_version,
+                frame_timestamps_json, batch_index, batch_timestamps_json,
+                analyses_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(
+                content_hash, settings_fingerprint, checkpoint_version,
+                frame_timestamps_json, batch_index, batch_timestamps_json
+            ) DO UPDATE SET
+                analyses_json = excluded.analyses_json,
+                created_at = CURRENT_TIMESTAMP",
+            params![
+                content_hash,
+                settings_fingerprint,
+                checkpoint_version,
+                frame_timestamps_json,
+                checkpoint.batch_index as i64,
+                batch_timestamps_json,
+                analyses_json,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM ai_vision_checkpoints
+             WHERE checkpoint_id IN (
+                 SELECT checkpoint_id
+                 FROM ai_vision_checkpoints
+                 ORDER BY checkpoint_id DESC
+                 LIMIT -1 OFFSET ?1
+             )",
+            params![MAX_AI_VISION_CHECKPOINTS],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn latest_ai_analysis_coverage(
@@ -1581,6 +1793,7 @@ impl SqliteIndex {
             (8_i64, MIGRATION_8),
             (9_i64, MIGRATION_9),
             (10_i64, MIGRATION_10),
+            (11_i64, MIGRATION_11),
         ] {
             let applied: Option<i64> = connection
                 .query_row(
@@ -2133,8 +2346,9 @@ fn path_key(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::AiFileAnalysisStatus;
+    use crate::ai::{AiFileAnalysisStatus, AiVisionCheckpointBatch, FrameAnalysis};
     use crate::scanner::{DiscoveredFile, ScanReport};
+    use rusqlite::params;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2202,12 +2416,38 @@ mod tests {
         ))
     }
 
+    fn checkpoint_batch(
+        batch_index: usize,
+        frame_timestamps: &[u64],
+        batch_timestamps: &[u64],
+    ) -> AiVisionCheckpointBatch {
+        AiVisionCheckpointBatch {
+            batch_index,
+            frame_timestamps: frame_timestamps.to_vec(),
+            batch_timestamps: batch_timestamps.to_vec(),
+            analyses: batch_timestamps
+                .iter()
+                .map(|timestamp| FrameAnalysis {
+                    description: format!("Frame at {timestamp} ms"),
+                    labels: vec!["fixture".to_owned()],
+                    visible_text: Vec::new(),
+                    entities: Vec::new(),
+                    actions: Vec::new(),
+                    dialogue: Vec::new(),
+                    setting: Some("test scene".to_owned()),
+                    situation: Some("testing".to_owned()),
+                    confidence: Some(0.9),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn creates_a_versioned_schema_and_is_idempotent() {
         let mut index = SqliteIndex::open_in_memory().expect("index should open");
         assert_eq!(
             index.schema_version().expect("version should be readable"),
-            10
+            11
         );
 
         let first = index
@@ -2237,6 +2477,185 @@ mod tests {
         assert_eq!(
             index.active_file_count().expect("active count should work"),
             1
+        );
+    }
+
+    #[test]
+    fn vision_checkpoints_require_matching_identity_and_valid_complete_batches() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file(
+                    "/library/checkpoint-validation.mp4",
+                    "hash-validation",
+                )]),
+                &HashMap::new(),
+            )
+            .expect("checkpoint asset should persist");
+        let frame_timestamps = (0..8).map(|index| index * 1_000).collect::<Vec<_>>();
+        let batch_timestamps = frame_timestamps[..4].to_vec();
+        index
+            .store_ai_vision_checkpoint(
+                "hash-validation",
+                "fingerprint-a",
+                "checkpoint-v1",
+                &checkpoint_batch(0, &frame_timestamps, &batch_timestamps),
+            )
+            .expect("valid checkpoint should persist");
+        index
+            .connection
+            .execute(
+                "INSERT INTO ai_vision_checkpoints(
+                    content_hash, settings_fingerprint, checkpoint_version,
+                    frame_timestamps_json, batch_index, batch_timestamps_json, analyses_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "hash-validation",
+                    "fingerprint-a",
+                    "checkpoint-v1",
+                    serde_json::to_string(&frame_timestamps).expect("timestamps should encode"),
+                    1_i64,
+                    serde_json::to_string(&frame_timestamps[4..]).expect("batch should encode"),
+                    "not-json"
+                ],
+            )
+            .expect("corrupt fixture should persist");
+
+        let loaded = index
+            .load_ai_vision_checkpoints(
+                "hash-validation",
+                "fingerprint-a",
+                "checkpoint-v1",
+                &frame_timestamps,
+                4,
+            )
+            .expect("matching checkpoints should load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].batch_index, 0);
+        assert_eq!(loaded[0].analyses.len(), 4);
+        assert!(index
+            .load_ai_vision_checkpoints(
+                "hash-validation",
+                "fingerprint-b",
+                "checkpoint-v1",
+                &frame_timestamps,
+                4,
+            )
+            .expect("different settings should be queryable")
+            .is_empty());
+        assert!(index
+            .load_ai_vision_checkpoints(
+                "hash-validation",
+                "fingerprint-a",
+                "checkpoint-v2",
+                &frame_timestamps,
+                4,
+            )
+            .expect("different checkpoint versions should be queryable")
+            .is_empty());
+        assert!(index
+            .load_ai_vision_checkpoints(
+                "hash-validation",
+                "fingerprint-a",
+                "checkpoint-v1",
+                &[0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 8_000],
+                4,
+            )
+            .expect("different frame plans should be queryable")
+            .is_empty());
+        assert!(index
+            .load_ai_vision_checkpoints(
+                "hash-validation",
+                "fingerprint-a",
+                "checkpoint-v1",
+                &frame_timestamps,
+                8,
+            )
+            .expect("different batch sizes should be queryable")
+            .is_empty());
+    }
+
+    #[test]
+    fn completed_analysis_clears_vision_checkpoints_but_failed_analysis_keeps_them() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .reconcile(
+                &report(vec![file(
+                    "/library/checkpoint-lifecycle.mp4",
+                    "hash-lifecycle",
+                )]),
+                &HashMap::new(),
+            )
+            .expect("checkpoint asset should persist");
+        let frame_timestamps = vec![0, 1_000, 2_000, 3_000];
+        index
+            .store_ai_vision_checkpoint(
+                "hash-lifecycle",
+                "fingerprint-lifecycle",
+                "checkpoint-v1",
+                &checkpoint_batch(0, &frame_timestamps, &frame_timestamps),
+            )
+            .expect("valid checkpoint should persist");
+        index
+            .record_ai_analysis_result(
+                "hash-lifecycle",
+                "model-lifecycle",
+                "fingerprint-lifecycle",
+                None,
+                &test_analysis_result(
+                    "model-lifecycle",
+                    1_000,
+                    "Failed downstream work",
+                    AiFileAnalysisStatus::Failed,
+                    4,
+                    4,
+                    Vec::new(),
+                ),
+            )
+            .expect("failed result should persist");
+        assert_eq!(
+            index
+                .ai_vision_checkpoint_summary(
+                    "hash-lifecycle",
+                    "fingerprint-lifecycle",
+                    "checkpoint-v1",
+                    &frame_timestamps,
+                    4,
+                )
+                .expect("failed result should leave checkpoint")
+                .reusable_batch_count,
+            1
+        );
+
+        index
+            .record_ai_analysis_result(
+                "hash-lifecycle",
+                "model-lifecycle",
+                "fingerprint-lifecycle",
+                None,
+                &test_analysis_result(
+                    "model-lifecycle",
+                    1_000,
+                    "Completed analysis",
+                    AiFileAnalysisStatus::Complete,
+                    4,
+                    4,
+                    Vec::new(),
+                ),
+            )
+            .expect("complete result should persist");
+        assert_eq!(
+            index
+                .ai_vision_checkpoint_summary(
+                    "hash-lifecycle",
+                    "fingerprint-lifecycle",
+                    "checkpoint-v1",
+                    &frame_timestamps,
+                    4,
+                )
+                .expect("complete result should clear checkpoint")
+                .reusable_batch_count,
+            0
         );
     }
 

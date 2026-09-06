@@ -31,6 +31,7 @@ const AI_CONNECT_TIMEOUT_SECONDS: u64 = 20;
 const AI_REQUEST_TIMEOUT_SECONDS: u64 = 180;
 pub const AI_ANALYSIS_CANCELLED_MESSAGE: &str = "AI analysis cancelled by user";
 pub const AI_ANALYSIS_PROMPT_VERSION: &str = "2026-09-05-v1";
+pub(crate) const AI_VISION_CHECKPOINT_VERSION: &str = "2026-09-06-v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub enum AiProvider {
@@ -481,6 +482,32 @@ where
     F: Fn(AiFileProgress),
     C: Fn() -> bool,
 {
+    analyze_file_with_progress_and_cancel_with_checkpoints(
+        path,
+        metadata,
+        settings,
+        progress,
+        is_cancelled,
+        |_frame_timestamps, _batch_size| Ok(Vec::new()),
+        |_checkpoint| Ok(()),
+    )
+}
+
+pub(crate) fn analyze_file_with_progress_and_cancel_with_checkpoints<F, C, L, S>(
+    path: &Path,
+    metadata: Option<&MediaMetadata>,
+    settings: &AiSettings,
+    progress: F,
+    is_cancelled: C,
+    load_checkpoints: L,
+    save_checkpoint: S,
+) -> Result<AiFileAnalysisResult, String>
+where
+    F: Fn(AiFileProgress),
+    C: Fn() -> bool,
+    L: FnOnce(&[u64], usize) -> Result<Vec<AiVisionCheckpointBatch>, String>,
+    S: FnMut(AiVisionCheckpointBatch) -> Result<(), String>,
+{
     ensure_analysis_not_cancelled(&is_cancelled)?;
     let client = build_http_client()?;
     progress(AiFileProgress {
@@ -508,43 +535,17 @@ where
             .and_then(|metadata| metadata.audio_codec.as_deref())
             .is_some();
     let vision_percent_span = if should_transcribe_audio { 60 } else { 80 };
-    let mut analyses = Vec::with_capacity(frames.len());
-    let mut frame_errors = Vec::new();
-    let mut processed_frames = 0usize;
-    for frame_batch in frames.chunks(settings.vision_batch_size()) {
-        ensure_analysis_not_cancelled(&is_cancelled)?;
-        match describe_frames(&client, frame_batch, settings, &is_cancelled) {
-            Ok(batch) if batch.len() == frame_batch.len() => {
-                analyses.extend(
-                    frame_batch
-                        .iter()
-                        .map(|(timestamp_ms, _)| *timestamp_ms)
-                        .zip(batch),
-                );
-            }
-            Ok(batch) => frame_errors.push(AiFrameBatchFailure {
-                start_timestamp_ms: frame_batch.first().map(|frame| frame.0).unwrap_or_default(),
-                end_timestamp_ms: frame_batch.last().map(|frame| frame.0).unwrap_or_default(),
-                message: format!(
-                    "vision returned {} analyses for {} frames",
-                    batch.len(),
-                    frame_batch.len()
-                ),
-            }),
-            Err(error) => frame_errors.push(AiFrameBatchFailure {
-                start_timestamp_ms: frame_batch.first().map(|frame| frame.0).unwrap_or_default(),
-                end_timestamp_ms: frame_batch.last().map(|frame| frame.0).unwrap_or_default(),
-                message: error,
-            }),
-        }
-        ensure_analysis_not_cancelled(&is_cancelled)?;
-        processed_frames += frame_batch.len();
-        let vision_percent = 10 + ((processed_frames * vision_percent_span) / frames.len()) as u8;
-        progress(AiFileProgress {
-            percent: vision_percent.min(10 + vision_percent_span as u8),
-            phase: "Analyzing frames",
-        });
-    }
+    let (mut analyses, frame_errors) = analyze_vision_batches(
+        path,
+        &client,
+        &frames,
+        settings,
+        vision_percent_span,
+        &progress,
+        &is_cancelled,
+        load_checkpoints,
+        save_checkpoint,
+    )?;
     if analyses.is_empty() {
         let detail = frame_errors
             .first()
@@ -1069,6 +1070,112 @@ where
     }
 }
 
+fn analyze_vision_batches<F, C, L, S>(
+    path: &Path,
+    client: &Client,
+    frames: &[(u64, Vec<u8>)],
+    settings: &AiSettings,
+    vision_percent_span: u8,
+    progress: &F,
+    is_cancelled: &C,
+    load_checkpoints: L,
+    mut save_checkpoint: S,
+) -> Result<(Vec<(u64, FrameAnalysis)>, Vec<AiFrameBatchFailure>), String>
+where
+    F: Fn(AiFileProgress),
+    C: Fn() -> bool,
+    L: FnOnce(&[u64], usize) -> Result<Vec<AiVisionCheckpointBatch>, String>,
+    S: FnMut(AiVisionCheckpointBatch) -> Result<(), String>,
+{
+    let frame_timestamps = frames
+        .iter()
+        .map(|(timestamp_ms, _)| *timestamp_ms)
+        .collect::<Vec<_>>();
+    let checkpoint_batches = load_checkpoints(&frame_timestamps, settings.vision_batch_size())?;
+    let mut analyses = Vec::with_capacity(frames.len());
+    let mut frame_errors = Vec::new();
+    let mut processed_frames = 0usize;
+    for (batch_index, frame_batch) in frames.chunks(settings.vision_batch_size()).enumerate() {
+        ensure_analysis_not_cancelled(is_cancelled)?;
+        let batch_timestamps = frame_batch
+            .iter()
+            .map(|(timestamp_ms, _)| *timestamp_ms)
+            .collect::<Vec<_>>();
+        let checkpoint = checkpoint_batches.iter().find(|checkpoint| {
+            checkpoint.batch_index == batch_index
+                && checkpoint.frame_timestamps == frame_timestamps
+                && checkpoint.batch_timestamps == batch_timestamps
+                && checkpoint.analyses.len() == frame_batch.len()
+        });
+        let reused_checkpoint = checkpoint.is_some();
+        if let Some(checkpoint) = checkpoint {
+            analyses.extend(
+                frame_batch
+                    .iter()
+                    .map(|(timestamp_ms, _)| *timestamp_ms)
+                    .zip(checkpoint.analyses.iter().cloned()),
+            );
+        } else {
+            match describe_frames(client, frame_batch, settings, is_cancelled) {
+                Ok(batch) if batch.len() == frame_batch.len() => {
+                    save_checkpoint(AiVisionCheckpointBatch {
+                        batch_index,
+                        frame_timestamps: frame_timestamps.clone(),
+                        batch_timestamps,
+                        analyses: batch.clone(),
+                    })
+                    .map_err(|error| {
+                        format!(
+                            "cannot persist vision checkpoint for {} batch {}: {error}",
+                            path.display(),
+                            batch_index + 1
+                        )
+                    })?;
+                    analyses.extend(
+                        frame_batch
+                            .iter()
+                            .map(|(timestamp_ms, _)| *timestamp_ms)
+                            .zip(batch),
+                    );
+                }
+                Ok(batch) => frame_errors.push(AiFrameBatchFailure {
+                    start_timestamp_ms: frame_batch
+                        .first()
+                        .map(|frame| frame.0)
+                        .unwrap_or_default(),
+                    end_timestamp_ms: frame_batch.last().map(|frame| frame.0).unwrap_or_default(),
+                    message: format!(
+                        "vision returned {} analyses for {} frames",
+                        batch.len(),
+                        frame_batch.len()
+                    ),
+                }),
+                Err(error) => frame_errors.push(AiFrameBatchFailure {
+                    start_timestamp_ms: frame_batch
+                        .first()
+                        .map(|frame| frame.0)
+                        .unwrap_or_default(),
+                    end_timestamp_ms: frame_batch.last().map(|frame| frame.0).unwrap_or_default(),
+                    message: error,
+                }),
+            }
+        }
+        ensure_analysis_not_cancelled(is_cancelled)?;
+        processed_frames += frame_batch.len();
+        let vision_percent =
+            10 + ((processed_frames * usize::from(vision_percent_span)) / frames.len()) as u8;
+        progress(AiFileProgress {
+            percent: vision_percent.min(10 + vision_percent_span),
+            phase: if reused_checkpoint {
+                "Reusing saved frame analysis"
+            } else {
+                "Analyzing frames"
+            },
+        });
+    }
+    Ok((analyses, frame_errors))
+}
+
 pub fn embed_query(query: &str, settings: &AiSettings) -> Result<Vec<f32>, String> {
     if query.trim().is_empty() {
         return Err("AI search query cannot be empty".to_owned());
@@ -1400,6 +1507,25 @@ fn provider_from_environment() -> Option<AiProvider> {
     }
 }
 
+pub(crate) fn planned_frame_timestamps(
+    duration_ms: Option<u64>,
+    settings: &AiSettings,
+) -> Vec<u64> {
+    let sample_interval_ms = settings.sample_interval_ms.max(1);
+    let frame_count = duration_ms
+        .map(|duration| {
+            duration
+                .max(1)
+                .div_ceil(sample_interval_ms)
+                .max(1)
+                .min(settings.max_frames_per_file.max(1) as u64)
+        })
+        .unwrap_or(settings.max_frames_per_file.max(1) as u64);
+    (0..frame_count)
+        .map(|index| index.saturating_mul(settings.sample_interval_ms))
+        .collect()
+}
+
 fn extract_frames(path: &Path, settings: &AiSettings) -> Result<Vec<(u64, Vec<u8>)>, String> {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1574,24 +1700,46 @@ fn configure_hidden_process(command: &mut Command) {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct FrameAnalysis {
-    description: String,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct FrameAnalysis {
+    pub(crate) description: String,
     #[serde(default)]
-    labels: Vec<String>,
+    pub(crate) labels: Vec<String>,
     #[serde(default)]
-    visible_text: Vec<String>,
+    pub(crate) visible_text: Vec<String>,
     #[serde(default)]
-    entities: Vec<String>,
+    pub(crate) entities: Vec<String>,
     #[serde(default)]
-    actions: Vec<String>,
+    pub(crate) actions: Vec<String>,
     #[serde(default)]
-    dialogue: Vec<String>,
+    pub(crate) dialogue: Vec<String>,
     #[serde(default)]
-    setting: Option<String>,
+    pub(crate) setting: Option<String>,
     #[serde(default)]
-    situation: Option<String>,
-    confidence: Option<f32>,
+    pub(crate) situation: Option<String>,
+    pub(crate) confidence: Option<f32>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AiVisionCheckpointBatch {
+    pub batch_index: usize,
+    pub frame_timestamps: Vec<u64>,
+    pub batch_timestamps: Vec<u64>,
+    pub analyses: Vec<FrameAnalysis>,
+}
+
+pub(crate) fn validate_checkpoint_analyses(
+    analyses: Vec<FrameAnalysis>,
+    expected_len: usize,
+) -> Option<Vec<FrameAnalysis>> {
+    if analyses.len() != expected_len {
+        return None;
+    }
+    analyses
+        .into_iter()
+        .map(normalize_frame_analysis)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
 }
 
 #[derive(Clone, Copy)]
@@ -2539,6 +2687,111 @@ mod tests {
             write_stub_response(&mut stream, &body);
         });
         (format!("http://{address}"), handle)
+    }
+
+    fn spawn_counting_vision_stub(
+        body: Value,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("stub should bind locally");
+        listener
+            .set_nonblocking(true)
+            .expect("stub should support nonblocking accepts");
+        let address = listener.local_addr().expect("stub should have an address");
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let request_count = requests.clone();
+        let stop_signal = stopped.clone();
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !stop_signal.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("stub stream should support blocking reads");
+                        request_count.fetch_add(1, Ordering::SeqCst);
+                        let _ = read_stub_request(&mut stream);
+                        write_stub_response(&mut stream, &body);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://{address}"), requests, stopped, handle)
+    }
+
+    fn vision_stub_response(frame_count: usize) -> Value {
+        let frames = (0..frame_count)
+            .map(|index| {
+                json!({
+                    "description": format!("Stub frame {index}"),
+                    "labels": ["stub"],
+                    "visible_text": [],
+                    "entities": [],
+                    "actions": ["testing"],
+                    "dialogue": [],
+                    "setting": "test scene",
+                    "situation": "testing",
+                    "confidence": 0.9
+                })
+            })
+            .collect::<Vec<_>>();
+        let text = serde_json::to_string(&json!({"frames": frames}))
+            .expect("stub response text should serialize");
+        json!({
+            "output": [{
+                "content": [{"type": "output_text", "text": text}]
+            }]
+        })
+    }
+
+    fn checkpoint_test_settings(base_url: String, max_frames: u64) -> AiSettings {
+        AiSettings::from_request(Some(AiRequestConfig {
+            provider: Some(AiProvider::OpenAI),
+            api_key: Some("checkpoint-test-key".to_owned()),
+            base_url: Some(base_url),
+            sample_interval_seconds: Some(1),
+            max_frames: Some(max_frames),
+            ..Default::default()
+        }))
+        .expect("checkpoint test settings should be valid")
+    }
+
+    fn checkpoint_test_frames(count: usize) -> Vec<(u64, Vec<u8>)> {
+        (0..count)
+            .map(|index| (index as u64 * 1_000, vec![0xff, 0xd8, 0xff, 0xd9]))
+            .collect()
+    }
+
+    fn checkpoint_test_database(path: &Path) -> crate::local_index::SqliteIndex {
+        let mut index = crate::local_index::SqliteIndex::open(path)
+            .expect("checkpoint test database should open");
+        index
+            .reconcile(
+                &crate::scanner::ScanReport {
+                    files: vec![crate::scanner::DiscoveredFile {
+                        path: "/library/checkpoint.mp4".to_owned(),
+                        size_bytes: 1,
+                        modified_unix_ms: Some(1),
+                        content_hash: "hash-checkpoint".to_owned(),
+                    }],
+                    warnings: Vec::new(),
+                },
+                &std::collections::HashMap::new(),
+            )
+            .expect("checkpoint test media asset should persist");
+        index
     }
 
     fn spawn_timeout_stub() -> (
@@ -3874,6 +4127,228 @@ mod tests {
         assert_ne!(
             base.analysis_settings_fingerprint(),
             settings(5, 120, Some("sports footage")).analysis_settings_fingerprint()
+        );
+    }
+
+    #[test]
+    fn committed_vision_checkpoints_resume_after_sqlite_restart_without_repeating_requests() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock should be after epoch")
+            .as_nanos();
+        let database_path = std::env::temp_dir().join(format!(
+            "mediaindex-mi04-checkpoints-{}-{stamp}.sqlite3",
+            std::process::id()
+        ));
+        drop(checkpoint_test_database(&database_path));
+
+        let frames = checkpoint_test_frames(16);
+        let (first_base_url, first_requests, first_stop, first_server) =
+            spawn_counting_vision_stub(vision_stub_response(8));
+        let first_settings = checkpoint_test_settings(first_base_url, 16);
+        let first_fingerprint = first_settings.analysis_settings_fingerprint();
+        let first_client = build_http_client().expect("first test client should build");
+        let first_cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let first_cancel_signal = first_cancelled.clone();
+        let first_storage = Rc::new(RefCell::new(
+            crate::local_index::SqliteIndex::open(&database_path)
+                .expect("first checkpoint database should reopen"),
+        ));
+        let first_store = first_storage.clone();
+        let first_checkpoint_fingerprint = first_fingerprint.clone();
+        let first_result = analyze_vision_batches(
+            Path::new("/library/checkpoint.mp4"),
+            &first_client,
+            &frames,
+            &first_settings,
+            80,
+            &|_| {},
+            &|| first_cancelled.load(Ordering::SeqCst),
+            |_, _| Ok(Vec::new()),
+            move |checkpoint| {
+                let result = first_store
+                    .borrow_mut()
+                    .store_ai_vision_checkpoint(
+                        "hash-checkpoint",
+                        &first_checkpoint_fingerprint,
+                        AI_VISION_CHECKPOINT_VERSION,
+                        &checkpoint,
+                    )
+                    .map_err(|error| error.to_string());
+                if result.is_ok() {
+                    first_cancel_signal.store(true, Ordering::SeqCst);
+                }
+                result
+            },
+        );
+        first_stop.store(true, Ordering::SeqCst);
+        first_server
+            .join()
+            .expect("first vision stub should finish");
+        assert!(matches!(
+            first_result,
+            Err(error) if error == AI_ANALYSIS_CANCELLED_MESSAGE
+        ));
+        assert_eq!(first_requests.load(Ordering::SeqCst), 1);
+        let first_summary = first_storage
+            .borrow()
+            .ai_vision_checkpoint_summary(
+                "hash-checkpoint",
+                &first_fingerprint,
+                AI_VISION_CHECKPOINT_VERSION,
+                &frames
+                    .iter()
+                    .map(|(timestamp, _)| *timestamp)
+                    .collect::<Vec<_>>(),
+                first_settings.vision_batch_size(),
+            )
+            .expect("first checkpoint should be queryable");
+        assert_eq!(first_summary.reusable_frame_count, 8);
+        assert_eq!(first_summary.reusable_batch_count, 1);
+        drop(first_storage);
+
+        let (second_base_url, second_requests, second_stop, second_server) =
+            spawn_counting_vision_stub(vision_stub_response(8));
+        let second_settings = checkpoint_test_settings(second_base_url, 16);
+        let second_client = build_http_client().expect("second test client should build");
+        let second_storage = Rc::new(RefCell::new(
+            crate::local_index::SqliteIndex::open(&database_path)
+                .expect("second checkpoint database should reopen"),
+        ));
+        let second_load = second_storage.clone();
+        let second_store = second_storage.clone();
+        let second_fingerprint = second_settings.analysis_settings_fingerprint();
+        let second_load_fingerprint = second_fingerprint.clone();
+        let second_store_fingerprint = second_fingerprint.clone();
+        let second_result = analyze_vision_batches(
+            Path::new("/library/checkpoint.mp4"),
+            &second_client,
+            &frames,
+            &second_settings,
+            80,
+            &|_| {},
+            &|| false,
+            move |frame_timestamps, batch_size| {
+                second_load
+                    .borrow()
+                    .load_ai_vision_checkpoints(
+                        "hash-checkpoint",
+                        &second_load_fingerprint,
+                        AI_VISION_CHECKPOINT_VERSION,
+                        frame_timestamps,
+                        batch_size,
+                    )
+                    .map_err(|error| error.to_string())
+            },
+            move |checkpoint| {
+                second_store
+                    .borrow_mut()
+                    .store_ai_vision_checkpoint(
+                        "hash-checkpoint",
+                        &second_store_fingerprint,
+                        AI_VISION_CHECKPOINT_VERSION,
+                        &checkpoint,
+                    )
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .expect("resume should complete both vision batches");
+        second_stop.store(true, Ordering::SeqCst);
+        second_server
+            .join()
+            .expect("second vision stub should finish");
+        assert_eq!(second_result.0.len(), 16);
+        assert!(second_result.1.is_empty());
+        assert_eq!(second_requests.load(Ordering::SeqCst), 1);
+        drop(second_storage);
+
+        let (third_base_url, third_requests, third_stop, third_server) =
+            spawn_counting_vision_stub(vision_stub_response(8));
+        let third_settings = checkpoint_test_settings(third_base_url, 16);
+        let third_client = build_http_client().expect("third test client should build");
+        let third_storage = Rc::new(RefCell::new(
+            crate::local_index::SqliteIndex::open(&database_path)
+                .expect("third checkpoint database should reopen"),
+        ));
+        let third_load = third_storage.clone();
+        let third_fingerprint = third_settings.analysis_settings_fingerprint();
+        let third_result = analyze_vision_batches(
+            Path::new("/library/checkpoint.mp4"),
+            &third_client,
+            &frames,
+            &third_settings,
+            80,
+            &|_| {},
+            &|| false,
+            move |frame_timestamps, batch_size| {
+                third_load
+                    .borrow()
+                    .load_ai_vision_checkpoints(
+                        "hash-checkpoint",
+                        &third_fingerprint,
+                        AI_VISION_CHECKPOINT_VERSION,
+                        frame_timestamps,
+                        batch_size,
+                    )
+                    .map_err(|error| error.to_string())
+            },
+            |_checkpoint| Ok(()),
+        )
+        .expect("all committed vision work should be reusable");
+        third_stop.store(true, Ordering::SeqCst);
+        third_server
+            .join()
+            .expect("third vision stub should finish");
+        assert_eq!(third_result.0.len(), 16);
+        assert!(third_result.1.is_empty());
+        assert_eq!(
+            third_requests.load(Ordering::SeqCst),
+            0,
+            "a retry after downstream work fails must not repeat completed vision"
+        );
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn vision_checkpoint_write_error_stops_before_the_next_paid_batch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (base_url, requests, stop, server) =
+            spawn_counting_vision_stub(vision_stub_response(8));
+        let settings = checkpoint_test_settings(base_url, 16);
+        let client = build_http_client().expect("checkpoint error test client should build");
+        let writes = AtomicUsize::new(0);
+        let result = analyze_vision_batches(
+            Path::new("/library/checkpoint-error.mp4"),
+            &client,
+            &checkpoint_test_frames(16),
+            &settings,
+            80,
+            &|_| {},
+            &|| false,
+            |_, _| Ok(Vec::new()),
+            |_checkpoint| {
+                writes.fetch_add(1, Ordering::SeqCst);
+                Err("simulated SQLite write failure".to_owned())
+            },
+        );
+        stop.store(true, Ordering::SeqCst);
+        server.join().expect("checkpoint error stub should finish");
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("cannot persist vision checkpoint")
+        ));
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the second paid vision batch must wait for the failed write ACK"
         );
     }
 

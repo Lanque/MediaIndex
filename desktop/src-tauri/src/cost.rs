@@ -11,7 +11,10 @@ const IMAGE_TOKEN_MULTIPLIER: f64 = 1.2;
 
 #[derive(Clone, Debug)]
 pub struct CostFile {
+    /// All frames that still need downstream embedding work.
     pub sampled_frames: u64,
+    /// Frames that still need a vision request; checkpoints may reduce this.
+    pub vision_sampled_frames: u64,
     pub vision_requests: u64,
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -66,6 +69,11 @@ pub fn estimate(input: CostInput) -> AiCostEstimate {
         .iter()
         .map(|file| file.sampled_frames)
         .sum::<u64>();
+    let vision_frame_count = input
+        .files
+        .iter()
+        .map(|file| file.vision_sampled_frames)
+        .sum::<u64>();
     let vision_requests = input
         .files
         .iter()
@@ -74,7 +82,9 @@ pub fn estimate(input: CostInput) -> AiCostEstimate {
     let image_tokens_likely = input
         .files
         .iter()
-        .map(|file| image_tokens(file.width, file.height).saturating_mul(file.sampled_frames))
+        .map(|file| {
+            image_tokens(file.width, file.height).saturating_mul(file.vision_sampled_frames)
+        })
         .sum::<u64>();
     let prompt_tokens = vision_requests.saturating_mul(VISION_PROMPT_TOKENS_PER_REQUEST);
     let vision_input_likely = image_tokens_likely.saturating_add(prompt_tokens);
@@ -84,9 +94,9 @@ pub fn estimate(input: CostInput) -> AiCostEstimate {
         high: scale_tokens(vision_input_likely, 5, 4),
     };
     let vision_output_tokens = TokenEstimate {
-        low: frame_count.saturating_mul(OUTPUT_TOKENS_PER_FRAME / 2),
-        likely: frame_count.saturating_mul(OUTPUT_TOKENS_PER_FRAME),
-        high: frame_count.saturating_mul(OUTPUT_TOKENS_PER_FRAME.saturating_mul(2)),
+        low: vision_frame_count.saturating_mul(OUTPUT_TOKENS_PER_FRAME / 2),
+        likely: vision_frame_count.saturating_mul(OUTPUT_TOKENS_PER_FRAME),
+        high: vision_frame_count.saturating_mul(OUTPUT_TOKENS_PER_FRAME.saturating_mul(2)),
     };
     let embedding_input_tokens = TokenEstimate {
         low: frame_count.saturating_mul(EMBEDDING_TOKENS_PER_FRAME / 2),
@@ -301,6 +311,10 @@ fn assumptions(
         .files
         .iter()
         .any(|file| file.width.is_none() || file.height.is_none());
+    let has_reused_vision_frames = input
+        .files
+        .iter()
+        .any(|file| file.vision_sampled_frames < file.sampled_frames);
     let mut assumptions = vec![
         "Vision input uses a high-detail image-token estimate based on frame dimensions."
             .to_owned(),
@@ -310,6 +324,12 @@ fn assumptions(
     if missing_dimensions {
         assumptions.push(
             "Some frame dimensions are unknown; 1280x720 is used for those frames.".to_owned(),
+        );
+    }
+    if has_reused_vision_frames {
+        assumptions.push(
+            "Vision cost excludes validated local checkpoint frames; document embeddings and configured speech transcription are estimated again."
+                .to_owned(),
         );
     }
     if !vision_known {
@@ -388,6 +408,7 @@ mod tests {
             budget_limit_usd: None,
             files: vec![CostFile {
                 sampled_frames: 8,
+                vision_sampled_frames: 8,
                 vision_requests: 1,
                 width: Some(1_280),
                 height: Some(720),
@@ -480,6 +501,26 @@ mod tests {
 
         assert!(long > short);
         assert!((long / short - 8.0).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn continuation_estimate_reuses_only_vision_cost_but_keeps_downstream_work() {
+        let full = estimate(input("openai"));
+        let mut continuation_input = input("openai");
+        continuation_input.files[0].vision_sampled_frames = 4;
+        continuation_input.files[0].vision_requests = 1;
+        let continuation = estimate(continuation_input);
+
+        assert_eq!(
+            continuation.embedding_input_tokens.likely, full.embedding_input_tokens.likely,
+            "document embeddings still cover every sampled frame"
+        );
+        assert!(continuation.vision_input_tokens.likely < full.vision_input_tokens.likely);
+        assert!(continuation.vision_output_tokens.likely < full.vision_output_tokens.likely);
+        assert!(continuation
+            .assumptions
+            .iter()
+            .any(|assumption| assumption.contains("checkpoint frames")));
     }
 
     #[test]
