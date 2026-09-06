@@ -1507,25 +1507,6 @@ fn provider_from_environment() -> Option<AiProvider> {
     }
 }
 
-pub(crate) fn planned_frame_timestamps(
-    duration_ms: Option<u64>,
-    settings: &AiSettings,
-) -> Vec<u64> {
-    let sample_interval_ms = settings.sample_interval_ms.max(1);
-    let frame_count = duration_ms
-        .map(|duration| {
-            duration
-                .max(1)
-                .div_ceil(sample_interval_ms)
-                .max(1)
-                .min(settings.max_frames_per_file.max(1) as u64)
-        })
-        .unwrap_or(settings.max_frames_per_file.max(1) as u64);
-    (0..frame_count)
-        .map(|index| index.saturating_mul(settings.sample_interval_ms))
-        .collect()
-}
-
 fn extract_frames(path: &Path, settings: &AiSettings) -> Result<Vec<(u64, Vec<u8>)>, String> {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4326,6 +4307,153 @@ mod tests {
             third_requests.load(Ordering::SeqCst),
             0,
             "a retry after downstream work fails must not repeat completed vision"
+        );
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn two_frame_checkpoint_with_missing_metadata_resumes_after_restart_without_new_vision_request()
+    {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::atomic::Ordering;
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock should be after epoch")
+            .as_nanos();
+        let database_path = std::env::temp_dir().join(format!(
+            "mediaindex-mi04r-metadata-free-{}-{stamp}.sqlite3",
+            std::process::id()
+        ));
+        drop(checkpoint_test_database(&database_path));
+
+        let frames = checkpoint_test_frames(2);
+        let (first_base_url, first_requests, first_stop, first_server) =
+            spawn_counting_vision_stub(vision_stub_response(2));
+        let first_settings = checkpoint_test_settings(first_base_url, 60);
+        let first_fingerprint = first_settings.analysis_settings_fingerprint();
+        let first_client = build_http_client().expect("first metadata-free client should build");
+        let first_storage = Rc::new(RefCell::new(
+            crate::local_index::SqliteIndex::open(&database_path)
+                .expect("first metadata-free database should reopen"),
+        ));
+        let first_store = first_storage.clone();
+        let first_checkpoint_fingerprint = first_fingerprint.clone();
+        let first_result = analyze_vision_batches(
+            Path::new("/library/checkpoint.mp4"),
+            &first_client,
+            &frames,
+            &first_settings,
+            80,
+            &|_| {},
+            &|| false,
+            |_, _| Ok(Vec::new()),
+            move |checkpoint| {
+                first_store
+                    .borrow_mut()
+                    .store_ai_vision_checkpoint(
+                        "hash-checkpoint",
+                        &first_checkpoint_fingerprint,
+                        AI_VISION_CHECKPOINT_VERSION,
+                        &checkpoint,
+                    )
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .expect("the first two-frame vision run should complete");
+        first_stop.store(true, Ordering::SeqCst);
+        first_server
+            .join()
+            .expect("first metadata-free vision stub should finish");
+        assert_eq!(first_result.0.len(), 2);
+        assert!(first_result.1.is_empty());
+        assert_eq!(first_requests.load(Ordering::SeqCst), 1);
+
+        let first_summary = first_storage
+            .borrow()
+            .ai_vision_checkpoint_summary_for_any_plan(
+                "hash-checkpoint",
+                &first_fingerprint,
+                AI_VISION_CHECKPOINT_VERSION,
+                first_settings.vision_batch_size(),
+            )
+            .expect("the actual two-frame plan should be discoverable");
+        assert_eq!(first_summary.frame_count, 2);
+        assert_eq!(first_summary.reusable_frame_count, 2);
+        assert_eq!(first_summary.reusable_batch_count, 1);
+        assert_eq!(
+            first_summary.frame_timestamps.as_deref(),
+            Some([0, 1_000].as_slice())
+        );
+        first_storage
+            .borrow_mut()
+            .record_ai_analysis_result(
+                "hash-checkpoint",
+                &first_settings.model_namespace(),
+                &first_fingerprint,
+                None,
+                &AiFileAnalysisResult {
+                    annotations: Vec::new(),
+                    planned_frame_count: 2,
+                    successful_frame_count: 2,
+                    failed_batches: Vec::new(),
+                    status: AiFileAnalysisStatus::Failed,
+                    warning: Some("simulated downstream failure".to_owned()),
+                },
+            )
+            .expect("downstream failure should preserve the vision checkpoint");
+        drop(first_storage);
+
+        let (second_base_url, second_requests, second_stop, second_server) =
+            spawn_counting_vision_stub(vision_stub_response(2));
+        let second_settings = checkpoint_test_settings(second_base_url, 60);
+        assert_eq!(
+            second_settings.analysis_settings_fingerprint(),
+            first_fingerprint,
+            "the provider endpoint must not change checkpoint identity"
+        );
+        let second_client = build_http_client().expect("second metadata-free client should build");
+        let second_storage = Rc::new(RefCell::new(
+            crate::local_index::SqliteIndex::open(&database_path)
+                .expect("second metadata-free database should reopen"),
+        ));
+        let second_load = second_storage.clone();
+        let second_load_fingerprint = second_settings.analysis_settings_fingerprint();
+        let second_result = analyze_vision_batches(
+            Path::new("/library/checkpoint.mp4"),
+            &second_client,
+            &frames,
+            &second_settings,
+            80,
+            &|_| {},
+            &|| false,
+            move |frame_timestamps, batch_size| {
+                second_load
+                    .borrow()
+                    .load_ai_vision_checkpoints(
+                        "hash-checkpoint",
+                        &second_load_fingerprint,
+                        AI_VISION_CHECKPOINT_VERSION,
+                        frame_timestamps,
+                        batch_size,
+                    )
+                    .map_err(|error| error.to_string())
+            },
+            |_checkpoint| Ok(()),
+        )
+        .expect("the reopened checkpoint should cover both actual frames");
+        second_stop.store(true, Ordering::SeqCst);
+        second_server
+            .join()
+            .expect("second metadata-free vision stub should finish");
+        assert_eq!(second_result.0.len(), 2);
+        assert!(second_result.1.is_empty());
+        assert_eq!(
+            second_requests.load(Ordering::SeqCst),
+            0,
+            "a metadata-free restart must reuse the saved actual frame plan"
         );
 
         let _ = fs::remove_file(database_path);

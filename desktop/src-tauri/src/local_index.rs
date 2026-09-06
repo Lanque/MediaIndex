@@ -408,6 +408,8 @@ pub struct AiAnalysisCoverage {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AiVisionCheckpointSummary {
+    pub frame_count: u64,
+    pub frame_timestamps: Option<Vec<u64>>,
     pub reusable_frame_count: u64,
     pub reusable_batch_count: u64,
 }
@@ -917,6 +919,7 @@ impl SqliteIndex {
         Ok(checkpoints)
     }
 
+    #[cfg(test)]
     pub(crate) fn ai_vision_checkpoint_summary(
         &self,
         content_hash: &str,
@@ -932,13 +935,52 @@ impl SqliteIndex {
             frame_timestamps,
             batch_size,
         )?;
-        Ok(AiVisionCheckpointSummary {
-            reusable_frame_count: checkpoints
-                .iter()
-                .map(|checkpoint| checkpoint.analyses.len() as u64)
-                .sum(),
-            reusable_batch_count: checkpoints.len() as u64,
-        })
+        Ok(checkpoint_summary(frame_timestamps, checkpoints))
+    }
+
+    pub(crate) fn ai_vision_checkpoint_summary_for_any_plan(
+        &self,
+        content_hash: &str,
+        settings_fingerprint: &str,
+        checkpoint_version: &str,
+        batch_size: usize,
+    ) -> Result<AiVisionCheckpointSummary, IndexError> {
+        if batch_size == 0 {
+            return Ok(AiVisionCheckpointSummary::default());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT frame_timestamps_json
+             FROM ai_vision_checkpoints
+             WHERE content_hash = ?1
+               AND settings_fingerprint = ?2
+               AND checkpoint_version = ?3
+             GROUP BY frame_timestamps_json
+             ORDER BY MAX(checkpoint_id) DESC",
+        )?;
+        let plans = statement.query_map(
+            params![content_hash, settings_fingerprint, checkpoint_version],
+            |row| row.get::<_, String>(0),
+        )?;
+        for plan in plans {
+            let Ok(frame_timestamps) = serde_json::from_str::<Vec<u64>>(&plan?) else {
+                continue;
+            };
+            if !valid_checkpoint_frame_plan(&frame_timestamps) {
+                continue;
+            }
+            let checkpoints = self.load_ai_vision_checkpoints(
+                content_hash,
+                settings_fingerprint,
+                checkpoint_version,
+                &frame_timestamps,
+                batch_size,
+            )?;
+            let summary = checkpoint_summary(&frame_timestamps, checkpoints);
+            if summary.reusable_batch_count > 0 {
+                return Ok(summary);
+            }
+        }
+        Ok(AiVisionCheckpointSummary::default())
     }
 
     pub(crate) fn store_ai_vision_checkpoint(
@@ -1868,6 +1910,31 @@ fn unknown_ai_analysis_coverage() -> AiAnalysisCoverage {
     }
 }
 
+fn checkpoint_summary(
+    frame_timestamps: &[u64],
+    checkpoints: Vec<AiVisionCheckpointBatch>,
+) -> AiVisionCheckpointSummary {
+    if checkpoints.is_empty() {
+        return AiVisionCheckpointSummary::default();
+    }
+    AiVisionCheckpointSummary {
+        frame_count: frame_timestamps.len() as u64,
+        frame_timestamps: Some(frame_timestamps.to_vec()),
+        reusable_frame_count: checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.analyses.len() as u64)
+            .sum(),
+        reusable_batch_count: checkpoints.len() as u64,
+    }
+}
+
+fn valid_checkpoint_frame_plan(frame_timestamps: &[u64]) -> bool {
+    !frame_timestamps.is_empty()
+        && frame_timestamps
+            .windows(2)
+            .all(|timestamps| timestamps[0] <= timestamps[1])
+}
+
 fn insert_ai_annotation(
     transaction: &Transaction<'_>,
     content_hash: &str,
@@ -2533,6 +2600,21 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].batch_index, 0);
         assert_eq!(loaded[0].analyses.len(), 4);
+        let saved_plan = index
+            .ai_vision_checkpoint_summary_for_any_plan(
+                "hash-validation",
+                "fingerprint-a",
+                "checkpoint-v1",
+                4,
+            )
+            .expect("saved frame plan should be discoverable");
+        assert_eq!(saved_plan.frame_count, 8);
+        assert_eq!(
+            saved_plan.frame_timestamps.as_deref(),
+            Some(frame_timestamps.as_slice())
+        );
+        assert_eq!(saved_plan.reusable_frame_count, 4);
+        assert_eq!(saved_plan.reusable_batch_count, 1);
         assert!(index
             .load_ai_vision_checkpoints(
                 "hash-validation",
