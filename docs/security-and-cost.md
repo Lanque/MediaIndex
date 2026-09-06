@@ -50,6 +50,16 @@ can increase the committed cost when it exceeds that reserve. Explicit numeric
 zero usage is valid and releases the unused reserve. HTTP errors, timeouts, and
 unreadable responses retain unknown cost instead of being inferred as zero.
 
+AI analysis runs additionally export a local diagnostic JSON file after the
+run reaches a terminal state. It records run/file wall time, stage timings,
+request-attempt counts, successful/failed/cancelled outcomes, and new versus
+reused vision frames/batches. HTTP transport timing is separate from response
+body and JSON parsing timing. The export is written by temporary-file rename
+under the app-local `ai-diagnostics` directory and is bounded to the newest 12
+`run-*.json` files. It contains only local content IDs and run metadata; media
+bytes, prompts, API keys, response content, and absolute private paths are not
+included. The desktop result exposes the path only after a successful export.
+
 Windows installers built locally or in pull-request CI are intentionally
 unsigned until the release owner provides an Authenticode certificate through
 the release environment. Certificate material and passwords must never be

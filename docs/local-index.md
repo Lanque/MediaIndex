@@ -74,3 +74,13 @@ kept explicitly unknown until a provider reports it; API keys, prompts, frame
 bytes, and response content are never written to the register. Search
 embeddings and connection checks are separate run operations from media
 analysis.
+
+Each production AI analysis run also writes a diagnostic JSON export below the
+Tauri app-local `ai-diagnostics` directory when the export succeeds. The
+export includes the run wall time, worker count, file wall times, stage timings,
+request-attempt counts, outcomes, and new/reused vision-frame counts. It is an
+atomic local file with bounded retention (the newest 12 `run-*.json` files).
+Only a local content ID and run metadata are exported; media bytes, prompts,
+API keys, response content, and absolute private paths are excluded. The
+desktop command returns the saved path in `diagnostics_path` so the UI can show
+where the report was written.
