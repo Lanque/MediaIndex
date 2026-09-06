@@ -17,6 +17,12 @@ pub struct CostFile {
     pub height: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ImageDimensions {
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct CostInput {
     pub provider: String,
@@ -25,7 +31,6 @@ pub struct CostInput {
     pub transcription_model: String,
     pub transcribes_audio: bool,
     pub audio_seconds: u64,
-    pub embedding_requests: u64,
     pub budget_limit_usd: Option<f64>,
     pub files: Vec<CostFile>,
 }
@@ -48,9 +53,6 @@ pub struct AiCostEstimate {
     pub vision_output_tokens: TokenEstimate,
     pub embedding_input_tokens: TokenEstimate,
     pub audio_seconds: u64,
-    pub vision_request_reserve_usd: Option<f64>,
-    pub embedding_request_reserve_usd: Option<f64>,
-    pub transcription_request_reserve_usd: Option<f64>,
     pub pricing_checked_at: &'static str,
     pub pricing_source: &'static str,
     pub budget_limit_usd: Option<f64>,
@@ -103,9 +105,6 @@ pub fn estimate(input: CostInput) -> AiCostEstimate {
             vision_output_tokens,
             embedding_input_tokens,
             audio_seconds: input.audio_seconds,
-            vision_request_reserve_usd: None,
-            embedding_request_reserve_usd: None,
-            transcription_request_reserve_usd: None,
             pricing_checked_at: pricing::PRICING_CHECKED_AT,
             pricing_source: "local runtime",
             budget_limit_usd: input.budget_limit_usd,
@@ -186,13 +185,6 @@ pub fn estimate(input: CostInput) -> AiCostEstimate {
             + embedding_cost(embedding_tokens)
             + transcription_cost
     };
-    let vision_request_reserve_usd = (vision_requests > 0).then(|| {
-        vision_cost(vision_input_tokens.high, vision_output_tokens.high) / vision_requests as f64
-    });
-    let embedding_request_reserve_usd = (input.embedding_requests > 0)
-        .then(|| embedding_cost(embedding_input_tokens.high) / input.embedding_requests as f64);
-    let transcription_request_reserve_usd =
-        (input.transcribes_audio && input.audio_seconds > 0).then_some(transcription_cost);
     let estimated_high_usd = cost(
         vision_input_tokens.high,
         vision_output_tokens.high,
@@ -221,9 +213,6 @@ pub fn estimate(input: CostInput) -> AiCostEstimate {
         vision_output_tokens,
         embedding_input_tokens,
         audio_seconds: input.audio_seconds,
-        vision_request_reserve_usd,
-        embedding_request_reserve_usd,
-        transcription_request_reserve_usd,
         pricing_checked_at: pricing::PRICING_CHECKED_AT,
         pricing_source: source,
         budget_limit_usd: input.budget_limit_usd,
@@ -252,15 +241,54 @@ fn unknown_estimate(
         vision_output_tokens,
         embedding_input_tokens,
         audio_seconds,
-        vision_request_reserve_usd: None,
-        embedding_request_reserve_usd: None,
-        transcription_request_reserve_usd: None,
         pricing_checked_at: pricing::PRICING_CHECKED_AT,
         pricing_source: source,
         budget_limit_usd,
         budget_status,
         assumptions,
     }
+}
+
+pub fn vision_request_cost(
+    provider: &str,
+    model: &str,
+    image_dimensions: &[ImageDimensions],
+    prompt_tokens_upper: u64,
+    max_output_tokens: u64,
+) -> Option<f64> {
+    let pricing = pricing::vision_pricing(provider, model)?;
+    let image_tokens = image_dimensions
+        .iter()
+        .map(|dimensions| image_tokens(Some(dimensions.width), Some(dimensions.height)))
+        .sum::<u64>();
+    Some(
+        token_cost(
+            image_tokens.saturating_add(prompt_tokens_upper),
+            pricing.input_usd_per_million?,
+        ) + token_cost(max_output_tokens, pricing.output_usd_per_million?),
+    )
+}
+
+pub fn embedding_request_cost(provider: &str, model: &str, input_tokens_upper: u64) -> Option<f64> {
+    Some(token_cost(
+        input_tokens_upper,
+        pricing::embedding_pricing(provider, model)?,
+    ))
+}
+
+pub fn transcription_request_cost(provider: &str, model: &str, audio_seconds: f64) -> Option<f64> {
+    if !audio_seconds.is_finite() || audio_seconds < 0.0 {
+        return None;
+    }
+    Some(audio_seconds / 60.0 * pricing::transcription_pricing(provider, model)?)
+}
+
+pub fn text_tokens_upper(text: &str) -> u64 {
+    text.len() as u64
+}
+
+fn token_cost(tokens: u64, usd_per_million: f64) -> f64 {
+    tokens as f64 * usd_per_million / 1_000_000.0
 }
 
 fn assumptions(
@@ -357,7 +385,6 @@ mod tests {
             transcription_model: "whisper-1".to_owned(),
             transcribes_audio: false,
             audio_seconds: 0,
-            embedding_requests: 1,
             budget_limit_usd: None,
             files: vec![CostFile {
                 sampled_frames: 8,
@@ -417,21 +444,42 @@ mod tests {
     }
 
     #[test]
-    fn embedding_reserve_uses_the_actual_batch_request_count() {
-        let mut file_batch_input = input("openai");
-        file_batch_input.embedding_requests = 1;
-        let mut frame_input = input("openai");
-        frame_input.embedding_requests = 8;
+    fn request_cost_uses_the_actual_vision_payload_size() {
+        let one_frame = vision_request_cost(
+            "openai",
+            "gpt-5.6-luna",
+            &[ImageDimensions {
+                width: 1_280,
+                height: 720,
+            }],
+            2_000,
+            1_280,
+        )
+        .expect("vision price should be known");
+        let eight_frames = vision_request_cost(
+            "openai",
+            "gpt-5.6-luna",
+            &[ImageDimensions {
+                width: 1_280,
+                height: 720,
+            }; 8],
+            2_000,
+            2_560,
+        )
+        .expect("vision price should be known");
 
-        let file_batch_reserve = estimate(file_batch_input)
-            .embedding_request_reserve_usd
+        assert!(eight_frames > one_frame);
+    }
+
+    #[test]
+    fn request_cost_uses_the_actual_embedding_payload_size() {
+        let short = embedding_request_cost("openai", "text-embedding-3-small", 32)
             .expect("embedding price should be known");
-        let frame_reserve = estimate(frame_input)
-            .embedding_request_reserve_usd
+        let long = embedding_request_cost("openai", "text-embedding-3-small", 256)
             .expect("embedding price should be known");
 
-        assert!(file_batch_reserve > frame_reserve);
-        assert!((file_batch_reserve / frame_reserve - 8.0).abs() < 0.000_001);
+        assert!(long > short);
+        assert!((long / short - 8.0).abs() < 0.000_001);
     }
 
     #[test]
@@ -443,6 +491,9 @@ mod tests {
         let estimate = estimate(input);
 
         assert_eq!(estimate.pricing_status, "known");
-        assert_eq!(estimate.transcription_request_reserve_usd, Some(0.006));
+        assert_eq!(
+            transcription_request_cost("openai", "whisper-1", 60.0),
+            Some(0.006)
+        );
     }
 }
