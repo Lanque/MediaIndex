@@ -63,3 +63,36 @@
   finish within the configured timeout and its usage remains recorded.
 - FFmpeg process cancellation, checkpoint/resume, pricing-model expansion, and
   UI changes are outside MI-02.
+
+## 2026-09-06 — MI-03 durable AI coverage and safe partial results
+
+- Baseline: `f8160ab` (`docs: record MI-02 verification`).
+- Implementation commit: `438cac6` (`fix: persist partial AI coverage safely`).
+- Documentation commit: pending after final verification.
+- Scope: structured per-file complete/partial/failed results, failed vision
+  batch timestamp ranges, a settings fingerprint covering prompt version and
+  sampling/context/speech settings, durable SQLite coverage history, legacy
+  coverage-unknown migration handling, explicit partial/legacy retry choice,
+  visible coverage warnings, and protection for prior complete same-model
+  annotations during failed or partial retries.
+- Partial annotations remain searchable when no protected complete result
+  exists. A failed or partial retry records diagnostics without deleting the
+  prior complete result; other model namespaces remain independent.
+- No paid provider requests were made; coverage tests use SQLite fixtures and
+  local test data.
+
+### Checks
+
+- Coverage-focused Rust tests: 5 passed, 0 failed.
+- Full offline Rust test suite: 106 passed, 0 failed, 1 ignored.
+- `npm.cmd run build`: passed.
+- `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check`: passed.
+- `git diff --check`: passed apart from the repository's existing LF/CRLF
+  normalization warnings.
+
+### Remaining risks
+
+- FFmpeg process cancellation, checkpoint/resume, performance/ETA
+  instrumentation, and batch continuation remain intentionally outside MI-03.
+- The real-media OpenAI smoke test still requires a configured local video and
+  FFmpeg, so it remains ignored in this environment.
