@@ -343,7 +343,10 @@ impl AiUsageRecorder {
         let event = state.pending.values_mut().find(|event| {
             event.operation == operation
                 && event.model == model
-                && matches!(event.usage_status.as_str(), "not_reported" | "partial" | "estimated")
+                && matches!(
+                    event.usage_status.as_str(),
+                    "not_reported" | "partial" | "estimated"
+                )
                 && request_id
                     .is_none_or(|request_id| event.request_id.as_deref() == Some(request_id))
         });
@@ -693,19 +696,17 @@ mod tests {
         let recorder = AiUsageRecorder::new("run-test", "openai", "known", "2026-09-05")
             .with_budget_gate(AiBudgetGate::new(1.0).expect("valid budget should create a gate"));
         let handle = recorder
-            .begin_reserved_request(
-                "OpenAI embedding",
-                "text-embedding-3-small",
-                1,
-                Some(0.6),
-            )
+            .begin_reserved_request("OpenAI embedding", "text-embedding-3-small", 1, Some(0.6))
             .expect("embedding request should reserve its cost");
 
         handle.record_reported_usage(recorder.provider_name(), None, Some(1_000), None, None);
         handle.finish();
 
         assert!((recorder.reserved_budget_usd(Some(1.0)).unwrap() - 0.6).abs() < 0.000_001);
-        let event = recorder.drain().pop().expect("usage event should be available");
+        let event = recorder
+            .drain()
+            .pop()
+            .expect("usage event should be available");
         assert_eq!(event.usage_status, "partial");
         assert_eq!(event.calculated_cost_usd, None);
     }
@@ -795,7 +796,10 @@ mod tests {
         handle.finish();
 
         assert!((recorder.reserved_budget_usd(Some(1.0)).unwrap() - 0.006).abs() < 0.000_001);
-        let event = recorder.drain().pop().expect("usage event should be available");
+        let event = recorder
+            .drain()
+            .pop()
+            .expect("usage event should be available");
         assert_eq!(event.usage_status, "not_reported");
         assert_eq!(event.calculated_cost_usd, None);
     }
