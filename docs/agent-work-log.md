@@ -4,7 +4,8 @@
 
 - Baseline: `8804176` (`fix: budget transcription by extracted audio duration`).
 - Implementation commit: `6d9fcb9` (`fix: retain budget for incomplete AI usage`).
-- Documentation commit: pending after the final documentation checks.
+- Formatting commit: `71bedc0` (`style: format MI-01 usage tests`).
+- Documentation commit: `09483d4` (`docs: document incomplete usage budget safety`).
 - Scope: provider/operation-specific usage completeness, conservative handling of
   missing or partial usage, known lower-bound charging when it exceeds the
   request reserve, and local HTTP regression coverage for API errors, timeouts,
@@ -17,8 +18,13 @@
 - `cargo test --manifest-path desktop/src-tauri/Cargo.toml --lib --offline`:
   92 passed, 0 failed, 1 ignored.
 - Targeted timeout regression test: passed.
-- `cargo fmt --check`, `npm.cmd run build`, and `git diff --check`: pending
-  until the documentation commit is prepared.
+- `cargo test --manifest-path desktop/src-tauri/Cargo.toml --offline`:
+  92 passed, 0 failed, 1 ignored; main tests, binary tests, and doc-tests all
+  completed successfully.
+- `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check`: passed.
+- `npm.cmd run build`: passed.
+- `git diff --check`: passed; Git reported only the existing LF/CRLF
+  normalization warnings.
 
 ### Remaining risks
 
