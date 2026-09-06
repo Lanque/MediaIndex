@@ -41,8 +41,14 @@ index and availability checks.
 AI request attempts are recorded locally with operation/model, retry number,
 duration, HTTP status, optional provider request ID, pricing status, and an
 explicit possible-charge flag. Request bodies, media bytes, API keys, and
-response content are excluded; missing provider usage remains visible as
-unknown rather than being inferred as zero.
+response content are excluded. A request reserve is settled only when its
+provider usage is complete: vision needs both input and output tokens,
+embedding needs input tokens, and transcription needs a provider-reported or
+locally measured audio duration. Missing or partial usage remains unknown or
+partial and keeps the conservative reserve; an independently known lower bound
+can increase the committed cost when it exceeds that reserve. Explicit numeric
+zero usage is valid and releases the unused reserve. HTTP errors, timeouts, and
+unreadable responses retain unknown cost instead of being inferred as zero.
 
 Windows installers built locally or in pull-request CI are intentionally
 unsigned until the release owner provides an Authenticode certificate through
