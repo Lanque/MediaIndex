@@ -1218,6 +1218,11 @@ async function openSavedAnalysis(
         const coverageWarning = coverageStatus && coverageStatus !== "complete"
           ? modelMoments[0]?.ai_coverage_warning ?? "This analysis has incomplete or unverified frame coverage."
           : "";
+        const latestAttemptStatus = modelMoments[0]?.ai_latest_attempt_status;
+        const latestAttemptFailed = latestAttemptStatus === "partial" || latestAttemptStatus === "failed";
+        const retainedCompleteWarning = coverageStatus === "complete" && latestAttemptFailed
+          ? `Saved complete analysis retained; latest retry is ${latestAttemptStatus}. ${modelMoments[0]?.ai_latest_attempt_warning ?? "Run an explicit full analysis to replace it."}`
+          : "";
         return `<section class="analysis-model-group">
         <header>
           <div>
@@ -1227,6 +1232,7 @@ async function openSavedAnalysis(
           <strong>${modelMoments.length} ${modelMoments.length === 1 ? "moment" : "moments"}</strong>
         </header>
         ${coverageWarning ? `<p class="analysis-coverage-warning">${escapeHtml(coverageWarning)}</p>` : ""}
+        ${retainedCompleteWarning ? `<p class="analysis-coverage-warning">${escapeHtml(retainedCompleteWarning)}</p>` : ""}
         <div class="analysis-moment-list">
           ${modelMoments
             .map((moment, index) => `<article class="analysis-moment-card">
@@ -1275,6 +1281,11 @@ function renderResultCard(result: SearchResult, index: number): string {
   const aiCount = result.ai_annotation_count ?? 0;
   const coverageStatus = result.ai_coverage_status;
   const incompleteCoverage = coverageStatus != null && coverageStatus !== "complete";
+  const latestAttemptStatus = result.ai_latest_attempt_status;
+  const latestAttemptFailed = latestAttemptStatus === "partial" || latestAttemptStatus === "failed";
+  const retainedCompleteWarning = coverageStatus === "complete" && latestAttemptFailed
+    ? `Saved complete analysis retained; latest retry is ${latestAttemptStatus}. ${result.ai_latest_attempt_warning ?? "Run an explicit full analysis to replace it."}`
+    : "";
   const coverageFrameSummary = incompleteCoverage && result.ai_planned_frame_count != null
     ? `${result.ai_successful_frame_count ?? 0}/${result.ai_planned_frame_count} frames`
     : "";
@@ -1292,10 +1303,10 @@ function renderResultCard(result: SearchResult, index: number): string {
       ? `<span class="relevance-badge badge-ai-partial">${coverageLabel}</span>`
     : `<span class="relevance-badge badge-ai-unindexed">Scan only</span>`;
   const coverageWarning = incompleteCoverage
-    ? result.ai_coverage_warning ?? (coverageStatus === "partial"
+    ? result.ai_coverage_warning ?? result.ai_latest_attempt_warning ?? (coverageStatus === "partial"
       ? "Some sampled frame batches failed. Run an explicit full analysis to complete coverage."
       : "This AI result is not confirmed as complete. Run an explicit full analysis before treating it as exhaustive.")
-    : "";
+    : retainedCompleteWarning;
 
   const metaPills = [
     resolution,
@@ -1429,9 +1440,16 @@ function renderGroupedAiResults(results: SearchResult[]): string {
       </div>
       <p class="video-card-folder">${escapeHtml(parentFolder)}</p>
       <p class="video-best-description">${escapeHtml(bestMatch.ai_description ?? "Matching scene")}</p>
-        ${bestMatch.ai_coverage_status && bestMatch.ai_coverage_status !== "complete"
-          ? `<p class="video-card-coverage-warning">${escapeHtml(bestMatch.ai_coverage_warning ?? "Search result comes from incomplete or unverified frame coverage.")}</p>`
-          : ""}
+        ${(() => {
+          const latestAttemptStatus = bestMatch.ai_latest_attempt_status;
+          const latestAttemptFailed = latestAttemptStatus === "partial" || latestAttemptStatus === "failed";
+          const warning = bestMatch.ai_coverage_status && bestMatch.ai_coverage_status !== "complete"
+            ? bestMatch.ai_coverage_warning ?? bestMatch.ai_latest_attempt_warning ?? "Search result comes from incomplete or unverified frame coverage."
+            : bestMatch.ai_coverage_status === "complete" && latestAttemptFailed
+              ? `Saved complete analysis retained; latest retry is ${latestAttemptStatus}. ${bestMatch.ai_latest_attempt_warning ?? "Run an explicit full analysis to replace it."}`
+              : "";
+          return warning ? `<p class="video-card-coverage-warning">${escapeHtml(warning)}</p>` : "";
+        })()}
         <button class="analysis-disclosure-button view-ai-analysis" type="button" data-path="${escapeHtml(bestMatch.path)}" data-name="${escapeHtml(fileName)}" data-sample-count="${bestMatch.ai_annotation_count ?? 0}" data-available="${bestMatch.available}"><span>Full description &amp; analysis</span><small>All saved context</small></button>
         ${extraMoments}
       </div>
@@ -1643,9 +1661,13 @@ async function searchAiLibrary(): Promise<void> {
       ai_description: match.description,
       match_score: match.score,
       ai_coverage_status: match.ai_coverage_status,
+      ai_coverage_fingerprint: match.ai_coverage_fingerprint,
       ai_coverage_warning: match.ai_coverage_warning,
       ai_successful_frame_count: match.ai_successful_frame_count,
       ai_planned_frame_count: match.ai_planned_frame_count,
+      ai_latest_attempt_status: match.ai_latest_attempt_status,
+      ai_latest_attempt_fingerprint: match.ai_latest_attempt_fingerprint,
+      ai_latest_attempt_warning: match.ai_latest_attempt_warning,
       metadata: null,
     }));
     renderResults(displayResults, true);

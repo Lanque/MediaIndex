@@ -783,25 +783,45 @@ fn ai_coverage_state(
     model: &str,
     settings_fingerprint: &str,
 ) -> Result<AiCoverageState, String> {
-    if let Some(coverage) = index
+    let active_coverage = index
+        .active_ai_analysis_coverage_or_unknown(content_hash, model)
+        .map_err(|error| error.to_string())?;
+    let latest_exact = index
         .latest_ai_analysis_coverage(content_hash, model, settings_fingerprint)
-        .map_err(|error| error.to_string())?
-    {
-        return Ok(match coverage.status.as_str() {
-            "complete" => AiCoverageState::Complete,
-            "partial" | "failed" => AiCoverageState::Partial,
-            _ => AiCoverageState::CoverageUnknown,
-        });
+        .map_err(|error| error.to_string())?;
+
+    if let Some(active_coverage) = active_coverage {
+        if active_coverage.settings_fingerprint == settings_fingerprint {
+            return Ok(match active_coverage.status.as_str() {
+                "complete" => AiCoverageState::Complete,
+                "partial" | "failed" => AiCoverageState::Partial,
+                _ => AiCoverageState::CoverageUnknown,
+            });
+        }
+        if latest_exact
+            .as_ref()
+            .is_some_and(|coverage| matches!(coverage.status.as_str(), "partial" | "failed"))
+        {
+            return Ok(AiCoverageState::Partial);
+        }
+        return Ok(AiCoverageState::CoverageUnknown);
     }
-    if index
-        .latest_ai_analysis_coverage_or_unknown(content_hash, model)
-        .map_err(|error| error.to_string())?
-        .is_some()
+
+    if latest_exact
+        .as_ref()
+        .is_some_and(|coverage| matches!(coverage.status.as_str(), "partial" | "failed"))
     {
-        Ok(AiCoverageState::CoverageUnknown)
-    } else {
-        Ok(AiCoverageState::New)
+        return Ok(AiCoverageState::Partial);
     }
+    if latest_exact.is_some()
+        || index
+            .latest_ai_analysis_coverage_for_content_model(content_hash, model)
+            .map_err(|error| error.to_string())?
+            .is_some()
+    {
+        return Ok(AiCoverageState::CoverageUnknown);
+    }
+    Ok(AiCoverageState::New)
 }
 
 fn count_already_analyzed(
@@ -1572,6 +1592,168 @@ mod tests {
             .expect("forced selection should work");
         assert_eq!(forced.files.len(), 1);
         assert!(!requires_explicit_coverage_confirmation(true, 1, 0));
+    }
+
+    #[test]
+    fn selection_uses_the_active_coverage_after_settings_switches() {
+        let mut index = local_index::SqliteIndex::open_in_memory().expect("index should open");
+        let file = local_index::IndexedFile {
+            path: "/library/settings-switch.mp4".to_owned(),
+            content_hash: "hash-settings-switch".to_owned(),
+            size_bytes: 10,
+            modified_unix_ms: None,
+            status: local_index::LocalFileStatus::Active,
+            identity_verified: true,
+        };
+        index
+            .reconcile(
+                &scanner::ScanReport {
+                    files: vec![scanner::DiscoveredFile {
+                        path: file.path.clone(),
+                        size_bytes: file.size_bytes,
+                        modified_unix_ms: file.modified_unix_ms,
+                        content_hash: file.content_hash.clone(),
+                    }],
+                    warnings: Vec::new(),
+                },
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+
+        for (fingerprint, timestamp_ms, description) in [
+            ("fingerprint-a", 1_000, "Settings A"),
+            ("fingerprint-b", 2_000, "Settings B"),
+        ] {
+            index
+                .record_ai_analysis_result(
+                    &file.content_hash,
+                    "model-a",
+                    fingerprint,
+                    None,
+                    &ai::AiFileAnalysisResult {
+                        annotations: vec![ai::AiAnnotation {
+                            timestamp_ms,
+                            description: description.to_owned(),
+                            labels: Vec::new(),
+                            embedding: vec![1.0, 0.0],
+                            confidence: None,
+                            model: "model-a".to_owned(),
+                        }],
+                        planned_frame_count: 1,
+                        successful_frame_count: 1,
+                        failed_batches: Vec::new(),
+                        status: ai::AiFileAnalysisStatus::Complete,
+                        warning: None,
+                    },
+                )
+                .expect("complete result should persist");
+        }
+
+        let old_settings = select_ai_files(
+            &index,
+            vec![file.clone()],
+            "model-a",
+            "fingerprint-a",
+            false,
+        )
+        .expect("selection should work");
+        assert!(old_settings.files.is_empty());
+        assert_eq!(old_settings.skipped_file_count, 1);
+        assert_eq!(old_settings.coverage_unknown_file_count, 1);
+
+        let active_settings = select_ai_files(
+            &index,
+            vec![file.clone()],
+            "model-a",
+            "fingerprint-b",
+            false,
+        )
+        .expect("selection should work");
+        assert!(active_settings.files.is_empty());
+        assert_eq!(active_settings.skipped_file_count, 1);
+        assert_eq!(active_settings.coverage_unknown_file_count, 0);
+
+        let restored_settings =
+            select_ai_files(&index, vec![file], "model-a", "fingerprint-a", true)
+                .expect("forced selection should work");
+        assert_eq!(restored_settings.files.len(), 1);
+    }
+
+    #[test]
+    fn failed_latest_attempt_keeps_prior_complete_result_selectable() {
+        let mut index = local_index::SqliteIndex::open_in_memory().expect("index should open");
+        let file = local_index::IndexedFile {
+            path: "/library/failed-retry.mp4".to_owned(),
+            content_hash: "hash-failed-retry".to_owned(),
+            size_bytes: 10,
+            modified_unix_ms: None,
+            status: local_index::LocalFileStatus::Active,
+            identity_verified: true,
+        };
+        index
+            .reconcile(
+                &scanner::ScanReport {
+                    files: vec![scanner::DiscoveredFile {
+                        path: file.path.clone(),
+                        size_bytes: file.size_bytes,
+                        modified_unix_ms: file.modified_unix_ms,
+                        content_hash: file.content_hash.clone(),
+                    }],
+                    warnings: Vec::new(),
+                },
+                &HashMap::new(),
+            )
+            .expect("fixture should be indexed");
+        index
+            .record_ai_analysis_result(
+                &file.content_hash,
+                "model-a",
+                "fingerprint-a",
+                None,
+                &ai::AiFileAnalysisResult {
+                    annotations: vec![ai::AiAnnotation {
+                        timestamp_ms: 1_000,
+                        description: "Complete A".to_owned(),
+                        labels: Vec::new(),
+                        embedding: vec![1.0, 0.0],
+                        confidence: None,
+                        model: "model-a".to_owned(),
+                    }],
+                    planned_frame_count: 1,
+                    successful_frame_count: 1,
+                    failed_batches: Vec::new(),
+                    status: ai::AiFileAnalysisStatus::Complete,
+                    warning: None,
+                },
+            )
+            .expect("complete result should persist");
+        index
+            .record_ai_analysis_result(
+                &file.content_hash,
+                "model-a",
+                "fingerprint-b",
+                None,
+                &ai::AiFileAnalysisResult {
+                    annotations: Vec::new(),
+                    planned_frame_count: 1,
+                    successful_frame_count: 0,
+                    failed_batches: Vec::new(),
+                    status: ai::AiFileAnalysisStatus::Failed,
+                    warning: Some("Retry failed".to_owned()),
+                },
+            )
+            .expect("failed retry should persist diagnostics");
+
+        assert_eq!(
+            ai_coverage_state(&index, &file.content_hash, "model-a", "fingerprint-a")
+                .expect("active settings should be readable"),
+            AiCoverageState::Complete
+        );
+        assert_eq!(
+            ai_coverage_state(&index, &file.content_hash, "model-a", "fingerprint-b")
+                .expect("failed settings should be readable"),
+            AiCoverageState::Partial
+        );
     }
 
     #[test]
