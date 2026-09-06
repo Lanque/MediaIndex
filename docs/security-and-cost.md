@@ -107,8 +107,11 @@ delivery, stale cursors, authorization failures, and worker crashes.
   version, sampling interval, frame cap, batch shape, context hint, and speech
   settings. Each attempt records complete, partial, or failed status, planned
   and successful frame counts, failed timestamp ranges, and a user-visible
-  warning. Pre-migration annotations are marked coverage-unknown and are not
-  automatically sent to a paid queue.
+  warning. Annotation rows point to the coverage record that produced the
+  active saved result; the latest attempt's status and warning are reported
+  separately. A historical complete row alone never makes a different active
+  settings fingerprint look complete. Pre-migration annotations are marked
+  coverage-unknown and are not automatically sent to a paid queue.
 - Partial or failed retries are an explicit user choice. Their conservative
   full-attempt estimate is shown before confirmation. A partial result can
   remain searchable, but it is labeled as incomplete; a failed or partial

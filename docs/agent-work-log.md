@@ -68,7 +68,7 @@
 
 - Baseline: `f8160ab` (`docs: record MI-02 verification`).
 - Implementation commit: `438cac6` (`fix: persist partial AI coverage safely`).
-- Documentation commit: pending after final verification.
+- Documentation commit: `aab22e1` (`docs: record MI-03 coverage safeguards`).
 - Scope: structured per-file complete/partial/failed results, failed vision
   batch timestamp ranges, a settings fingerprint covering prompt version and
   sampling/context/speech settings, durable SQLite coverage history, legacy
@@ -94,5 +94,35 @@
 
 - FFmpeg process cancellation, checkpoint/resume, performance/ETA
   instrumentation, and batch continuation remain intentionally outside MI-03.
+- The real-media OpenAI smoke test still requires a configured local video and
+  FFmpeg, so it remains ignored in this environment.
+
+## 2026-09-06 — MI-03R active coverage pointer and cancellation fix
+
+- Baseline: `aab22e1` (`docs: record MI-03 coverage safeguards`).
+- Implementation commit: `df125c0` (`fix: separate active AI coverage from latest attempts`).
+- Documentation commit: pending after final verification.
+- Scope: an annotation-to-coverage pointer and migration for durable active
+  results, selection that trusts only the active matching settings fingerprint,
+  separate latest-attempt diagnostics in library/search/inspector responses,
+  and cancellation-specific handling for speech retries.
+- Complete annotations stay active when a later failed or partial attempt only
+  records diagnostics. Switching from A to B and back to A no longer treats a
+  historical A row as active while B annotations are stored.
+- No paid provider requests were made; the speech cancellation regression uses
+  a local multipart HTTP stub and the coverage regressions use SQLite fixtures.
+
+### Checks
+
+- Full offline Rust test suite: 109 passed, 0 failed, 1 ignored.
+- `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check`: passed.
+- `npm.cmd run build`: passed.
+- `git diff --check`: passed apart from the repository's existing LF/CRLF
+  normalization warnings.
+
+### Remaining risks
+
+- FFmpeg process cancellation, checkpoint/resume, performance/ETA
+  instrumentation, and batch continuation remain intentionally outside MI-03R.
 - The real-media OpenAI smoke test still requires a configured local video and
   FFmpeg, so it remains ignored in this environment.
