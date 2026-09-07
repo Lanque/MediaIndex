@@ -1,8 +1,11 @@
 pub mod ai;
+pub mod cost;
 pub mod gemini_oauth;
 pub mod local_index;
 pub mod metadata;
+pub mod pricing;
 pub mod scanner;
+pub mod usage;
 
 use base64::Engine;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -10,6 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
@@ -67,6 +71,7 @@ struct AiAnalysisPlan {
     estimated_sampled_frames: u64,
     estimated_vision_requests: u64,
     estimated_audio_seconds: u64,
+    estimated_cost: cost::AiCostEstimate,
     model: String,
 }
 
@@ -123,6 +128,7 @@ fn index_media_folder_blocking(
                     size_bytes: file.size_bytes,
                     modified_unix_ms: file.modified_unix_ms,
                     content_hash: file.content_hash,
+                    identity_verified: file.identity_verified,
                 },
             )
         })
@@ -231,6 +237,7 @@ fn plan_ai_analysis(
     if indexed_files.is_empty() {
         return Err("No indexed active clips were found in the selected folder".to_owned());
     }
+    ensure_ai_identity_verified(&indexed_files)?;
     let model = settings.model_namespace();
     let total_file_count = indexed_files.len() as u64;
     let already_analyzed_file_count = count_already_analyzed(&index, &indexed_files, &model)?;
@@ -243,6 +250,7 @@ fn plan_ai_analysis(
     let mut estimated_sampled_frames = 0u64;
     let mut estimated_vision_requests = 0u64;
     let mut estimated_audio_seconds = 0u64;
+    let mut cost_files = Vec::with_capacity(files.len());
     for file in &files {
         let metadata = index
             .get_asset_metadata(&file.content_hash)
@@ -258,8 +266,14 @@ fn plan_ai_analysis(
             })
             .unwrap_or(max_frames_per_file);
         estimated_sampled_frames = estimated_sampled_frames.saturating_add(sampled_frames);
-        estimated_vision_requests =
-            estimated_vision_requests.saturating_add(sampled_frames.div_ceil(vision_batch_size));
+        let vision_requests = sampled_frames.div_ceil(vision_batch_size);
+        estimated_vision_requests = estimated_vision_requests.saturating_add(vision_requests);
+        cost_files.push(cost::CostFile {
+            sampled_frames,
+            vision_requests,
+            width: metadata.as_ref().and_then(|metadata| metadata.width),
+            height: metadata.as_ref().and_then(|metadata| metadata.height),
+        });
         if settings.transcribes_audio()
             && metadata
                 .as_ref()
@@ -277,6 +291,16 @@ fn plan_ai_analysis(
             );
         }
     }
+    let estimated_cost = cost::estimate(cost::CostInput {
+        provider: settings.provider_name().to_owned(),
+        vision_model: settings.vision_model().to_owned(),
+        embedding_model: settings.embedding_model().to_owned(),
+        transcription_model: settings.transcription_model().to_owned(),
+        transcribes_audio: settings.transcribes_audio(),
+        audio_seconds: estimated_audio_seconds,
+        budget_limit_usd: settings.budget_usd(),
+        files: cost_files,
+    });
 
     Ok(AiAnalysisPlan {
         total_file_count,
@@ -289,6 +313,7 @@ fn plan_ai_analysis(
         estimated_sampled_frames,
         estimated_vision_requests,
         estimated_audio_seconds,
+        estimated_cost,
         model,
     })
 }
@@ -305,8 +330,10 @@ fn analyze_media_folder_blocking(
     force: bool,
     control: &AiAnalysisControl,
 ) -> Result<ai::AiIndexReport, String> {
-    let settings = ai_settings(&app, config)?;
+    let settings = ai_settings(&app, config.clone())?;
     let mut index = open_local_index(&app)?;
+    let plan = plan_ai_analysis(app.clone(), path.clone(), config.clone(), Some(force))?;
+    validate_ai_budget(&plan)?;
     let root = Path::new(&path);
     let indexed_files = unique_indexed_files_under_root(
         index.known_files().map_err(|error| error.to_string())?,
@@ -315,9 +342,43 @@ fn analyze_media_folder_blocking(
     if indexed_files.is_empty() {
         return Err("No indexed active clips were found in the selected folder".to_owned());
     }
+    ensure_ai_identity_verified(&indexed_files)?;
 
     let provider = settings.model_namespace();
     let (files, skipped_file_count) = select_ai_files(&index, indexed_files, &provider, force)?;
+    let run_id = new_ai_run_id();
+    let recorder = usage::AiUsageRecorder::new(
+        run_id.clone(),
+        settings.provider_name(),
+        plan.estimated_cost.pricing_status,
+        plan.estimated_cost.pricing_checked_at,
+    );
+    let usage_recorder = match (
+        plan.estimated_cost.budget_limit_usd,
+        plan.estimated_cost.pricing_status,
+    ) {
+        (Some(limit), "known") => usage::AiBudgetGate::new(limit)
+            .map(|gate| recorder.clone().with_budget_gate(gate))
+            .unwrap_or(recorder),
+        _ => recorder,
+    };
+    index
+        .start_ai_analysis_run(&usage::AiRunSpec {
+            run_id: run_id.clone(),
+            operation: "analyze_media_folder".to_owned(),
+            provider: settings.provider_name().to_owned(),
+            vision_model: settings.vision_model().to_owned(),
+            embedding_model: settings.embedding_model().to_owned(),
+            transcription_model: settings
+                .transcribes_audio()
+                .then(|| settings.transcription_model().to_owned()),
+            model_namespace: provider.clone(),
+            pricing_status: plan.estimated_cost.pricing_status.to_owned(),
+            pricing_checked_at: plan.estimated_cost.pricing_checked_at.to_owned(),
+            estimated_cost_usd: plan.estimated_cost.estimated_likely_usd,
+            budget_limit_usd: plan.estimated_cost.budget_limit_usd,
+        })
+        .map_err(|error| error.to_string())?;
 
     let mut report = ai::AiIndexReport {
         analyzed_file_count: 0,
@@ -348,16 +409,16 @@ fn analyze_media_folder_blocking(
     let worker_count = settings.parallel_file_limit().min(tasks.len());
     let tasks = Arc::new(Mutex::new(tasks));
     let file_progress = Arc::new(Mutex::new(vec![0u8; total_files as usize]));
-    let completed_files = Arc::new(AtomicU64::new(0));
+    let persisted_files = Arc::new(AtomicU64::new(0));
     let (sender, receiver) = mpsc::channel();
 
-    std::thread::scope(|scope| {
+    let worker_result = std::thread::scope(|scope| {
         for _ in 0..worker_count {
             let worker_tasks = Arc::clone(&tasks);
             let worker_progress = Arc::clone(&file_progress);
-            let worker_completed = Arc::clone(&completed_files);
+            let worker_persisted = Arc::clone(&persisted_files);
             let worker_sender = sender.clone();
-            let worker_settings = settings.clone();
+            let worker_settings = settings.clone().with_usage_recorder(usage_recorder.clone());
             let worker_provider = provider.clone();
             let worker_app = app.clone();
             let worker_control = control.clone();
@@ -380,7 +441,7 @@ fn analyze_media_folder_blocking(
                             update_overall_progress(&worker_progress, file_index, progress.percent);
                         emit_ai_progress(
                             &worker_app,
-                            worker_completed.load(Ordering::Relaxed),
+                            worker_persisted.load(Ordering::Relaxed),
                             total_files,
                             current_file.clone(),
                             worker_provider.clone(),
@@ -394,52 +455,62 @@ fn analyze_media_folder_blocking(
                     let _ = worker_sender.send((file_index, file, result));
                     break;
                 }
-                let percent = update_overall_progress(&worker_progress, file_index, 100);
-                let completed = worker_completed.fetch_add(1, Ordering::Relaxed) + 1;
-                let phase = if result.is_ok() {
-                    "Clip finished"
-                } else {
-                    "Clip finished with a warning"
-                };
-                emit_ai_progress(
-                    &worker_app,
-                    completed,
-                    total_files,
-                    current_file,
-                    worker_provider.clone(),
-                    percent,
-                    phase,
-                );
                 if worker_sender.send((file_index, file, result)).is_err() {
                     break;
                 }
             });
         }
-    });
-    drop(sender);
+        drop(sender);
 
-    let mut results = receiver.into_iter().collect::<Vec<_>>();
-    results.sort_by_key(|(file_index, _, _)| *file_index);
-    for (_, file, result) in results {
-        match result {
-            Ok(annotations) => {
-                report.analyzed_file_count += 1;
-                report.annotation_count += annotations.len() as u64;
-                index
-                    .replace_ai_annotations(&file.content_hash, &annotations)
-                    .map_err(|error| error.to_string())?;
+        while let Ok((file_index, file, result)) = receiver.recv() {
+            persist_ai_usage_events(&mut index, &usage_recorder)?;
+            let outcome =
+                persist_ai_result(&mut index, &mut report, &file, result, &persisted_files)?;
+            let percent = update_overall_progress(&file_progress, file_index, 100);
+            match outcome {
+                AiResultOutcome::Committed => emit_ai_progress(
+                    &app,
+                    persisted_files.load(Ordering::Relaxed),
+                    total_files,
+                    file.path,
+                    provider.clone(),
+                    percent,
+                    "Clip saved",
+                ),
+                AiResultOutcome::Warning => emit_ai_progress(
+                    &app,
+                    persisted_files.load(Ordering::Relaxed),
+                    total_files,
+                    file.path,
+                    provider.clone(),
+                    percent,
+                    "Clip finished with a warning",
+                ),
+                AiResultOutcome::Cancelled => {}
             }
-            Err(error) if error == ai::AI_ANALYSIS_CANCELLED_MESSAGE => {
-                report.cancelled = true;
-            }
-            Err(error) => report.warnings.push(ai::AiWarning {
-                path: file.path,
-                message: error,
-            }),
         }
-    }
+        Ok::<(), String>(())
+    });
+
+    persist_ai_usage_events(&mut index, &usage_recorder)?;
 
     report.cancelled |= control.is_cancelled();
+    let run_status = match &worker_result {
+        Ok(()) if report.cancelled => "cancelled",
+        Ok(()) if report.warnings.is_empty() => "completed",
+        Ok(()) => "partial",
+        Err(_) => "failed",
+    };
+    index
+        .finish_ai_analysis_run(
+            &run_id,
+            run_status,
+            report.analyzed_file_count,
+            report.annotation_count,
+            usage_recorder.reserved_budget_usd(plan.estimated_cost.budget_limit_usd),
+        )
+        .map_err(|error| error.to_string())?;
+    worker_result?;
 
     if !report.cancelled {
         emit_ai_progress(
@@ -456,6 +527,82 @@ fn analyze_media_folder_blocking(
     Ok(report)
 }
 
+fn new_ai_run_id() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("run-{}-{timestamp}", std::process::id())
+}
+
+fn persist_ai_usage_events(
+    index: &mut local_index::SqliteIndex,
+    recorder: &usage::AiUsageRecorder,
+) -> Result<(), String> {
+    for event in recorder.drain() {
+        index
+            .record_ai_usage_event(&event)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn validate_ai_budget(plan: &AiAnalysisPlan) -> Result<(), String> {
+    let cost = &plan.estimated_cost;
+    if cost.budget_limit_usd.is_none() || cost.pricing_status == "local" {
+        return Ok(());
+    }
+    match cost.budget_status {
+        "exceeds_limit" => Err(
+            "The conservative API cost estimate exceeds the configured budget; refresh the plan before starting analysis."
+                .to_owned(),
+        ),
+        "unknown" => Err(
+            "The configured budget cannot be enforced because at least one selected model has unknown pricing."
+                .to_owned(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AiResultOutcome {
+    Committed,
+    Warning,
+    Cancelled,
+}
+
+fn persist_ai_result(
+    index: &mut local_index::SqliteIndex,
+    report: &mut ai::AiIndexReport,
+    file: &local_index::IndexedFile,
+    result: Result<Vec<ai::AiAnnotation>, String>,
+    persisted_files: &AtomicU64,
+) -> Result<AiResultOutcome, String> {
+    match result {
+        Ok(annotations) => {
+            index
+                .replace_ai_annotations(&file.content_hash, &annotations)
+                .map_err(|error| error.to_string())?;
+            report.analyzed_file_count += 1;
+            report.annotation_count += annotations.len() as u64;
+            persisted_files.fetch_add(1, Ordering::Relaxed);
+            Ok(AiResultOutcome::Committed)
+        }
+        Err(error) if error == ai::AI_ANALYSIS_CANCELLED_MESSAGE => {
+            report.cancelled = true;
+            Ok(AiResultOutcome::Cancelled)
+        }
+        Err(error) => {
+            report.warnings.push(ai::AiWarning {
+                path: file.path.clone(),
+                message: error,
+            });
+            Ok(AiResultOutcome::Warning)
+        }
+    }
+}
+
 fn unique_indexed_files_under_root(
     files: Vec<local_index::IndexedFile>,
     root: &Path,
@@ -464,8 +611,21 @@ fn unique_indexed_files_under_root(
     files
         .into_iter()
         .filter(|file| Path::new(&file.path).starts_with(root))
-        .filter(|file| content_hashes.insert(file.content_hash.clone()))
+        .filter(|file| !file.identity_verified || content_hashes.insert(file.content_hash.clone()))
         .collect()
+}
+
+fn ensure_ai_identity_verified(indexed_files: &[local_index::IndexedFile]) -> Result<(), String> {
+    let unverified_count = indexed_files
+        .iter()
+        .filter(|file| !file.identity_verified)
+        .count();
+    if unverified_count > 0 {
+        return Err(format!(
+            "AI analysis requires a fresh scan before paid requests: {unverified_count} indexed clip identity(ies) are unverified"
+        ));
+    }
+    Ok(())
 }
 
 fn select_ai_files(
@@ -477,7 +637,14 @@ fn select_ai_files(
     let mut files = Vec::with_capacity(indexed_files.len());
     let mut skipped_file_count = 0u64;
     for file in indexed_files {
-        let already_analyzed = !force
+        if !file.identity_verified {
+            return Err(format!(
+                "AI analysis requires a fresh scan before paid requests: '{}' has an unverified identity",
+                file.path
+            ));
+        }
+        let already_analyzed = file.identity_verified
+            && !force
             && index
                 .has_ai_annotations_for_content_model(&file.content_hash, model)
                 .map_err(|error| error.to_string())?;
@@ -497,9 +664,10 @@ fn count_already_analyzed(
 ) -> Result<u64, String> {
     let mut count = 0u64;
     for file in indexed_files {
-        if index
-            .has_ai_annotations_for_content_model(&file.content_hash, model)
-            .map_err(|error| error.to_string())?
+        if file.identity_verified
+            && index
+                .has_ai_annotations_for_content_model(&file.content_hash, model)
+                .map_err(|error| error.to_string())?
         {
             count += 1;
         }
@@ -569,7 +737,7 @@ fn search_ai_blocking(
 ) -> Result<Vec<local_index::AiSearchResult>, String> {
     let settings = ai_settings(&app, config)?;
     let model_namespace = settings.model_namespace();
-    let index = open_local_index(&app)?;
+    let mut index = open_local_index(&app)?;
     let root_path = root
         .as_deref()
         .filter(|value| !value.trim().is_empty())
@@ -583,17 +751,59 @@ fn search_ai_blocking(
             "No AI moments indexed for {model_namespace}. Analyze the folder with this provider and model first."
         ));
     }
-    let embedding = ai::embed_query(&query, &settings)?;
+    let run_id = new_ai_run_id();
+    let usage_recorder = usage::AiUsageRecorder::new(
+        run_id.clone(),
+        settings.provider_name(),
+        "unknown",
+        pricing::PRICING_CHECKED_AT,
+    );
     index
-        .search_ai_with_focus_under_root(
-            &query,
-            &embedding,
-            100,
-            Some(&model_namespace),
-            focus.unwrap_or_default(),
-            root_path,
+        .start_ai_analysis_run(&usage::AiRunSpec {
+            run_id: run_id.clone(),
+            operation: "search_ai".to_owned(),
+            provider: settings.provider_name().to_owned(),
+            vision_model: settings.vision_model().to_owned(),
+            embedding_model: settings.embedding_model().to_owned(),
+            transcription_model: None,
+            model_namespace: model_namespace.clone(),
+            pricing_status: "unknown".to_owned(),
+            pricing_checked_at: pricing::PRICING_CHECKED_AT.to_owned(),
+            estimated_cost_usd: None,
+            budget_limit_usd: None,
+        })
+        .map_err(|error| error.to_string())?;
+    let embedding = ai::embed_query(
+        &query,
+        &settings.with_usage_recorder(usage_recorder.clone()),
+    );
+    persist_ai_usage_events(&mut index, &usage_recorder)?;
+    let results = embedding.and_then(|embedding| {
+        index
+            .search_ai_with_focus_under_root(
+                &query,
+                &embedding,
+                100,
+                Some(&model_namespace),
+                focus.unwrap_or_default(),
+                root_path,
+            )
+            .map_err(|error| error.to_string())
+    });
+    index
+        .finish_ai_analysis_run(
+            &run_id,
+            if results.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+            0,
+            0,
+            None,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    results
 }
 
 #[tauri::command]
@@ -678,7 +888,46 @@ fn test_ai_connection_blocking(
     config: Option<ai::AiRequestConfig>,
 ) -> Result<ai::AiConnectionReport, String> {
     let settings = ai_settings(&app, config)?;
-    ai::test_connection(&settings)
+    let mut index = open_local_index(&app)?;
+    let run_id = new_ai_run_id();
+    let usage_recorder = usage::AiUsageRecorder::new(
+        run_id.clone(),
+        settings.provider_name(),
+        "unknown",
+        pricing::PRICING_CHECKED_AT,
+    );
+    let model_namespace = settings.model_namespace();
+    index
+        .start_ai_analysis_run(&usage::AiRunSpec {
+            run_id: run_id.clone(),
+            operation: "test_ai_connection".to_owned(),
+            provider: settings.provider_name().to_owned(),
+            vision_model: settings.vision_model().to_owned(),
+            embedding_model: settings.embedding_model().to_owned(),
+            transcription_model: None,
+            model_namespace,
+            pricing_status: "unknown".to_owned(),
+            pricing_checked_at: pricing::PRICING_CHECKED_AT.to_owned(),
+            estimated_cost_usd: None,
+            budget_limit_usd: None,
+        })
+        .map_err(|error| error.to_string())?;
+    let result = ai::test_connection(&settings.with_usage_recorder(usage_recorder.clone()));
+    persist_ai_usage_events(&mut index, &usage_recorder)?;
+    index
+        .finish_ai_analysis_run(
+            &run_id,
+            if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+            0,
+            0,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+    result
 }
 
 fn ai_settings(
@@ -813,6 +1062,181 @@ mod tests {
     }
 
     #[test]
+    fn persisted_file_counter_changes_only_after_successful_sqlite_commit() {
+        let mut index = local_index::SqliteIndex::open_in_memory().expect("index should open");
+        let file = local_index::IndexedFile {
+            path: "/library/clip.mp4".to_owned(),
+            content_hash: "hash-clip".to_owned(),
+            size_bytes: 10,
+            modified_unix_ms: None,
+            status: local_index::LocalFileStatus::Active,
+            identity_verified: true,
+        };
+        index
+            .reconcile(
+                &scanner::ScanReport {
+                    files: vec![scanner::DiscoveredFile {
+                        path: file.path.clone(),
+                        size_bytes: file.size_bytes,
+                        modified_unix_ms: file.modified_unix_ms,
+                        content_hash: file.content_hash.clone(),
+                    }],
+                    warnings: Vec::new(),
+                },
+                &HashMap::new(),
+            )
+            .expect("file should be indexed");
+
+        let mut report = ai::AiIndexReport {
+            analyzed_file_count: 0,
+            skipped_file_count: 0,
+            annotation_count: 0,
+            cancelled: false,
+            warnings: Vec::new(),
+        };
+        let persisted_files = AtomicU64::new(0);
+        let annotation = ai::AiAnnotation {
+            timestamp_ms: 1_000,
+            description: "A saved scene".to_owned(),
+            labels: vec!["scene".to_owned()],
+            embedding: vec![0.1, 0.2],
+            confidence: Some(0.9),
+            model: "openai:test".to_owned(),
+        };
+
+        assert_eq!(
+            persist_ai_result(
+                &mut index,
+                &mut report,
+                &file,
+                Ok(vec![annotation.clone()]),
+                &persisted_files,
+            )
+            .expect("result should be committed"),
+            AiResultOutcome::Committed
+        );
+        assert_eq!(persisted_files.load(Ordering::Relaxed), 1);
+        assert_eq!(index.ai_annotation_count().expect("count should load"), 1);
+
+        let missing_file = local_index::IndexedFile {
+            content_hash: "missing-hash".to_owned(),
+            ..file
+        };
+        assert!(persist_ai_result(
+            &mut index,
+            &mut report,
+            &missing_file,
+            Ok(vec![annotation]),
+            &persisted_files,
+        )
+        .is_err());
+        assert_eq!(persisted_files.load(Ordering::Relaxed), 1);
+        assert_eq!(report.analyzed_file_count, 1);
+    }
+
+    #[test]
+    fn cancellation_keeps_a_completed_clip_and_stops_the_next_worker_result() {
+        let mut index = local_index::SqliteIndex::open_in_memory().expect("index should open");
+        let file = local_index::IndexedFile {
+            path: "/library/clip.mp4".to_owned(),
+            content_hash: "hash-cancelled-clip".to_owned(),
+            size_bytes: 10,
+            modified_unix_ms: None,
+            status: local_index::LocalFileStatus::Active,
+            identity_verified: true,
+        };
+        index
+            .reconcile(
+                &scanner::ScanReport {
+                    files: vec![scanner::DiscoveredFile {
+                        path: file.path.clone(),
+                        size_bytes: file.size_bytes,
+                        modified_unix_ms: file.modified_unix_ms,
+                        content_hash: file.content_hash.clone(),
+                    }],
+                    warnings: Vec::new(),
+                },
+                &HashMap::new(),
+            )
+            .expect("file should be indexed");
+
+        let annotation = ai::AiAnnotation {
+            timestamp_ms: 1_000,
+            description: "A completed scene".to_owned(),
+            labels: vec!["scene".to_owned()],
+            embedding: vec![0.1, 0.2],
+            confidence: Some(0.9),
+            model: "openai:test".to_owned(),
+        };
+        let control = AiAnalysisControl::default();
+        let _guard = control.begin().expect("analysis should start");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let completed_annotation = annotation.clone();
+        let completed_worker = std::thread::spawn(move || {
+            ready_tx
+                .send(())
+                .expect("test should observe completed work");
+            Ok::<Vec<ai::AiAnnotation>, String>(vec![completed_annotation])
+        });
+        let next_worker_control = control.clone();
+        let next_worker = std::thread::spawn(move || {
+            stop_rx.recv().expect("test should release the next worker");
+            if next_worker_control.is_cancelled() {
+                Err(ai::AI_ANALYSIS_CANCELLED_MESSAGE.to_owned())
+            } else {
+                Ok(Vec::new())
+            }
+        });
+
+        ready_rx
+            .recv()
+            .expect("first worker should finish before cancellation");
+        assert!(control.request_cancel());
+        stop_tx.send(()).expect("next worker should be released");
+        let completed_result = completed_worker
+            .join()
+            .expect("completed worker should finish");
+        let cancelled_result = next_worker.join().expect("cancelled worker should finish");
+
+        let mut report = ai::AiIndexReport {
+            analyzed_file_count: 0,
+            skipped_file_count: 0,
+            annotation_count: 0,
+            cancelled: false,
+            warnings: Vec::new(),
+        };
+        let persisted_files = AtomicU64::new(0);
+        assert_eq!(
+            persist_ai_result(
+                &mut index,
+                &mut report,
+                &file,
+                completed_result,
+                &persisted_files,
+            )
+            .expect("completed clip should still be committed"),
+            AiResultOutcome::Committed
+        );
+        assert_eq!(
+            persist_ai_result(
+                &mut index,
+                &mut report,
+                &file,
+                cancelled_result,
+                &persisted_files,
+            )
+            .expect("cancellation should be handled"),
+            AiResultOutcome::Cancelled
+        );
+        report.cancelled = true;
+
+        assert_eq!(persisted_files.load(Ordering::Relaxed), 1);
+        assert_eq!(index.ai_annotation_count().expect("count should load"), 1);
+        assert!(report.cancelled);
+    }
+
+    #[test]
     fn analysis_control_prevents_overlap_and_resets_after_cancellation() {
         let control = AiAnalysisControl::default();
         let guard = control.begin().expect("first analysis should start");
@@ -836,6 +1260,7 @@ mod tests {
                 size_bytes: 10,
                 modified_unix_ms: None,
                 status: local_index::LocalFileStatus::Active,
+                identity_verified: true,
             },
             local_index::IndexedFile {
                 path: "/library/b/copy.mp4".to_owned(),
@@ -843,6 +1268,7 @@ mod tests {
                 size_bytes: 10,
                 modified_unix_ms: None,
                 status: local_index::LocalFileStatus::Active,
+                identity_verified: true,
             },
             local_index::IndexedFile {
                 path: "/library/b/unique.mp4".to_owned(),
@@ -850,6 +1276,7 @@ mod tests {
                 size_bytes: 20,
                 modified_unix_ms: None,
                 status: local_index::LocalFileStatus::Active,
+                identity_verified: true,
             },
             local_index::IndexedFile {
                 path: "/outside/other.mp4".to_owned(),
@@ -857,6 +1284,7 @@ mod tests {
                 size_bytes: 30,
                 modified_unix_ms: None,
                 status: local_index::LocalFileStatus::Active,
+                identity_verified: true,
             },
         ];
 
@@ -868,6 +1296,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unverified_content_before_ai_analysis() {
+        let files = vec![local_index::IndexedFile {
+            path: "/library/legacy/clip.mp4".to_owned(),
+            content_hash: "legacy-hash".to_owned(),
+            size_bytes: 10,
+            modified_unix_ms: None,
+            status: local_index::LocalFileStatus::Active,
+            identity_verified: false,
+        }];
+
+        let error = ensure_ai_identity_verified(&files).expect_err("legacy identity must block");
+
+        assert!(error.contains("fresh scan"));
+        assert!(error.contains("unverified"));
+    }
+
+    #[test]
     fn derives_the_common_active_library_root() {
         let files = vec![
             local_index::IndexedFile {
@@ -876,6 +1321,7 @@ mod tests {
                 size_bytes: 10,
                 modified_unix_ms: None,
                 status: local_index::LocalFileStatus::Active,
+                identity_verified: true,
             },
             local_index::IndexedFile {
                 path: "/library/fortnite/day-two/clip-b.mp4".to_owned(),
@@ -883,6 +1329,7 @@ mod tests {
                 size_bytes: 20,
                 modified_unix_ms: None,
                 status: local_index::LocalFileStatus::Active,
+                identity_verified: true,
             },
         ];
 

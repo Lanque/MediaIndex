@@ -62,7 +62,31 @@ export type AiAnalysisPlan = {
   estimated_sampled_frames: number;
   estimated_vision_requests: number;
   estimated_audio_seconds: number;
+  estimated_cost: AiCostEstimate;
   model: string;
+};
+
+export type AiTokenEstimate = {
+  low: number;
+  likely: number;
+  high: number;
+};
+
+export type AiCostEstimate = {
+  currency: string;
+  pricing_status: "known" | "unknown" | "local";
+  estimated_low_usd: number | null;
+  estimated_likely_usd: number | null;
+  estimated_high_usd: number | null;
+  vision_input_tokens: AiTokenEstimate;
+  vision_output_tokens: AiTokenEstimate;
+  embedding_input_tokens: AiTokenEstimate;
+  audio_seconds: number;
+  pricing_checked_at: string;
+  pricing_source: string;
+  budget_limit_usd: number | null;
+  budget_status: "not_configured" | "within_limit" | "exceeds_limit" | "unknown" | "local";
+  assumptions: string[];
 };
 
 export type AiProgress = {
@@ -91,6 +115,7 @@ export type AiConfig = {
   contextHint: string;
   transcribeAudio: boolean;
   transcriptionModel: string;
+  budgetUsd: number | null;
   reanalyzeExisting: boolean;
 };
 
