@@ -1,6 +1,7 @@
 use crate::ai::AiAnnotation;
 use crate::metadata::MediaMetadata;
 use crate::scanner::{DiscoveredFile, ScanReport, ScanWarning};
+use crate::usage::{AiRunSpec, AiUsageEvent};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -67,6 +68,75 @@ SELECT local_files.path, local_files.path || ' ' || COALESCE(media_assets.metada
 FROM local_files
 JOIN media_assets ON media_assets.content_hash = local_files.content_hash
 WHERE local_files.status = 'ACTIVE';
+"#;
+
+const MIGRATION_4: &str = r#"
+ALTER TABLE local_files ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 0
+    CHECK (identity_verified IN (0, 1));
+"#;
+
+const MIGRATION_5: &str = r#"
+CREATE TABLE ai_analysis_runs (
+    run_id TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    vision_model TEXT NOT NULL,
+    embedding_model TEXT NOT NULL,
+    transcription_model TEXT,
+    model_namespace TEXT NOT NULL,
+    pricing_status TEXT NOT NULL,
+    pricing_checked_at TEXT NOT NULL,
+    estimated_cost_usd REAL,
+    budget_limit_usd REAL,
+    reserved_budget_usd REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'partial', 'completed', 'failed', 'cancelled')),
+    completed_file_count INTEGER NOT NULL DEFAULT 0,
+    annotation_count INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at TEXT
+);
+
+CREATE TABLE ai_usage_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES ai_analysis_runs(run_id),
+    operation TEXT NOT NULL,
+    model TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    status_code INTEGER,
+    request_id TEXT,
+    usage_status TEXT NOT NULL,
+    pricing_status TEXT NOT NULL,
+    pricing_checked_at TEXT NOT NULL,
+    reported_input_tokens INTEGER,
+    reported_output_tokens INTEGER,
+    reported_audio_seconds REAL,
+    calculated_cost_usd REAL,
+    possible_cost INTEGER NOT NULL CHECK (possible_cost IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX ai_analysis_runs_status_idx ON ai_analysis_runs(status);
+CREATE INDEX ai_usage_events_run_id_idx ON ai_usage_events(run_id);
+CREATE INDEX ai_usage_events_operation_idx ON ai_usage_events(operation);
+"#;
+
+const MIGRATION_6: &str = r#"
+ALTER TABLE ai_usage_events ADD COLUMN local_event_id TEXT;
+CREATE UNIQUE INDEX ai_usage_events_local_event_id_idx
+    ON ai_usage_events(local_event_id)
+    WHERE local_event_id IS NOT NULL;
+"#;
+
+const MIGRATION_7: &str = r#"
+ALTER TABLE ai_usage_events ADD COLUMN reserved_cost_usd REAL;
+ALTER TABLE ai_usage_events ADD COLUMN budget_adjustment_usd REAL;
+"#;
+
+const MIGRATION_8: &str = r#"
+ALTER TABLE ai_usage_events ADD COLUMN estimated_audio_seconds REAL;
 "#;
 
 #[derive(Debug)]
@@ -140,6 +210,7 @@ pub struct IndexedFile {
     pub size_bytes: u64,
     pub modified_unix_ms: Option<u64>,
     pub status: LocalFileStatus,
+    pub identity_verified: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -378,7 +449,9 @@ impl SqliteIndex {
         Ok(self
             .connection
             .query_row(
-                "SELECT path, content_hash, size_bytes, modified_unix_ms, status FROM local_files WHERE path = ?1",
+                "SELECT path, content_hash, size_bytes, modified_unix_ms, status,
+                        identity_verified
+                 FROM local_files WHERE path = ?1",
                 params![path],
                 |row| {
                     let status: String = row.get(4)?;
@@ -388,6 +461,7 @@ impl SqliteIndex {
                         size_bytes: row.get(2)?,
                         modified_unix_ms: row.get(3)?,
                         status: parse_status(&status),
+                        identity_verified: row.get::<_, i64>(5)? != 0,
                     })
                 },
             )
@@ -396,7 +470,8 @@ impl SqliteIndex {
 
     pub fn known_files(&self) -> Result<Vec<IndexedFile>, IndexError> {
         let mut statement = self.connection.prepare(
-            "SELECT path, content_hash, size_bytes, modified_unix_ms, status
+            "SELECT path, content_hash, size_bytes, modified_unix_ms, status,
+                    identity_verified
              FROM local_files
              WHERE status = 'ACTIVE'
              ORDER BY path",
@@ -409,6 +484,7 @@ impl SqliteIndex {
                 size_bytes: row.get(2)?,
                 modified_unix_ms: row.get(3)?,
                 status: parse_status(&status),
+                identity_verified: row.get::<_, i64>(5)? != 0,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -449,6 +525,90 @@ impl SqliteIndex {
         json.map(|value| serde_json::from_str(&value))
             .transpose()
             .map_err(Into::into)
+    }
+
+    pub fn start_ai_analysis_run(&mut self, run: &AiRunSpec) -> Result<(), IndexError> {
+        self.connection.execute(
+            "INSERT INTO ai_analysis_runs(
+                 run_id, operation, provider, vision_model, embedding_model,
+                 transcription_model, model_namespace, pricing_status,
+                 pricing_checked_at, estimated_cost_usd, budget_limit_usd
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                run.run_id,
+                run.operation,
+                run.provider,
+                run.vision_model,
+                run.embedding_model,
+                run.transcription_model,
+                run.model_namespace,
+                run.pricing_status,
+                run.pricing_checked_at,
+                run.estimated_cost_usd,
+                run.budget_limit_usd,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_ai_usage_event(&mut self, event: &AiUsageEvent) -> Result<(), IndexError> {
+        self.connection.execute(
+            "INSERT INTO ai_usage_events(
+                 local_event_id, run_id, operation, model, attempt, duration_ms, outcome,
+                 status_code, request_id, usage_status, pricing_status,
+                 pricing_checked_at, reported_input_tokens, reported_output_tokens,
+                 reported_audio_seconds, estimated_audio_seconds, calculated_cost_usd,
+                 reserved_cost_usd, budget_adjustment_usd, possible_cost
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            params![
+                event.local_event_id,
+                event.run_id,
+                event.operation,
+                event.model,
+                event.attempt,
+                event.duration_ms,
+                event.outcome,
+                event.status_code,
+                event.request_id,
+                event.usage_status,
+                event.pricing_status,
+                event.pricing_checked_at,
+                event.reported_input_tokens,
+                event.reported_output_tokens,
+                event.reported_audio_seconds,
+                event.estimated_audio_seconds,
+                event.calculated_cost_usd,
+                event.reserved_cost_usd,
+                event.budget_adjustment_usd,
+                event.possible_cost,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_ai_analysis_run(
+        &mut self,
+        run_id: &str,
+        status: &str,
+        completed_file_count: u64,
+        annotation_count: u64,
+        reserved_budget_usd: Option<f64>,
+    ) -> Result<(), IndexError> {
+        self.connection.execute(
+            "UPDATE ai_analysis_runs
+             SET status = ?2, completed_file_count = ?3,
+                 annotation_count = ?4, reserved_budget_usd = COALESCE(?5, reserved_budget_usd),
+                 finished_at = CURRENT_TIMESTAMP
+             WHERE run_id = ?1",
+            params![
+                run_id,
+                status,
+                completed_file_count,
+                annotation_count,
+                reserved_budget_usd,
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn replace_ai_annotations(
@@ -496,7 +656,11 @@ impl SqliteIndex {
 
     pub fn ai_annotation_count_for_model(&self, model_namespace: &str) -> Result<u64, IndexError> {
         Ok(self.connection.query_row(
-            "SELECT COUNT(*) FROM ai_annotations WHERE model = ?1",
+            "SELECT COUNT(*)
+             FROM ai_annotations
+             JOIN local_files ON local_files.content_hash = ai_annotations.content_hash
+             WHERE local_files.identity_verified = 1
+               AND ai_annotations.model = ?1",
             params![model_namespace],
             |row| row.get(0),
         )?)
@@ -514,7 +678,8 @@ impl SqliteIndex {
             "SELECT local_files.path, local_files.content_hash, ai_annotations.timestamp_ms
              FROM ai_annotations
              JOIN local_files ON local_files.content_hash = ai_annotations.content_hash
-             WHERE ai_annotations.model = ?1",
+             WHERE local_files.identity_verified = 1
+               AND ai_annotations.model = ?1",
         )?;
         let rows = statement.query_map(params![model_namespace], |row| {
             Ok((
@@ -598,7 +763,8 @@ impl SqliteIndex {
                     local_files.path, local_files.content_hash, local_files.status
              FROM ai_annotations
              JOIN local_files ON local_files.content_hash = ai_annotations.content_hash
-             WHERE (?1 IS NULL OR ai_annotations.model = ?1)",
+             WHERE local_files.identity_verified = 1
+               AND (?1 IS NULL OR ai_annotations.model = ?1)",
         )?;
         let rows = statement.query_map(params![model_namespace], |row| {
             let timestamp_ms: u64 = row.get(0)?;
@@ -746,6 +912,9 @@ impl SqliteIndex {
         let Some(file) = self.get_file(path)? else {
             return Ok(Vec::new());
         };
+        if !file.identity_verified {
+            return Ok(Vec::new());
+        }
         let mut statement = self.connection.prepare(
             "SELECT timestamp_ms, description, labels_json, embedding_json,
                     confidence, model
@@ -896,6 +1065,11 @@ impl SqliteIndex {
             (1_i64, MIGRATION_1),
             (2_i64, MIGRATION_2),
             (3_i64, MIGRATION_3),
+            (4_i64, MIGRATION_4),
+            (5_i64, MIGRATION_5),
+            (6_i64, MIGRATION_6),
+            (7_i64, MIGRATION_7),
+            (8_i64, MIGRATION_8),
         ] {
             let applied: Option<i64> = connection
                 .query_row(
@@ -949,13 +1123,15 @@ fn upsert_file(
         params![file.content_hash, file.size_bytes, metadata_json],
     )?;
     transaction.execute(
-        "INSERT INTO local_files(path, content_hash, size_bytes, modified_unix_ms, status)
-         VALUES (?1, ?2, ?3, ?4, 'ACTIVE')
+        "INSERT INTO local_files(
+             path, content_hash, size_bytes, modified_unix_ms, status, identity_verified
+         ) VALUES (?1, ?2, ?3, ?4, 'ACTIVE', 1)
          ON CONFLICT(path) DO UPDATE SET
              content_hash = excluded.content_hash,
              size_bytes = excluded.size_bytes,
              modified_unix_ms = excluded.modified_unix_ms,
              status = 'ACTIVE',
+             identity_verified = 1,
              last_seen_at = CURRENT_TIMESTAMP",
         params![
             file.path,
@@ -1407,7 +1583,7 @@ mod tests {
         let mut index = SqliteIndex::open_in_memory().expect("index should open");
         assert_eq!(
             index.schema_version().expect("version should be readable"),
-            3
+            8
         );
 
         let first = index
@@ -1427,6 +1603,13 @@ mod tests {
         assert_eq!(second.changes[0].kind, IndexChangeKind::Unchanged);
         assert_eq!(index.asset_count().expect("asset count should work"), 1);
         assert_eq!(index.local_file_count().expect("file count should work"), 1);
+        assert!(
+            index
+                .get_file("/library/a.mp4")
+                .expect("file should load")
+                .expect("file should exist")
+                .identity_verified
+        );
         assert_eq!(
             index.active_file_count().expect("active count should work"),
             1
@@ -2377,5 +2560,71 @@ mod tests {
                 .status,
             LocalFileStatus::Active
         );
+    }
+
+    #[test]
+    fn records_request_attempts_with_unknown_usage_explicitly() {
+        let mut index = SqliteIndex::open_in_memory().expect("index should open");
+        index
+            .start_ai_analysis_run(&AiRunSpec {
+                run_id: "run-test".to_owned(),
+                operation: "search_ai".to_owned(),
+                provider: "openai".to_owned(),
+                vision_model: "gpt-5.6-luna".to_owned(),
+                embedding_model: "text-embedding-3-small".to_owned(),
+                transcription_model: None,
+                model_namespace: "openai:gpt-5.6-luna:text-embedding-3-small".to_owned(),
+                pricing_status: "unknown".to_owned(),
+                pricing_checked_at: "2026-09-05".to_owned(),
+                estimated_cost_usd: None,
+                budget_limit_usd: None,
+            })
+            .expect("run should be inserted");
+        index
+            .record_ai_usage_event(&AiUsageEvent {
+                local_event_id: "run-test:1".to_owned(),
+                run_id: "run-test".to_owned(),
+                operation: "OpenAI embedding".to_owned(),
+                model: "text-embedding-3-small".to_owned(),
+                attempt: 2,
+                duration_ms: 180,
+                outcome: "response_received".to_owned(),
+                status_code: Some(200),
+                request_id: Some("req_test".to_owned()),
+                usage_status: "not_reported".to_owned(),
+                pricing_status: "unknown".to_owned(),
+                pricing_checked_at: "2026-09-05".to_owned(),
+                reported_input_tokens: None,
+                reported_output_tokens: None,
+                reported_audio_seconds: None,
+                estimated_audio_seconds: None,
+                calculated_cost_usd: None,
+                reserved_cost_usd: None,
+                budget_adjustment_usd: None,
+                possible_cost: true,
+            })
+            .expect("event should be inserted");
+        index
+            .finish_ai_analysis_run("run-test", "completed", 0, 0, None)
+            .expect("run should finish");
+
+        let event_count: u64 = index
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM ai_usage_events WHERE run_id = 'run-test'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("event count should load");
+        let status: String = index
+            .connection
+            .query_row(
+                "SELECT status FROM ai_analysis_runs WHERE run_id = 'run-test'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("run status should load");
+        assert_eq!(event_count, 1);
+        assert_eq!(status, "completed");
     }
 }

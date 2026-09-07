@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -106,6 +106,7 @@ pub struct LocalFileRecord {
     pub size_bytes: u64,
     pub modified_unix_ms: Option<u64>,
     pub content_hash: String,
+    pub identity_verified: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -293,7 +294,8 @@ fn visit_directory(
             let content_hash = known_files
                 .get(&path_string)
                 .filter(|known| {
-                    known.size_bytes == metadata.len()
+                    known.identity_verified
+                        && known.size_bytes == metadata.len()
                         && known.modified_unix_ms.is_some()
                         && known.modified_unix_ms == modified_unix_ms
                 })
@@ -346,45 +348,17 @@ fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
     }
 }
 
-const FULL_HASH_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
-const SAMPLE_CHUNK_SIZE: usize = 256 * 1024;
-
 fn hash_file(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
-    let metadata = file.metadata()?;
-    let size = metadata.len();
     let mut hasher = Sha256::new();
 
-    if size <= FULL_HASH_THRESHOLD_BYTES {
-        let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
+    let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
         }
-    } else {
-        hasher.update(b"FAST_TIERED_V1:");
-        hasher.update(size.to_be_bytes());
-
-        let mut chunk = vec![0u8; SAMPLE_CHUNK_SIZE];
-
-        // 1. Initial chunk
-        let read = file.read(&mut chunk)?;
-        hasher.update(&chunk[..read]);
-
-        // 2. Middle chunk
-        let middle_offset = size / 2;
-        file.seek(SeekFrom::Start(middle_offset))?;
-        let read = file.read(&mut chunk)?;
-        hasher.update(&chunk[..read]);
-
-        // 3. Tail chunk
-        let tail_offset = size.saturating_sub(SAMPLE_CHUNK_SIZE as u64);
-        file.seek(SeekFrom::Start(tail_offset))?;
-        let read = file.read(&mut chunk)?;
-        hasher.update(&chunk[..read]);
+        hasher.update(&buffer[..read]);
     }
 
     Ok(format!("{:x}", hasher.finalize()))
@@ -423,6 +397,7 @@ fn path_key(path: &str) -> String {
 mod tests {
     use super::*;
     use std::fs::{create_dir_all, remove_dir_all, write};
+    use std::io::{Seek, Write};
     use std::time::SystemTime;
 
     struct TestDirectory(PathBuf);
@@ -454,6 +429,7 @@ mod tests {
             size_bytes: hash.len() as u64,
             modified_unix_ms: None,
             content_hash: hash.to_owned(),
+            identity_verified: true,
         }
     }
 
@@ -557,6 +533,7 @@ mod tests {
                 size_bytes: metadata.len(),
                 modified_unix_ms: modified_unix_ms(&metadata),
                 content_hash: "cached-hash".to_owned(),
+                identity_verified: true,
             },
         );
 
@@ -581,5 +558,34 @@ mod tests {
 
         assert_eq!(hash_1, hash_2);
         assert!(!hash_1.is_empty());
+    }
+
+    #[test]
+    fn hashes_large_files_by_all_content_not_only_sampled_regions() {
+        let directory = TestDirectory::new("large-file-collision");
+        let left_path = directory.0.join("left.mp4");
+        let right_path = directory.0.join("right.mp4");
+        let size = 17 * 1024 * 1024;
+
+        for path in [&left_path, &right_path] {
+            let file = File::create(path).expect("large file should be created");
+            file.set_len(size).expect("file length should be set");
+        }
+
+        let mut right = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&right_path)
+            .expect("right file should be writable");
+        right
+            .seek(std::io::SeekFrom::Start(1024 * 1024))
+            .expect("file should be seekable");
+        right
+            .write_all(b"content outside the old sample regions")
+            .expect("different content should be written");
+
+        assert_ne!(
+            hash_file(&left_path).expect("left hash should succeed"),
+            hash_file(&right_path).expect("right hash should succeed")
+        );
     }
 }

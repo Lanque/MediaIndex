@@ -38,6 +38,18 @@ path is an active SQLite-indexed file, confirms it still exists, and authorizes
 only that file for the current process. System-player opening applies the same
 index and availability checks.
 
+AI request attempts are recorded locally with operation/model, retry number,
+duration, HTTP status, optional provider request ID, pricing status, and an
+explicit possible-charge flag. Request bodies, media bytes, API keys, and
+response content are excluded. A request reserve is settled only when its
+provider usage is complete: vision needs both input and output tokens,
+embedding needs input tokens, and transcription needs a provider-reported or
+locally measured audio duration. Missing or partial usage remains unknown or
+partial and keeps the conservative reserve; an independently known lower bound
+can increase the committed cost when it exceeds that reserve. Explicit numeric
+zero usage is valid and releases the unused reserve. HTTP errors, timeouts, and
+unreadable responses retain unknown cost instead of being inferred as zero.
+
 Windows installers built locally or in pull-request CI are intentionally
 unsigned until the release owner provides an Authenticode certificate through
 the release environment. Certificate material and passwords must never be
@@ -74,8 +86,16 @@ delivery, stale cursors, authorization failures, and worker crashes.
 - Every run requires confirmation after a local preflight reports
   the unique content count, duration-based estimated sampled frames/vision
   requests, configured upper bounds, estimated speech-audio duration, and a
-  model-aware first-run time estimate, and a locally measured per-model estimate
-  after calibration. Cancelling the dialog sends no provider requests.
+  model-aware first-run time estimate, a low/likely/high API cost estimate, and
+  a locally measured per-model estimate after calibration. The API cost estimate
+  is a heuristic: unknown model pricing is reported as unknown rather than zero,
+  local runtime cost excludes CPU/GPU time and electricity, and the checked
+  pricing date and source are retained in the plan. Cancelling the dialog sends
+  no provider requests.
+- Remote pricing is maintained as a small checked catalog using the
+  [OpenAI pricing](https://developers.openai.com/api/docs/pricing) and
+  [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) pages. A custom
+  or newly introduced model must be priced before a USD estimate can be shown.
 - Duplicate file paths that share a content hash are analyzed once, preventing
   duplicate API spend for copied footage.
 - **Analyze with AI** skips content that already has annotations in the active
@@ -84,11 +104,19 @@ delivery, stale cursors, authorization failures, and worker crashes.
   clearly states that same-model annotations will be replaced.
 - Only one AI analysis can run at a time. The stop control prevents additional
   files and frame batches from starting, keeps completed clip annotations, and
-  lets a later run continue with missing clips. A cloud request already sent to
-  the provider may finish before cancellation takes effect.
+  lets a later run continue with missing clips. The shared cancellation check
+  runs before each budget reservation and network send, between individual
+  Gemini embedding requests, and during retry backoff. A stop before sending
+  creates no paid-attempt event and releases any race-created reservation. A
+  cloud request already sent to the provider may finish before cancellation
+  takes effect; its usage event is retained and unknown usage remains reserved.
+  Search and Test connection use independent request paths and are not stopped
+  by an analysis run cancellation.
 - Focused search limits low-ranking results, videos, and moments without making
   another vision request. Query embeddings remain the only AI call during
-  search.
+  search and are recorded as a separate usage operation.
+- Connection tests are also recorded separately from analysis; their network
+  requests can therefore be distinguished from indexed-media usage.
 - Best-moment thumbnails are extracted and cached locally with FFmpeg. The
   thumbnail command accepts only active paths already present in the SQLite
   index and never uploads the source frame.
