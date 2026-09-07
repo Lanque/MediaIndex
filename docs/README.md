@@ -4,6 +4,7 @@ This directory is the project’s living design and engineering record.
 
 ## Start here
 
+- [Performance, cost, and development plan (2026-09-05)](performance-cost-development-plan-2026-09-05.md) — Estonian code-review findings and a staged plan for monetary estimates, budgets, durable analysis, and performance.
 - [Project plan](project-plan.md) — scope, phases, build order, and non-goals.
 - [Architecture](architecture.md) — boundaries, data ownership, synchronization, jobs, search, and reliability.
 - [Roadmap](roadmap.md) — phase exit criteria mapped to GitHub issues.
