@@ -22,7 +22,8 @@ This directory is the project’s living design and engineering record.
 - [Engineering status](engineering-status.md) — stacked PR order and known limitations.
 - [Main integration review](main-integration-review.md) — evidence and merge risks for bringing the desktop MVP to `main`.
 - [Next-agent plan](next-agent-plan.md) — exact verification, packaging, and GitHub reconciliation checklist.
-- [Release verification](release-verification.md) — latest automated checks and Windows artifact hashes.
+- [Release verification](release-verification.md) — current automated checks and the evidence still needed for packaging.
+- [v0.1.0 release notes](releases/v0.1.0.md) — experimental prerelease scope and known limitations.
 - [ADRs](adr/) — durable architectural decisions.
 
 ## Documentation maintenance

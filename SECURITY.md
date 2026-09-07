@@ -26,4 +26,10 @@ default, and document a rollback/disable path.
 
 ## Reporting
 
-For a private repository, report suspected vulnerabilities directly to the repository owner through a private GitHub channel rather than opening a public issue. Include reproduction steps, affected component, impact, and a suggested mitigation when known.
+This is a public repository. Report suspected vulnerabilities through GitHub's
+private vulnerability reporting channel (Security → Advisories → Report a
+vulnerability) rather than opening a public issue. Include reproduction steps,
+the affected component, impact, and a suggested mitigation when known. If the
+private reporting option is temporarily unavailable, contact the repository
+owner through a private GitHub channel and keep exploit details and secrets out
+of public discussions.
