@@ -1,103 +1,214 @@
-# MediaIndex
+<p align="center">
+  <img src="desktop/src-tauri/icons/icon.svg" alt="MediaIndex icon" width="96">
+</p>
 
-> Find any shot in your local footage in seconds, without uploading your entire archive.
+<h1 align="center">MediaIndex</h1>
 
-MediaIndex is a local-first media indexing and search platform for large video projects. The desktop application discovers footage where it already lives, builds a fast local index, and syncs project knowledge to the cloud only when that provides value.
+<p align="center">
+  Find the right moment in local footage without uploading your archive.
+</p>
 
-## Current status
+<p align="center">
+  <a href="https://github.com/Lanque/MediaIndex/actions/workflows/ci.yml"><img src="https://github.com/Lanque/MediaIndex/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="https://github.com/Lanque/MediaIndex/releases/tag/v0.1.0"><img src="https://img.shields.io/badge/release-v0.1.0%20experimental-F5A623" alt="v0.1.0 experimental prerelease"></a>
+  <img src="https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white" alt="Windows">
+  <img src="https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white" alt="Tauri 2">
+</p>
 
-The current integration branch contains a working Windows desktop MVP packaged
-with Tauri. MediaIndex is not a browser-hosted product: the TypeScript interface
-runs inside the native desktop shell and works with the local filesystem through
-the Rust backend.
+<p align="center">
+  <a href="#download">Download</a> ·
+  <a href="#what-it-does">What it does</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#development">Development</a> ·
+  <a href="#documentation">Documentation</a>
+</p>
 
-- recursive folder scanning, stable hashing, and change detection;
-- cached FFprobe metadata and a machine-local SQLite index;
-- a selected-folder view plus a separate saved AI-analysis archive, both grouped
-  by the footage's real source folders;
-- deterministic search, filters, local preview, and opening the original clip;
-- explicit sampled-frame AI analysis through OpenAI, Gemini, or local Ollama,
-  plus optional timestamped OpenAI speech transcription;
-- native Gemini **Login with Google** through a user-owned Desktop OAuth client,
-  with session-only credentials;
-- per-video visual search that combines similar adjacent frames into contextual
-  time ranges;
-- a lazy, full-context AI analysis inspector for every indexed clip, including
-  complete descriptions, time ranges, labels, confidence, and model history;
-- background analysis progress, measured time estimates, cancellation, and
-  bounded cloud cost preflight.
+MediaIndex is a Windows desktop application for finding clips and moments in
+large local video folders. It discovers footage where it already lives,
+extracts metadata locally, and keeps the working index in SQLite. Deterministic
+search and preview work without an account or network connection. An optional
+AI index adds sampled visual descriptions and semantic search through OpenAI,
+Google Gemini, or a local Ollama installation.
 
-The API, worker, migration, and Terraform foundations are present, but no AWS
-infrastructure is applied by this repository. GitHub's `origin/main` now
-contains the merged foundation, scanner, metadata, local-index, responsive
-preview, and AI-search stack through PR #39. The current branch is synchronized
-with that baseline and adds the performance, provider, and interface follow-up;
-review the exact delta in
-[docs/main-integration-review.md](docs/main-integration-review.md) before
-merging.
+## Release status
 
-## Product principles
+`v0.1.0` is an experimental prerelease for Windows. The installer is unsigned,
+so Windows cannot show a verified publisher identity. Use it for evaluation and
+keep a backup of the local index before upgrading. A signed stable release and
+the complete installed-app verification matrix remain future release work.
 
-- Original footage stays local by default.
-- SQLite is a machine-local index, not a second source of truth.
-- PostgreSQL becomes the shared project source of truth when cloud sync is introduced.
-- A content hash identifies a logical media asset; a local path identifies only one local copy.
-- Expensive cloud processing is explicit, asynchronous, retry-safe, and observable.
-- Deterministic filters remain separate from AI similarity search.
+## Download
 
-## Planned architecture
+Download the [v0.1.0 experimental prerelease](https://github.com/Lanque/MediaIndex/releases/tag/v0.1.0)
+from GitHub. The release page is the source for the Windows installer and its
+checksums.
 
-```text
-Local footage
-    |
-    v
-Tauri desktop app ---> SQLite local index ---> local search / clip opening
-    |
-    | explicit, incremental sync
-    v
-FastAPI ---> PostgreSQL project state
-    |
-    | explicit processing requests
-    v
-SQS ---> worker service ---> transcripts / tags / embeddings / previews
+## What it does
+
+- **Scans locally.** Select a folder and MediaIndex recursively discovers video
+  files, computes complete SHA-256 content identities, and reads technical
+  metadata through FFprobe. The original files stay in their existing folders.
+- **Indexes in SQLite.** A machine-local SQLite database tracks content hashes,
+  paths, metadata, availability, and saved AI results. A path is a location;
+  copied footage can share one content identity.
+- **Searches and previews offline.** Search filenames and technical metadata,
+  filter by folder, date, resolution, frame rate, duration, or codec, then
+  preview or open the original clip. The local index does not require cloud
+  services.
+- **Adds optional visual search.** An explicit **Analyze with AI** run samples
+  frames and stores timestamped descriptions and embeddings locally. Choose
+  OpenAI, Google Gemini, or Local (Ollama); provider and model histories remain
+  separate.
+- **Shows scope before cloud work.** After **Select Footage Folder** finishes
+  its local scan, the app shows an **AI cost preview** with unique clips,
+  sampled-frame and vision-request counts, optional speech duration, and the
+  configured estimate. The preview is computed locally and does not need an
+  API key or contact a provider. Cloud analysis starts only after explicit
+  confirmation.
+- **Keeps analysis bounded and recoverable.** Optional remote budgets,
+  per-request accounting, resumable vision checkpoints, and partial/failed
+  coverage states keep an interrupted run from silently discarding completed
+  work.
+
+### AI data movement and cost
+
+| Provider | What leaves the computer | Setup |
+| --- | --- | --- |
+| Local (Ollama) | When the endpoint is local, frames, prompts, generated descriptions, context, embeddings, and AI Search query text stay on the computer. A remote Ollama endpoint receives the data sent to that endpoint. | Ollama and the selected vision/embedding models installed locally. |
+| OpenAI API | Sampled JPEG frames and analysis prompts/context go to vision; generated descriptions, context, and AI Search query text go to the embedding API. Optional timestamped transcription sends a temporary compressed speech track for the analyzed span. The original video is not uploaded as a whole. | OpenAI developer API key. A ChatGPT subscription is not an API key. |
+| Google Gemini API | Sampled JPEG frames and analysis prompts/context go to vision; generated descriptions, context, and AI Search query text go to the embedding API. The original video is not uploaded as a whole. | Google AI Studio API key or the supported Google Desktop OAuth flow. |
+
+The estimate is a planning heuristic based on the selected models, sampling
+settings, media metadata, and the checked pricing catalog. It is not a quote
+and does not guarantee the amount on a provider invoice. Unknown model pricing
+is shown as unknown rather than treated as zero; local CPU/GPU time and
+electricity are outside the API estimate.
+
+### Coverage limitation
+
+AI analysis samples a prefix of each video. With the default OpenAI settings
+of one frame every five seconds and a maximum of 60 frames, a long clip covers
+roughly its first five minutes (`60 × 5 s`), rather than the whole video. Fast
+gameplay events such as a death, kill, or attack can fall between samples or be
+described too coarsely. For those moments, lower **Sample every (s)** to `2` or
+`1` and intentionally re-analyze the relevant clips. Denser sampling can capture
+more short-lived events, but does not guarantee that a provider will recognize
+or label them. The resulting coverage is still bounded by the configured frame
+limit.
+
+## Requirements
+
+The v0.1.0 desktop release targets Windows and requires:
+
+- the Microsoft Edge **WebView2 Runtime** for the Tauri desktop shell;
+- **FFmpeg** and **FFprobe** available on `PATH`. For AI analysis, an FFmpeg
+  executable can instead be selected under **AI connection** or supplied as
+  `MEDIAINDEX_FFMPEG_PATH`; the related FFprobe executable is resolved beside
+  it when possible. Metadata scanning can use `MEDIAINDEX_FFPROBE_PATH` for an
+  explicit FFprobe path;
+- the Rust stable toolchain with the MSVC target, Visual Studio C++ build tools,
+  and the Windows SDK when developing or building the desktop client;
+- an OpenAI or Gemini credential only if you choose that cloud provider. Local
+  scanning, deterministic search, preview, and the local cost estimate do not
+  require an API key;
+- Ollama and its selected models only if you choose Local (Ollama).
+
+## Quick start
+
+1. Install the requirements above and launch MediaIndex.
+2. Choose **Select Footage Folder**. The initial scan hashes files and reads
+   metadata locally; wait for indexing to finish.
+3. Search the indexed folder or use the filters, then preview or open a result.
+4. For visual search, open **AI connection**, select a provider, and configure
+   its models. After the scan, review the local **AI cost preview** before
+   pressing **Analyze with AI**.
+5. Search indexed moments with a description such as `red car at night`,
+   `person in a forest`, or `blue vehicle by a lake`.
+
+The index is stored in the Tauri app-local data directory as
+`mediaindex.sqlite3`. Before installing a newer build, close MediaIndex and
+copy the file to a dated backup. On Windows it is typically at
+`%LOCALAPPDATA%\ee.lanque.mediaindex\mediaindex.sqlite3`. Keep the original
+footage backed up separately; MediaIndex does not replace the source files.
+
+## Development
+
+The repository uses Python for the API and repository checks, and Node.js,
+Rust, and Tauri for the Windows desktop client. The CI workflow currently uses
+Python 3.12 and Node.js 22.
+
+From PowerShell at the repository root:
+
+```powershell
+git clone https://github.com/Lanque/MediaIndex.git
+cd MediaIndex
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r api\requirements-dev.txt
+
+python scripts\check_repository.py
+python -m unittest discover -s tests -p "test_*.py"
+python scripts\check_migrations.py
+python scripts\check_infra.py
+
+cd desktop
+npm.cmd ci
+npm.cmd run build
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo test --manifest-path src-tauri/Cargo.toml
+npm.cmd run tauri dev
 ```
 
-The full architecture and the reasoning behind each component live in [docs/architecture.md](docs/architecture.md).
+To create a Windows installer locally, run this from `desktop` after the
+frontend build:
+
+```powershell
+npm.cmd run tauri build
+```
+
+Local and CI installers are unsigned unless the release environment provides a
+Windows Authenticode certificate. Do not commit certificate material or
+passwords.
 
 ## Repository map
 
 | Path | Purpose |
 | --- | --- |
-| `PRODUCT.md` | product brief and desktop delivery boundary |
-| `DESIGN.md` | canonical desktop visual system |
-| `desktop/` | Tauri + TypeScript desktop client |
-| `api/` | FastAPI service |
-| `worker/` | asynchronous processing worker |
-| `shared/` | API contracts and shared schemas |
-| `migrations/` | PostgreSQL migrations |
-| `infra/` | Terraform infrastructure |
-| `tests/` | integration and contract tests |
-| `docs/` | architecture, roadmap, ADRs, and engineering decisions |
+| `desktop/` | Tauri 2 shell, TypeScript interface, Rust scanner, index, and AI worker |
+| `api/` | FastAPI reference boundary for the versioned cloud sync contract |
+| `worker/` | Asynchronous processing worker foundation |
+| `shared/` | Shared API contracts and schemas |
+| `migrations/` | PostgreSQL schema and row-level security migration |
+| `infra/terraform/` | Guarded AWS infrastructure scaffold |
+| `tests/` | Repository, API, migration, infrastructure, security, and worker checks |
+| `docs/` | Architecture, local-index behavior, provider notes, release evidence, and ADRs |
 
-## Working in this repository
+## Documentation
 
-All work should start from a GitHub issue and land through a pull request:
+- [Local index and content identity](docs/local-index.md) — SQLite schema,
+  hashing, re-indexing, and saved AI data.
+- [Local search and clip opening](docs/local-search.md) — offline filters,
+  previews, AI search, sampling, and cost confirmation.
+- [AI provider compatibility](docs/ai-provider-compatibility.md) — supported
+  providers, models, authentication, and migration behavior.
+- [Security and cost guardrails](docs/security-and-cost.md) — data movement,
+  credentials, budgets, request accounting, and release posture.
+- [Release verification](docs/release-verification.md) — current checks and
+  the evidence still needed for a public stable release.
+- [v0.1.0 release notes](docs/releases/v0.1.0.md) — experimental prerelease
+  scope and known limitations.
+- [Architecture](docs/architecture.md) — ownership boundaries and the planned
+  local-to-cloud path.
+- [Development workflow](docs/development-workflow.md) — issue, branch,
+  commit, pull-request, and review conventions.
+- [Security policy](SECURITY.md) — private vulnerability reporting and
+  development rules.
 
-1. Choose or create an issue.
-2. Create a branch named `<type>/<issue-number>-<short-slug>`.
-3. Keep commits focused and use Conventional Commit style.
-4. Open a draft PR early, linking the issue.
-5. Add tests and documentation with the change.
-6. Merge only after the PR checklist and CI are green.
+## Cloud scope
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/development-workflow.md](docs/development-workflow.md).
-The detailed continuation checklist is in
-[docs/next-agent-plan.md](docs/next-agent-plan.md).
-
-## Scope boundaries
-
-The initial project deliberately does not include permanent cloud backup of every original, real-time team collaboration, a mobile app, a cloud rendering farm, complex permissions, or an AI chatbot as the primary UI.
-
-## Source and status of documentation
-
-The attached project plan is the product and architecture input for this repository. Repository documentation is the living engineering record: when implementation decisions change, update the relevant document or add an ADR in the same pull request.
+The API, worker, PostgreSQL migration, and Terraform files describe a later
+cloud-sync path. They are scaffolding only: this repository has not applied AWS
+infrastructure, does not ship a hosted service, and does not require cloud
+deployment for the local desktop workflow. Original footage remains local by
+default.

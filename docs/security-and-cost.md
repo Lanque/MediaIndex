@@ -63,8 +63,11 @@ included. The desktop result exposes the path only after a successful export.
 Windows installers built locally or in pull-request CI are intentionally
 unsigned until the release owner provides an Authenticode certificate through
 the release environment. Certificate material and passwords must never be
-committed. Public distribution is gated on signing and verifying the final
-installer; unsigned artifacts remain test builds.
+committed. A clearly labeled experimental unsigned prerelease such as
+`v0.1.0` may be published for evaluation with its unsigned status visible on
+the release page. Stable public distribution remains gated on signing and
+verifying the final installer; an experimental prerelease does not satisfy
+that stable-release gate.
 
 ## Observability and failure behavior
 
