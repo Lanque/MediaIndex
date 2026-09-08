@@ -77,14 +77,6 @@ jobs:
         working-directory: desktop
         run: npm run build
 
-      - name: Check Rust formatting
-        working-directory: desktop
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-
-      - name: Run Rust tests
-        working-directory: desktop
-        run: cargo test --manifest-path src-tauri/Cargo.toml
-
       - name: Set up FFmpeg
         uses: FedericoCarboni/setup-ffmpeg@v3
         with:
@@ -96,6 +88,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path desktop/src-tauri/bin
           Copy-Item (Get-Command ffmpeg).Source desktop/src-tauri/bin/ffmpeg.exe
           Copy-Item (Get-Command ffprobe).Source desktop/src-tauri/bin/ffprobe.exe
+
+      - name: Check Rust formatting
+        working-directory: desktop
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Run Rust tests
+        working-directory: desktop
+        run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Build Windows installer
         working-directory: desktop
