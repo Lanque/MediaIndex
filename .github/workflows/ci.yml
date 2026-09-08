@@ -85,6 +85,18 @@ jobs:
         working-directory: desktop
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      - name: Set up FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare bundled FFmpeg binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path desktop/src-tauri/bin
+          Copy-Item (Get-Command ffmpeg).Source desktop/src-tauri/bin/ffmpeg.exe
+          Copy-Item (Get-Command ffprobe).Source desktop/src-tauri/bin/ffprobe.exe
+
       - name: Build Windows installer
         working-directory: desktop
         run: npm run tauri build

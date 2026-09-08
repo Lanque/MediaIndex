@@ -93,10 +93,48 @@ pub struct FfprobeMetadataProbe {
     executable: PathBuf,
 }
 
+pub fn find_bundled_executable(name: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let file_name = if name.ends_with(".exe") {
+        name.to_string()
+    } else {
+        format!("{name}.exe")
+    };
+    #[cfg(not(windows))]
+    let file_name = name.to_string();
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            let candidates = [
+                exe_dir.join(&file_name),
+                exe_dir.join("bin").join(&file_name),
+                exe_dir.join("resources").join(&file_name),
+                exe_dir.join("resources").join("bin").join(&file_name),
+                exe_dir.join("../../bin").join(&file_name),
+                exe_dir.join("../../../bin").join(&file_name),
+            ];
+            for candidate in candidates {
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest_candidate = manifest_dir.join("bin").join(&file_name);
+    if manifest_candidate.is_file() {
+        return Some(manifest_candidate);
+    }
+
+    None
+}
+
 impl Default for FfprobeMetadataProbe {
     fn default() -> Self {
         let executable = std::env::var_os("MEDIAINDEX_FFPROBE_PATH")
             .map(PathBuf::from)
+            .or_else(|| find_bundled_executable("ffprobe"))
             .unwrap_or_else(|| PathBuf::from("ffprobe"));
         Self { executable }
     }
@@ -505,5 +543,15 @@ mod tests {
 
         assert_eq!(metadata.get("cached.mp4"), Some(&cached));
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn bundled_executables_can_be_discovered_when_present() {
+        if let Some(ffmpeg) = find_bundled_executable("ffmpeg") {
+            assert!(ffmpeg.is_file());
+        }
+        if let Some(ffprobe) = find_bundled_executable("ffprobe") {
+            assert!(ffprobe.is_file());
+        }
     }
 }

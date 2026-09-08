@@ -471,6 +471,7 @@ pub fn resolve_ffmpeg_executable(configured_path: Option<String>) -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("MEDIAINDEX_FFMPEG_PATH").map(PathBuf::from))
         .filter(|path| path.is_file())
+        .or_else(|| crate::metadata::find_bundled_executable("ffmpeg"))
         .unwrap_or_else(|| PathBuf::from("ffmpeg"))
 }
 
@@ -1106,19 +1107,22 @@ fn measure_audio_duration(path: &Path, ffmpeg_executable: &Path) -> Result<f64, 
 
 fn resolve_ffprobe_executable(ffmpeg_executable: &Path) -> PathBuf {
     let Some(file_name) = ffmpeg_executable.file_name().and_then(|name| name.to_str()) else {
-        return PathBuf::from("ffprobe");
+        return crate::metadata::find_bundled_executable("ffprobe")
+            .unwrap_or_else(|| PathBuf::from("ffprobe"));
     };
     let ffprobe_name = if file_name.eq_ignore_ascii_case("ffmpeg.exe") {
         "ffprobe.exe"
     } else if file_name.eq_ignore_ascii_case("ffmpeg") {
         "ffprobe"
     } else {
-        return PathBuf::from("ffprobe");
+        return crate::metadata::find_bundled_executable("ffprobe")
+            .unwrap_or_else(|| PathBuf::from("ffprobe"));
     };
     ffmpeg_executable
         .parent()
         .map(|parent| parent.join(ffprobe_name))
         .filter(|path| path.is_file())
+        .or_else(|| crate::metadata::find_bundled_executable("ffprobe"))
         .unwrap_or_else(|| PathBuf::from(ffprobe_name))
 }
 
