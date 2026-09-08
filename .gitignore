@@ -44,3 +44,9 @@ reports/
 
 # Bundled binaries
 desktop/src-tauri/bin/
+
+# Local agent and design tooling
+.github/agents/
+.github/hooks/
+.github/skills/
+.impeccable/

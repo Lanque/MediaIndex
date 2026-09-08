@@ -4,12 +4,10 @@ This directory is the project’s living design and engineering record.
 
 ## Start here
 
-- [Performance, cost, and development plan (2026-09-05)](performance-cost-development-plan-2026-09-05.md) — Estonian code-review findings and a staged plan for monetary estimates, budgets, durable analysis, and performance.
 - [Project plan](project-plan.md) — scope, phases, build order, and non-goals.
 - [Architecture](architecture.md) — boundaries, data ownership, synchronization, jobs, search, and reliability.
 - [Roadmap](roadmap.md) — phase exit criteria mapped to GitHub issues.
 - [Development workflow](development-workflow.md) — issue, branch, commit, PR, and review conventions.
-- [GitHub repository settings](github-repository-settings.md) — desired `main` protection policy and current plan limitation.
 - [Local index](local-index.md) — SQLite schema, hashing, identity, and interrupted-scan behavior.
 - [Local search](local-search.md) — offline filters, unavailable files, and clip opening.
 - [Explicit AI visual index](adr/0005-explicit-ai-visual-index.md) — sampled-frame analysis, embeddings, timestamps, and cost boundaries.
@@ -19,9 +17,6 @@ This directory is the project’s living design and engineering record.
 - [Worker runtime](worker-runtime.md) — retries, visibility leases, dead letters, and crash recovery.
 - [Security and cost](security-and-cost.md) — executable guardrails and AWS budget prerequisites.
 - [AWS architecture](aws-architecture.md) — guarded Terraform scaling path and defaults.
-- [Engineering status](engineering-status.md) — stacked PR order and known limitations.
-- [Main integration review](main-integration-review.md) — evidence and merge risks for bringing the desktop MVP to `main`.
-- [Next-agent plan](next-agent-plan.md) — exact verification, packaging, and GitHub reconciliation checklist.
 - [Release verification](release-verification.md) — current automated checks and the evidence still needed for packaging.
 - [v0.1.0 release notes](releases/v0.1.0.md) — experimental prerelease scope and known limitations.
 - [ADRs](adr/) — durable architectural decisions.
