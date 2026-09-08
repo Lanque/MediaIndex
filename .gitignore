@@ -50,3 +50,14 @@ desktop/src-tauri/bin/
 .github/hooks/
 .github/skills/
 .impeccable/
+
+# Internal agent logs and private development documents
+docs/agent-work-log.md
+docs/next-agent-plan.md
+docs/performance-cost-development-plan-2026-09-05.md
+docs/branch-review-2026-09-08.md
+docs/main-integration-review.md
+docs/engineering-status.md
+docs/github-repository-settings.md
+docs/internal/
+*.private.md
